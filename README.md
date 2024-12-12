@@ -73,7 +73,7 @@ controller.setForceControlledAxis(Tr, n_af);
 
 // HFVC, compliant translational motion, rigid rotation motion 
 RUT::Matrix6d Tr = RUT::Matrix6d::Identity();
-int n_af = 6;
+int n_af = 3;
 controller.setForceControlledAxis(Tr, n_af);
 
 // HFVC, compliant rotational motion, rigid translational motion
@@ -121,9 +121,9 @@ while (true) {
 ```
 
 ## Reference
-
+This package was implemented as a part of 
 Y. Hou and M. T. Mason, "Robust Execution of Contact-Rich Motion Plans by Hybrid Force-Velocity Control,"
 2019 International Conference on Robotics and Automation (ICRA), Montreal, QC, Canada, 2019, pp. 1933-1939
 
-The package was initially implemented based on James A. Maples and Joseph J. Becker, "Experience in Force Control of Robotic Manipulators", 
+The implementation was initially based on James A. Maples and Joseph J. Becker, "Experience in Force Control of Robotic Manipulators", 
 Then a lot more functionalities were added. Please contact yifan for questions.

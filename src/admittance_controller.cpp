@@ -298,6 +298,13 @@ int AdmittanceController::Implementation::step(RUT::Vector7d& pose_to_send) {
   wrench_T_Err_prev = wrench_T_Err;
   wrench_Tr_Err = Tr * wrench_T_Err;
 
+  /* Apply static friction */
+  for (int i = 0; i < 6; ++i) {
+    if (std::abs(wrench_Tr_Err(i)) < config.compliance6d.stiction(i)) {
+      wrench_Tr_Err(i) = 0;
+    }
+  }
+
   wrench_Tr_damping = -Tr * config.compliance6d.damping * v_body_WT;
 
   wrench_Tr_All = diag_force_selection * (wrench_Tr_spring + wrench_Tr_Err +
@@ -357,7 +364,7 @@ int AdmittanceController::Implementation::step(RUT::Vector7d& pose_to_send) {
   }
   profiler.stop("5");
   double timenow = timer.toc_ms();
-  if (timenow > 2.0) {
+  if (config.alert_overrun && timenow > config.dt * 1000.) {
     std::cerr << "AdmittanceController: step took too long: " << timenow << "ms"
               << std::endl;
     std::cerr << "Profiler: " << std::endl;

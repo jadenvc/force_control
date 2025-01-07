@@ -48,12 +48,15 @@ class AdmittanceController {
     double dt{0.002};  // used for integration/differentiation
     bool log_to_file{false};
     std::string log_file_path{""};
+    bool alert_overrun{
+        false};  // if true, print warning when step() takes too long
 
     struct ComplianceParameters6d {
       // Admittance parameters
       RUT::Matrix6d stiffness{};
       RUT::Matrix6d damping{};
       RUT::Matrix6d inertia{};
+      RUT::Vector6d stiction{};  // static friction, eliminates drifting
     };
     ComplianceParameters6d compliance6d{};
     // spring force will be capped at this value. Currently it is the norm of the whole wrench vector, not distinguishing between force and torque.

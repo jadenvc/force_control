@@ -3,6 +3,7 @@ Implementations of 6D Cartesian space admittance control. Supports hybrid force-
 
 The algorithm creates a virtual spring-mass-damper system using a position controlled robot. You can specify the following parameters:
 * 6x6 stiffness matrix, inertia matrix, damper matrix.
+
 You can update the following online:
 * Direction and dimension of force (soft) and position (rigid) control axes
 
@@ -12,6 +13,29 @@ Hardware requirements:
 
 Author: Yifan Hou
 yifanhou at stanford dot edu
+
+# SAFETY WARNING
+Force control is a high rate, high order control scheme that can go very wrong very quickly. Make sure you understand what you are doing before using this code. If the compliance parameters are not suitable, e.g. the robot is configured to be too soft and light while force feedback is not well calibrated, the robot will drift away very fast, which can be dangerous. 
+
+For your own safety, the following steps are recommended before launching a force-controlled robot:
+1. Start from enabling only one translational compliance axis (using `setForceControlledAxis`). Get the compliance control to work, get a feeling of what parameters make sense for your robot before enabling more axes. Common mistakes to pay attention to:
+  * Force feedback transformation is wrong. This could cause a positive feedback loop.
+  * Force sensor is badly calibrated.
+  * Compliance parameters are set to be too senstitive (unstable motion) or too insensitive (no response to external force).
+2. Safe parameters to use when testing for the first time:
+  * Set the inertia value to the same magnitude as the actual robot mass. For example, 2~5kg is reasonable for a typical table top robot arm like ABB120, UR5e.
+  * Set damping to a small value, e.g. 0.1
+  * Set stiffness to a reasonable value.
+  * direct_force_control_gains and direct_force_control_I_limit should be all zero.
+3. Make sure the robot stays clear from any potential collisions.
+4. Make sure you have the emergency stop button at your thumb.
+5. Start to run the controller.
+  * Stop immediately if there is any sudden/unstable motion.
+  * If the robot appears to be stable, gently push the robot in the direction where you enabled compliance. Check if the robot can be dragged as expected. If not, check your sensor sign/transformation/robot tool frame setting, etc.
+  * If the signs/direction seems fine but the robot is just shaking a bit, graduately increase damping.
+6. Now you have a one-axis compliance control working. You can play with the parameters as you wish, e.g. graduately reduce the inertia values and damping to get a more "soft" feeling.
+7. Enable all three translational axes.
+8. Redo the above for rotational axes. Note the order of magnitude of parameters are quiet different between rotational and translational axes.
 
 # Install
 ## Dependency
@@ -42,7 +66,31 @@ target_link_libraries(force_control_demo
 )
 ```
 
-## c++ code sketch
+## config example
+Save the following as `config.yaml`:
+``` yaml
+admittance_controller:
+  dt: 0.002
+  log_to_file: false
+  log_file_path: "/tmp/admittance_controller.log"
+  alert_overrun: false
+  compliance6d:
+    stiffness: [100, 100, 100, 1, 1, 1]
+    damping: [2, 2, 2, 0.2, 0.2, 0.2]
+    inertia: [5, 5, 5, 0.005, 0.005, 0.005]
+    stiction: [0, 0, 0, 0, 0, 0]
+  max_spring_force_magnitude: 50
+  direct_force_control_gains:
+    P_trans: 0
+    I_trans: 0
+    D_trans: 0
+    P_rot: 0
+    I_rot: 0
+    D_rot: 0
+  direct_force_control_I_limit: [0, 0, 0, 0, 0, 0]
+```
+
+## c++ code example
 Headers:
 ``` c++
 #include <RobotUtilities/spatial_utilities.h>
@@ -52,8 +100,17 @@ typedef Eigen::Matrix<double, 6, 1> Vector6d;
 ```
 Create the controller config, initialize controller:
 ``` c++
+// load config
 AdmittanceController::AdmittanceControllerConfig admittance_config;
-// populate admittance_config before using it
+const std::string CONFIG_PATH = "path_to/config.yaml";
+YAML::Node config{};
+try {
+  config = YAML::LoadFile(CONFIG_PATH);
+  deserialize(config["admittance_controller"], admittance_config);
+} catch (const std::exception& e) {
+  std::cerr << "Failed to load the config file: " << e.what() << std::endl;
+  return -1;
+}
 
 AdmittanceController controller;
 

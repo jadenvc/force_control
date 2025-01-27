@@ -149,6 +149,11 @@ class AdmittanceController {
    */
   void reset();
 
+  /**
+   * @brief      Print the current states to the console.
+   */
+  void displayStates();
+
  private:
   struct Implementation;
   std::unique_ptr<Implementation> m_impl;

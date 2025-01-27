@@ -591,3 +591,7 @@ void AdmittanceController::setDampingMatrix(const Matrix6d& damping) {
 int AdmittanceController::step(RUT::Vector7d& pose_to_send) {
   return m_impl->step(pose_to_send);
 }
+
+void AdmittanceController::displayStates() {
+  m_impl->displayStates();
+}

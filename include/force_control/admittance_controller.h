@@ -59,8 +59,9 @@ class AdmittanceController {
       RUT::Vector6d stiction{};  // static friction, eliminates drifting
     };
     ComplianceParameters6d compliance6d{};
-    // spring force will be capped at this value. Currently it is the norm of the whole wrench vector, not distinguishing between force and torque.
+    // spring force will be capped at this value.
     double max_spring_force_magnitude{0.0};
+    double max_spring_torque_magnitude{0.0};
 
     struct PIDGains {
       double P_trans{0.0};

@@ -268,10 +268,17 @@ int AdmittanceController::Implementation::step(RUT::Vector7d& pose_to_send) {
 
   // clip spring force
   if (config.max_spring_force_magnitude > 0) {
-    double spring_force_magnitude = wrench_T_spring.norm();
+    double spring_force_magnitude = wrench_T_spring.head<3>().norm();
     if (spring_force_magnitude > config.max_spring_force_magnitude) {
-      wrench_T_spring *=
+      wrench_T_spring.head<3>() *=
           config.max_spring_force_magnitude / spring_force_magnitude;
+    }
+  }
+  if (config.max_spring_torque_magnitude > 0) {
+    double spring_torque_magnitude = wrench_T_spring.tail<3>().norm();
+    if (spring_torque_magnitude > config.max_spring_torque_magnitude) {
+      wrench_T_spring.tail<3>() *=
+          config.max_spring_torque_magnitude / spring_torque_magnitude;
     }
   }
 

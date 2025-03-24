@@ -26,6 +26,8 @@ bool deserialize(const YAML::Node& node,
         node["compliance6d"]["stiction"]);
     config.max_spring_force_magnitude =
         node["max_spring_force_magnitude"].as<double>();
+    config.max_spring_torque_magnitude =
+        node["max_spring_torque_magnitude"].as<double>();
     config.direct_force_control_gains.P_trans =
         node["direct_force_control_gains"]["P_trans"].as<double>();
     config.direct_force_control_gains.I_trans =

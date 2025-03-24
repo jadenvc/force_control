@@ -80,6 +80,7 @@ admittance_controller:
     inertia: [5, 5, 5, 0.005, 0.005, 0.005]
     stiction: [0, 0, 0, 0, 0, 0]
   max_spring_force_magnitude: 50
+  max_spring_torque_magnitude: 4
   direct_force_control_gains:
     P_trans: 0
     I_trans: 0

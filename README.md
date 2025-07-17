@@ -1,8 +1,8 @@
 # force_control
 Implementations of 6D Cartesian space admittance control. Supports hybrid force-velocity control.
 
-The algorithm creates a virtual spring-mass-damper system using a position controlled robot. You can specify the following parameters:
-* 6x6 stiffness matrix, inertia matrix, damper matrix.
+The algorithm creates a virtual spring-mass-damper-friction system using a position controlled robot. You can specify the following parameters:
+* 6x6 stiffness matrix, inertia matrix, damper matrix, friction vector.
 
 You can update the following online:
 * Direction and dimension of force (soft) and position (rigid) control axes
@@ -13,6 +13,15 @@ Hardware requirements:
 
 Author: Yifan Hou
 yifanhou at stanford dot edu
+# What is admittance control?
+Admittance control is one of the two ways (the other is impedance control) to implement compliance control. Compliance control refers to methods to make a robot act compliantly via feedback control. Compliance is usually described by a spring-mass-damper system. For more details on how is compliance achieved, the difference between admittance and impedance, please checkout my [lecture notes on Compliance Control](https://www.dropbox.com/scl/fi/4xg3notqen0wrbkyk59i1/Intro_to_compliance_control.pdf?rlkey=qrm58807j5q4irl2viyrp2df7&e=2&dl=0).
+
+# What is hybrid force-velocity control?
+A robot usually lives in a multi-dimensional space. For example, a typical robot arm moves its hand in 6D rigid body space. When doing compliance control, you need to specify the compliant behavior you want in all those six dimensions.
+
+Hybrid force-velocity control (or hybrid force-position control, just different names) refers to the act of using different compliance parameters (inertia, stiffness, damping) in different directions in this 6D space. This package lets you specify parameters in all six dimensions, as well as the directions of the six axes.
+
+If you don't want HFVC and just want uniform compliance, that is easy to set too. See the examples below for how to do it.
 
 # SAFETY WARNING
 Force control is a high rate, high order control scheme that can go very wrong very quickly. Make sure you understand what you are doing before using this code. If the compliance parameters are not suitable, e.g. the robot is configured to be too soft and light while force feedback is not well calibrated, the robot will drift away very fast, which can be dangerous. 

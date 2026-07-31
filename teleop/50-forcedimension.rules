@@ -1,0 +1,5 @@
+# Force Dimension haptic devices (omega.x, delta.x, sigma.x, lambda.x)
+# USB vendor ID 0x1451. Grants USB access to members of the "plugdev" group
+# and to the currently logged-in (seated) user via systemd uaccess,
+# so the SDK programs can talk to the device without running as root.
+SUBSYSTEM=="usb", ATTRS{idVendor}=="1451", MODE="0660", GROUP="plugdev", TAG+="uaccess"

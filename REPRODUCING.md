@@ -1,8 +1,9 @@
 # Reproducing the audited environment
 
-This repository intentionally reproduces the standalone `force_control` C++
-library. It does not copy build products, Conda environments, robot
-calibration, MuJoCo assets, or logs from the development machine.
+This repository reproduces the standalone `force_control` C++ library and
+includes the self-contained FlipUp MuJoCo environment. It does not copy build
+products, Conda environments, robot calibration, experiment datasets, or logs
+from the development machine.
 
 ## Audited baseline
 
@@ -43,18 +44,21 @@ cmake --build build/consumer
 Alternatively, `docker build --tag force-control:0.1.0 .` performs configure,
 build, test, and install inside the pinned Ubuntu base image.
 
-## Environment boundaries
+## FlipUp environment
 
-MuJoCo was not linked, imported, or referenced by `force_control`. In the
-audited workstation it belonged to a separate stack:
+The C++ library remains independent of MuJoCo. The Python additions are:
 
-| Concern | Repository | Audited runtime |
-| --- | --- | --- |
-| MuJoCo environments and MJCF assets | [PyriteEnvSuites](https://github.com/yifan-hou/PyriteEnvSuites) | Python 3.10.20, MuJoCo 3.2.7, dm-control 1.0.27 |
-| Real-robot adapters and deployed controller YAML | [hardware_interfaces](https://github.com/yifan-hou/hardware_interfaces) | Robot- and workstation-specific |
-| Task type conversions | [PyriteConfig](https://github.com/yifan-hou/PyriteConfig) | Pyrite-specific |
+| Concern | Location |
+| --- | --- |
+| MuJoCo scene, controller, heuristic, meshes, and textures | `flipup_minimal/` |
+| Force Dimension haptic bridge and device-free dry run | `teleop/` |
+| Optional Zarr dataset support | `teleop/requirements_dataset.txt` |
 
-Those projects should be reproduced through a separate umbrella repository
-with commit-pinned submodules and their own environment lock. In particular,
-large experiment logs and hardware-specific state should never be copied into
-this repository.
+The Python package declares broad compatible dependency versions so a new
+machine can resolve packages appropriate for its platform. Python 3.10,
+MuJoCo 3.2.7, and dm-control 1.0.27 are a known-good reference, not a mandatory
+byte-for-byte lock. Follow the commands in `README.md` and validate with seed 0.
+
+The proprietary Force Dimension SDK, robot calibration, experiment datasets,
+and generated videos remain external. Large logs and hardware-specific state
+must not be committed.

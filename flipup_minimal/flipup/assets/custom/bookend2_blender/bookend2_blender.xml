@@ -1,0 +1,29 @@
+<mujoco model="bookend2_blender">
+  <default>
+    <default class="visual">
+      <geom group="2" type="mesh" contype="0" conaffinity="0"/> <!--  contype⁠=⁠conaffinity⁠=0 make it ignored by dynamics -->
+    </default>
+    <default class="collision_high_friction">
+      <geom group="3" type="mesh" friction="0.8 0.02 0.0000" solref="0.01 1.0" priority="10"/>
+    </default>
+    <default class="collision_low_friction">
+      <geom group="3" type="mesh" friction="0.1 0.02 0.0000" solref="0.01 1.0" priority="10"/>
+    </default>
+  </default>
+  <asset>
+    <texture type="2d" name="rusty_metal_03" file="rusty_metal_03.png"/>
+    <material name="0.615686_0.811765_0.929412_0.000000_0.000000" texture="rusty_metal_03" specular="0.0" shininess="0.0"/>
+    <mesh file="bookend2_blender.obj"/>
+    <mesh file="bookend2_blender_collision_0.obj"/>
+    <mesh file="bookend2_blender_collision_1.obj"/>
+    <mesh file="bookend2_blender_collision_2.obj"/>
+  </asset>
+  <worldbody>
+    <body name="bookend2_blender">
+      <geom material="0.615686_0.811765_0.929412_0.000000_0.000000" mesh="bookend2_blender" class="visual"/>
+      <geom mesh="bookend2_blender_collision_0" rgba="1 0 0 1" class="collision_high_friction"/> <!-- wall -->
+      <geom mesh="bookend2_blender_collision_1" rgba="0 1 0 1" class="collision_low_friction"/> <!-- corner -->
+      <geom mesh="bookend2_blender_collision_2" rgba="0 0 1 1" class="collision_high_friction"/> <!-- floor -->
+    </body>
+  </worldbody>
+</mujoco>

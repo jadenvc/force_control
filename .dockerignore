@@ -2,3 +2,5 @@
 .github
 build
 *.log
+flipup_minimal
+teleop

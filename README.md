@@ -97,6 +97,35 @@ The checked-in `Dockerfile` performs the same release build and smoke test:
 docker build --tag force-control:0.1.0 .
 ```
 
+## FlipUp MuJoCo environment
+
+The standalone UR5e + WSG50 book-pivot environment and all required MuJoCo
+assets are included in [`flipup_minimal`](flipup_minimal). The optional
+Force Dimension haptic bridge is in [`teleop`](teleop).
+
+Use a current Python 3.10-or-newer environment rather than trying to reproduce
+one workstation package-for-package. On Ubuntu, a minimal setup is:
+
+```sh
+sudo apt-get install python3-venv libgl1 libglfw3 libosmesa6 ffmpeg
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install --editable ./flipup_minimal
+python -m pip install --requirement teleop/requirements.txt
+```
+
+Run the environment without hardware or a viewer:
+
+```sh
+python teleop/teleop_flipup.py --dry-run --no-view
+```
+
+For physical haptics, install a compatible Force Dimension SDK separately,
+install [`teleop/50-forcedimension.rules`](teleop/50-forcedimension.rules), and
+set `FORCEDIMENSION_LIB` to the SDK's `libdrd.so.3` if it is not on the system
+library path. See [`teleop/README.md`](teleop/README.md) for details.
+
 ## Optional plotting environment
 
 The controller library itself does not require Python. To reproduce the
@@ -151,9 +180,9 @@ admittance_controller:
   direct_force_control_I_limit: [0, 0, 0, 0, 0, 0]
 ```
 
-MuJoCo is not a dependency of this library. The MuJoCo environments and MJCF
-assets used by the broader Pyrite stack live in the separate
-[`PyriteEnvSuites`](https://github.com/yifan-hou/PyriteEnvSuites) repository.
+MuJoCo is not a dependency of the C++ force-control library. The bundled
+FlipUp environment is an independent Python package and does not change the
+native library build.
 
 ## c++ code example
 Headers:

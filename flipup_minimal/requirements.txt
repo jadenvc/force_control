@@ -1,0 +1,6 @@
+dm-control>=1.0.20
+mujoco>=3.2
+numpy>=1.24
+scipy>=1.10
+spatialmath-python>=1.1
+toppra>=0.6

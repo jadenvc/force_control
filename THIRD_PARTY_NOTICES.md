@@ -10,3 +10,7 @@ The reproducible build downloads these unmodified source releases:
 
 The upstream license files are installed under
 `share/doc/force_control/licenses` with the library.
+
+The bundled FlipUp assets have additional notices in
+`flipup_minimal/THIRD_PARTY_NOTICES.md`. The Force Dimension SDK is not
+redistributed by this repository.

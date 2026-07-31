@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flipup-minimal"
+version = "0.2.0"
+description = "Standalone MuJoCo FlipUp environment with a scripted heuristic"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {file = "LICENSE"}
+dependencies = [
+    "dm-control>=1.0.20",
+    "mujoco>=3.2",
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "spatialmath-python>=1.1",
+    "toppra>=0.6",
+]
+
+[project.scripts]
+flipup-demo = "flipup.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["flipup*"]
+
+[tool.setuptools.package-data]
+flipup = ["assets/**/*"]

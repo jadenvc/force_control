@@ -2,3 +2,5 @@ test/data/*.txt
 .vscode/
 *sublime*
 build/
+*.log
+.venv/

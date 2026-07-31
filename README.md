@@ -47,36 +47,87 @@ For your own safety, the following steps are recommended before launching a forc
 8. Redo the above for rotational axes. Note the order of magnitude of parameters are quiet different between rotational and translational axes.
 
 # Install
-## Dependency
-Please install the following packages:
-* [cpplibrary](https://github.com/yifan-hou/cpplibrary)
 
-## Build
-``` sh
+## Reproducible dependencies
+
+The default CMake build downloads and verifies the same core dependency
+versions used by the audited development environment:
+
+* Eigen 3.4.0
+* yaml-cpp 0.8.0
+* [cpplibrary](https://github.com/yifan-hou/cpplibrary) commit
+  `e01dc4ccd68363a571e1f6a3c8cd3ba6dbec130c`
+
+Each source archive is protected by a SHA-256 checksum in
+[`CMakeLists.txt`](CMakeLists.txt). Nothing needs to be installed under
+`/usr/local` or `~/.local` before configuring this project.
+
+The baseline system used for the container and CI build is Ubuntu 22.04 with
+GCC 11 and C++17. The Dockerfile pins the multi-platform Ubuntu image by digest.
+
+## Native build
+
+Install CMake 3.20 or newer, a C++ compiler, and Git. On Ubuntu 22.04:
+
+```sh
+sudo apt-get update
+sudo apt-get install --yes build-essential ca-certificates cmake git
+```
+
+Then configure, build, test, and install:
+
+```sh
+git clone https://github.com/jadenvc/force_control.git
 cd force_control
-mkdir build && cd build
-cmake ..
-make -j
-make install
+cmake --preset release
+cmake --build --preset release
+ctest --preset release
+cmake --install build/release
+```
+
+The preset installs into `build/install`, keeping the host system unchanged.
+Use `--prefix /your/prefix` with the final command to choose another
+installation location.
+
+## Container build
+
+The checked-in `Dockerfile` performs the same release build and smoke test:
+
+```sh
+docker build --tag force-control:0.1.0 .
+```
+
+## Optional plotting environment
+
+The controller library itself does not require Python. To reproduce the
+environment used by `scripts/plot.py`, create a virtual environment and install
+the two pinned plotting packages:
+
+```sh
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install --requirement requirements-plot.txt
 ```
 
 # How to use
-## Use with cmake
-``` makefile
-# replace ${CMAKE_INSTALL_PREFIX} with your install location
-find_library(FORCE_CONTROLLERS FORCE_CONTROLLERS HINTS ${CMAKE_INSTALL_PREFIX}/lib/)
-find_library(RUT Utilities HINTS ${CMAKE_INSTALL_PREFIX}/lib/RobotUtilities)
 
-# your executable
+## Use with cmake
+
+After installing, point `CMAKE_PREFIX_PATH` at the chosen prefix and consume the
+exported target:
+
+```cmake
+find_package(force_control 0.1 CONFIG REQUIRED)
+
 add_executable(force_control_demo src/main.cc)
-target_link_libraries(force_control_demo
-  ${RUT}
-  ${FORCE_CONTROLLERS}
-)
+target_link_libraries(force_control_demo PRIVATE force_control::force_control)
 ```
 
 ## config example
-Save the following as `config.yaml`:
+
+A complete, smoke-tested configuration is checked in at
+[`config/example.yaml`](config/example.yaml):
+
 ``` yaml
 admittance_controller:
   dt: 0.002
@@ -99,6 +150,10 @@ admittance_controller:
     D_rot: 0
   direct_force_control_I_limit: [0, 0, 0, 0, 0, 0]
 ```
+
+MuJoCo is not a dependency of this library. The MuJoCo environments and MJCF
+assets used by the broader Pyrite stack live in the separate
+[`PyriteEnvSuites`](https://github.com/yifan-hou/PyriteEnvSuites) repository.
 
 ## c++ code example
 Headers:

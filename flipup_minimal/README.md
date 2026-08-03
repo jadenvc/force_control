@@ -12,9 +12,17 @@ The scene uses the original PyriteEnvSuites UR5e, WSG50, RealSense D435i,
 table, book, bookend, and reference-frame models, including their original
 visual meshes and textures.
 
-Collision filtering allows only robot-book and book-bookend-support contact.
-Robot self-contact and all contacts involving the decorative table, floor, or
-reference frame are disabled.
+Collision filtering allows robot-book, book-bookend-support, and WSG50-surface
+guard contact. Robot self-contact and all contacts involving the decorative
+table, global floor, or reference frame are disabled. The surface guard is an
+oversized flat box recessed 1 mm below the book support, with its edges outside
+the working area. It is strongly overdamped to avoid rebound and uses low
+friction so the rounded pads can slide.
+
+For stable edge contact, the visual fin-ray fingers are collision-free: one
+rounded capsule per fingertip contacts a convex book collider with a 0.5 mm
+edge radius. The book collider is generated deterministically by
+`tools/generate_rounded_book_collider.py`.
 
 ## Install
 

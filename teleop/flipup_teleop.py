@@ -44,8 +44,8 @@ What this adds on top of it
 Measured notes that shaped the defaults (see teleop/README.md for the rest):
 
 * **Do not soften the task-space stiffness.** 16 kN/m looks unrenderable, but
-  the flip needs it: the fingertip pad is a 4.2 mm capsule contacting the book
-  7.5 mm below its top edge, so a few mm of sag loses the edge. Sweeping the
+  the flip needs it: each fingertip is a single 8 mm-radius capsule contacting
+  the book 7.5 mm below its top edge, so a few mm of sag loses the edge. Sweeping the
   shipped heuristic over tool_kp, the flip succeeds at 16000 and 12000 and fails
   at every value at or below 8000. What makes the stiff arm renderable anyway is
   that this task's contact forces are ~10x BallPush's (19 N median while
@@ -633,7 +633,7 @@ class FlipUpTeleop(FlipUpEnv):
         ]
 
     def make_camera(self, width=640, height=480, quality="fast",
-                    azimuth=45.0, elevation=-20.0, distance=0.65, lookat=None,
+                    azimuth=-30.0, elevation=-25.0, distance=0.75, lookat=None,
                     camera=None):
         """Return ``render() -> HxWx3 RGB`` for a camera on this scene.
 

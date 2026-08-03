@@ -214,7 +214,7 @@ are never written.
 Two task configurations are installed in PyriteML:
 
 ```bash
-cd /path/to/PyriteML
+cd /home/yifan/git/PyriteML
 
 # Standard diffusion behavior cloning: 9D pose actions
 accelerate launch train.py --config-name=train_dp_workspace \
@@ -232,15 +232,31 @@ Both use two RGB frames, three pose frames, eight sensed-F/T frames, and a
 
 ## Contact allowlist
 
-The simulation permits only **robot ↔ book** and **book ↔ bookend support**
-contact. Collision bits disable every other combination, including robot
-self-contact, robot ↔ bookend/table/floor, and book ↔ the decorative table or
-floor. The visible small support under the book belongs to the
-`bookend2_blender` fixture; it is not the separate `table/table` asset.
+The simulation permits **robot ↔ book**, **book ↔ bookend support**, and
+**WSG50 ↔ surface guard** contact. Collision bits disable every other
+combination, including robot self-contact, arm/camera ↔ support, and book ↔ the
+decorative table, global floor, or guard. The visible small support under the
+book belongs to the `bookend2_blender` fixture; it is not the separate
+`table/table` asset.
 
-This uses MuJoCo collision filtering rather than explicit contact pairs, so the
-book's configured friction and the original contact solver parameters are
-preserved.
+The WSG50 guard is an oversized flat box recessed 1 mm below the support top,
+with its edges outside the gripper workspace rather than beside the fingertips.
+Its independent contact channel is overdamped (`solref="0.015 2"`) and
+near-frictionless (`0.01` sliding), so the gripper gets a dead-stop response with
+essentially no rebound while remaining free to slide. These settings do not
+alter the book's floor, pivot, or wall contacts.
+
+This uses MuJoCo collision filtering rather than explicit contact pairs. The
+higher-priority fingertip and bookend geoms own the effective pair friction and
+solver parameters; the book's values remain its fallback when it meets a geom
+without a higher contact priority.
+
+The rendered fin-ray fingers are not collision meshes. Each finger has one
+8 mm-radius capsule pad, eliminating the old overlapping sharp-mesh/capsule
+contacts. The book uses a deterministic convex rounded-box collider with a
+0.5 mm nominal edge radius. Regenerate that checked-in asset with
+`python flipup_minimal/tools/generate_rounded_book_collider.py` from the repository
+root.
 
 ## Haptics
 
@@ -260,7 +276,7 @@ k_handle = tool_kp × scale × force_gain          (N/m at the handle)
 and the loop is only passive while `k_handle < 2 × damping / T_effective`, where
 `T_effective = 1/control_freq + 2 × force_tau`. The obvious move — soften the
 arm until `tool_kp` is "renderable" — **does not work here**: the fingertip pad
-is a 4.2 mm capsule bearing on the book 7.5 mm below its top edge, so a few mm of
+is an 8 mm-radius capsule bearing on the book 7.5 mm below its top edge, so a few mm of
 sag loses the edge. Sweeping the shipped heuristic trajectory over `tool_kp`:
 
 | `tool_kp` (N/m) | scripted flip on the seeds it solves | free-space lag |
@@ -445,7 +461,7 @@ bottom (green = force sent to the handle, red = sim force × gain) and the same
 per-axis panel on the right (bright = sent, dim = sim × gain, **in device axes**,
 each channel autoscaled with its scale printed).
 
-The default camera looks **just off head-on**: `--cam-azimuth 15
+The default camera uses a **left-oblique view**: `--cam-azimuth -30
 --cam-elevation -25 --cam-distance 0.75`, aimed at the middle of the flip arc, with
 **`--arm-view hidden`** drawing only the WSG50 and not the UR5e links. Hiding the
 arm is what makes that view usable — the forearm otherwise fills 14–39% of the frame
@@ -455,12 +471,13 @@ links translucent instead, `full` restores them. It is a visualization change on
 (`geom_group`/`geom_rgba` play no part in collision detection), so the physics is
 bit-for-bit identical.
 
-**Why 15° and not 0°.** At *exactly* azimuth 0 the flip angle is geometrically
+**Why −30° and not 0°.** At *exactly* azimuth 0 the flip angle is geometrically
 invisible: the book's long axis rotates in the world x–z plane, that plane contains
 the view direction, so the axis projects to a *vertical line for every tilt and
 every elevation* — only its apparent length changes, and not even monotonically (at
 elevation −25 the projected length runs 0.91 → 0.57 → 0.09 → 0.42 as the tilt goes
-0° → 30° → 60° → 90°). 15° of side angle is enough to break that degeneracy.
+0° → 30° → 60° → 90°). A −30° left-oblique angle breaks that degeneracy and exposes
+more of the book-support contact without becoming fully side-on.
 Measured apparent tilt against a true 35.4°, arm hidden, at the default elevation
 and distance:
 
@@ -468,14 +485,14 @@ and distance:
 | --- | --- | --- | --- |
 | 0 | 89.9° — carries no information | 7.4% | 22.8k |
 | 10 | 63.2° | 7.1% | 21.9k |
-| **15 (default)** | **59.2°** | 6.9% | 21.3k |
+| 15 | 59.2° | 6.9% | 21.3k |
 | 20 | 56.4° | 6.7% | 20.5k |
-| 30 | 52.6° | 6.0% | 18.5k |
+| **−30 (default)** | **52.6°** | **6.0%** | **18.5k** |
 
-The angle still reads exaggerated at 15° (59° for a true 35°), so the viewer prints
-**`book NN.N deg from vertical (need < 15)`** in the top-left, turning green on
-success. Raise `--cam-azimuth` toward 45–90 to judge the angle geometrically rather
-than off that overlay.
+The angle still reads somewhat exaggerated at −30° (53° for a true 35°), so the
+viewer prints **`book NN.N deg from vertical (need < 15)`** in the top-left,
+turning green on success. Increase `|--cam-azimuth|` toward 45–90 to judge the
+angle geometrically rather than off that overlay.
 
 At the defaults the loop holds **real-time factor 1.00 at 1000 Hz** with the
 viewer at 25–30 fps. `--no-view` runs headless (still records video if asked).

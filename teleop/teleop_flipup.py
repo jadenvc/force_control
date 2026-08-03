@@ -75,9 +75,9 @@ from flipup.physical_properties import (  # noqa: E402
 
 
 # Force Dimension's device frame is +x toward the operator, +y to the operator's
-# right, +z up. The default camera sits just off head-on (azimuth 15), so the push
-# direction runs mostly INTO the screen with a slight rightward lean, and the lift
-# direction is straight up the screen. So the natural mapping is
+# right, +z up. The default camera uses a left-oblique view (azimuth -30), so the
+# push direction runs mostly INTO the screen with a visible leftward lean, and
+# the lift direction is straight up the screen. So the natural mapping is
 #     handle away from you (dev -x) -> tool into the bookend (sim +x)
 #     handle up             (dev +z) -> tool up                (sim +z)
 # and sim y takes -y_dev to keep the mapping right-handed. Same default as
@@ -202,7 +202,7 @@ def main():
     parser.add_argument("--tool-kp", type=float, default=DEFAULT_TOOL_KP,
                         help="task-space translational stiffness (N/m). Leave alone: "
                              "the flip needs the shipped 16000 because the fingertip "
-                             "pad is a 4.2 mm capsule on the book's top edge, and the "
+                             "pad is an 8 mm-radius capsule on the book's top edge, and the "
                              "scripted flip fails at every value <= 8000. Lowering it "
                              "does NOT soften the felt force -- --stiffness does that.")
     parser.add_argument("--tool-rot-kp", type=float, default=DEFAULT_TOOL_ROT_KP,
@@ -368,15 +368,15 @@ def main():
                         help="full ~75 ms/frame, fast (no reflection/shadow/skybox) "
                              "~51 ms, collision (collision geoms only) ~9 ms. The cost "
                              "is the high-resolution meshes, not the resolution")
-    parser.add_argument("--cam-azimuth", type=float, default=15.0,
+    parser.add_argument("--cam-azimuth", type=float, default=-30.0,
                         help="0 is dead-on the way the robot reaches (world +x), 90 is "
-                             "square on to the plane the book pivots in. Default 15 is "
-                             "just off head-on: enough side angle that the book's tilt "
-                             "reads at all, which at exactly 0 it geometrically cannot "
+                             "square on to the plane the book pivots in. Default -30 is "
+                             "left-oblique: enough side angle that the book's tilt "
+                             "reads clearly, which at exactly 0 it geometrically cannot "
                              "(the long axis projects to a vertical line for EVERY tilt "
                              "and elevation there). Measured apparent tilt at a true "
-                             "35.4 deg: az 0 -> 89.9 deg (no information), az 15 -> 59.2, "
-                             "az 30 -> 52.6, az 90 -> ~35. Raise it toward 45-90 to judge "
+                             "35.4 deg: az 0 -> 89.9 deg (no information), |az| 15 -> 59.2, "
+                             "|az| 30 -> 52.6, |az| 90 -> ~35. Increase |azimuth| to judge "
                              "the angle geometrically rather than off the overlay")
     parser.add_argument("--cam-elevation", type=float, default=-25.0,
                         help="degrees above the horizontal, negative = looking down. "

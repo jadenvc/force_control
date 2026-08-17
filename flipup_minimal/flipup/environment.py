@@ -56,6 +56,7 @@ class FlipUpEnv:
         *,
         show_viewer: bool = True,
         physical_properties: PhysicalProperties = DEFAULT_PHYSICAL_PROPERTIES,
+        collision_envelope_dimensions: FloatArray | None = None,
     ) -> None:
         self._validate_transform(bookend_transform, "bookend_transform")
         self._validate_transform(book_transform, "book_transform")
@@ -65,6 +66,7 @@ class FlipUpEnv:
             bookend_transform,
             book_transform,
             physical_properties,
+            collision_envelope_dimensions=collision_envelope_dimensions,
         )
         self.model = self.physics.model
         self.data = self.physics.data
@@ -162,8 +164,16 @@ class FlipUpEnv:
     def _configure_book_model(
         book_model: mjcf.RootElement,
         properties: PhysicalProperties,
+        collision_envelope_dimensions: FloatArray | None = None,
     ) -> None:
-        """Resize the book and set contact/inertial properties before compilation."""
+        """Resize the book and set contact/inertial properties before compilation.
+
+        Teleoperation may resize the primitive collision geom between episodes.
+        Compiling it at the largest possible dimensions keeps MuJoCo's immutable
+        broad-phase bounds conservative while the active box is only shrunk at
+        runtime.  Direct users omit ``collision_envelope_dimensions`` and get an
+        exact-size collider as before.
+        """
         book_mesh = book_model.find("mesh", "book2_blend")
         collision_geom = book_model.find("geom", "book_collision")
         if book_mesh is None or collision_geom is None:
@@ -175,16 +185,28 @@ class FlipUpEnv:
             properties.width_m / base.width_m,
             properties.thickness_m / base.thickness_m,
         )
-        collision_geom.pos = (
-            properties.length_m / 2.0,
-            properties.width_m / 2.0,
-            properties.thickness_m / 2.0,
+        dimensions = np.asarray(
+            (
+                properties.length_m,
+                properties.width_m,
+                properties.thickness_m,
+            )
+            if collision_envelope_dimensions is None
+            else collision_envelope_dimensions,
+            dtype=np.float64,
         )
-        collision_geom.size = (
-            properties.length_m / 2.0,
-            properties.width_m / 2.0,
-            properties.thickness_m / 2.0,
+        if dimensions.shape != (3,) or np.any(~np.isfinite(dimensions)):
+            raise ValueError("collision_envelope_dimensions must be finite xyz")
+        physical_dimensions = np.array(
+            [properties.length_m, properties.width_m, properties.thickness_m],
+            dtype=np.float64,
         )
+        if np.any(dimensions < physical_dimensions) or np.any(dimensions <= 0.0):
+            raise ValueError(
+                "collision_envelope_dimensions must contain the physical book"
+            )
+        collision_geom.pos = tuple(dimensions / 2.0)
+        collision_geom.size = tuple(dimensions / 2.0)
         collision_geom.mass = properties.mass_kg
         collision_geom.friction = properties.friction
 
@@ -202,22 +224,33 @@ class FlipUpEnv:
         world_model: mjcf.RootElement,
         *,
         robot_geoms: tuple[mjcf.Element, ...],
+        surface_robot_geoms: tuple[mjcf.Element, ...],
         object_geom: mjcf.Element,
         support_geoms: tuple[mjcf.Element, ...],
+        robot_surface_geoms: tuple[mjcf.Element, ...],
+        robot_table_geom: mjcf.Element,
     ) -> None:
-        """Allow only robot-object and object-support contact."""
-        # Use one directed collision bit: the object emits it, while only the
-        # robot and its physical support accept it. This removes robot
-        # self-contact, robot-fixture contact, the floor, and the unused large
-        # table while retaining MuJoCo's normal geom-derived friction and
-        # solver parameters for the two allowed interaction classes.
+        """Enable task, visible-fixture, and complete-table contact.
+
+        Three independent directed bits prevent duplicate contacts: the book
+        contacts the physical book support and robot; visual-aligned duplicate
+        support geoms contact only the WSG50; and every robot geom contacts the
+        complete rendered tabletop.  Robot self-contact remains disabled.
+        """
         for geom in world_model.find_all("geom"):
             geom.contype = 0
             geom.conaffinity = 0
 
         object_geom.contype = 1
-        for geom in (*robot_geoms, *support_geoms):
+        for geom in support_geoms:
             geom.conaffinity = 1
+        for geom in robot_geoms:
+            geom.conaffinity = 5  # book bit 1 | table bit 4
+        for geom in surface_robot_geoms:
+            geom.conaffinity = 7  # book 1 | visible support 2 | table 4
+        for geom in robot_surface_geoms:
+            geom.contype = 2
+        robot_table_geom.contype = 4
 
     @classmethod
     def _build_physics(
@@ -225,6 +258,8 @@ class FlipUpEnv:
         bookend_transform: FloatArray,
         book_transform: FloatArray,
         physical_properties: PhysicalProperties,
+        *,
+        collision_envelope_dimensions: FloatArray | None = None,
     ) -> Physics:
         world_model = mjcf.from_path(str(ASSET_DIR / "ground.xml"))
 
@@ -239,7 +274,8 @@ class FlipUpEnv:
         if attachment_site is None:
             raise RuntimeError("UR5e attachment site is missing")
         gripper_model = mjcf.from_path(str(ASSET_DIR / "wsg50" / "wsg50.xml"))
-        robot_collision_geoms += cls._collision_geoms(gripper_model)
+        gripper_collision_geoms = cls._collision_geoms(gripper_model)
+        robot_collision_geoms += gripper_collision_geoms
         attachment_site.attach(gripper_model)
 
         camera_mount_site = gripper_model.find("site", "cam_mount")
@@ -264,6 +300,9 @@ class FlipUpEnv:
         robot_site.attach(robot_model)
 
         table_model = mjcf.from_path(str(ASSET_DIR / "custom" / "table" / "table.xml"))
+        table_surface_geom = table_model.find("geom", "table_surface")
+        if table_surface_geom is None:
+            raise RuntimeError("Robot-safe table surface geom is missing")
         table_site = world_model.worldbody.add(
             "site",
             name="table_attachment_site",
@@ -274,7 +313,20 @@ class FlipUpEnv:
         bookend_model = mjcf.from_path(
             str(ASSET_DIR / "custom" / "bookend2_blender" / "bookend2_blender.xml")
         )
-        support_collision_geoms = cls._collision_geoms(bookend_model)
+        robot_surface_names = {
+            "robot_wall_surface",
+            "robot_pivot_surface",
+            "robot_floor_surface",
+        }
+        all_support_geoms = cls._collision_geoms(bookend_model)
+        robot_surface_geoms = tuple(
+            geom for geom in all_support_geoms if geom.name in robot_surface_names
+        )
+        support_collision_geoms = tuple(
+            geom for geom in all_support_geoms if geom.name not in robot_surface_names
+        )
+        if len(robot_surface_geoms) != len(robot_surface_names):
+            raise RuntimeError("Visible-aligned robot support surfaces are missing")
         cls._attach_model(
             world_model,
             bookend_model,
@@ -285,7 +337,11 @@ class FlipUpEnv:
         book_model = mjcf.from_path(
             str(ASSET_DIR / "custom" / "book2_blend" / "book2_blend.xml")
         )
-        cls._configure_book_model(book_model, physical_properties)
+        cls._configure_book_model(
+            book_model,
+            physical_properties,
+            collision_envelope_dimensions=collision_envelope_dimensions,
+        )
         book_collision_geom = book_model.find("geom", "book_collision")
         if book_collision_geom is None:
             raise RuntimeError("Flip object collision geom is missing")
@@ -306,13 +362,14 @@ class FlipUpEnv:
             freejoint=False,
         )
 
-        # The fixture that physically supports the book is the bookend model's
-        # floor/wall/corner, not the separate large decorative table asset.
         cls._configure_contact_allowlist(
             world_model,
             robot_geoms=robot_collision_geoms,
+            surface_robot_geoms=gripper_collision_geoms,
             object_geom=book_collision_geom,
             support_geoms=support_collision_geoms,
+            robot_surface_geoms=robot_surface_geoms,
+            robot_table_geom=table_surface_geom,
         )
 
         return mjcf.Physics.from_mjcf_model(world_model)

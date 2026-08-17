@@ -21,11 +21,46 @@ import numpy as np
 import fdsdk
 
 
+def advance_reflected_force(filtered, applied, target, *, dt_s, tau_s, rate_n_s):
+    """One measured-time filter/slew step for the independent device servo."""
+    filtered = np.asarray(filtered, dtype=float).copy()
+    applied = np.asarray(applied, dtype=float).copy()
+    target = np.asarray(target, dtype=float)
+    if tau_s > 0.0:
+        alpha = 1.0 - np.exp(-float(dt_s) / float(tau_s))
+    else:
+        alpha = 1.0
+    filtered += alpha * (target - filtered)
+    step = filtered - applied
+    step_norm = np.linalg.norm(step)
+    budget = float(rate_n_s) * float(dt_s)
+    if rate_n_s > 0.0 and step_norm > budget:
+        step *= budget / max(step_norm, 1e-12)
+    applied += step
+    return filtered, applied
+
+
+def advance_grip_force(filtered, applied, target, *, dt_s, tau_s, rate_n_s):
+    """Causal scalar filter and slew limit for the omega.7 gripper channel."""
+    if tau_s > 0.0:
+        alpha = 1.0 - np.exp(-float(dt_s) / float(tau_s))
+    else:
+        alpha = 1.0
+    filtered = float(filtered) + alpha * (float(target) - float(filtered))
+    step = filtered - float(applied)
+    budget = float(rate_n_s) * float(dt_s)
+    if rate_n_s > 0.0:
+        step = float(np.clip(step, -budget, budget))
+    return filtered, float(applied) + step
+
+
 class FDOmega:
     def __init__(self, poll_hz=1000.0, long_press_s=0.7, auto_init=False,
                  read_orientation=True, spring_k=0.0, max_force=10.0,
                  home_pos=None, wall_k=0.0, wall_half=None, damping_b=15.0,
-                 grip_damping=6.0):
+                 grip_damping=6.0, grip_tau_s=0.010, grip_rate_n_s=60.0,
+                 max_grip_force=None, spring_max_force=None,
+                 reflected_tau_s=0.0, reflected_rate=0.0):
         self.poll_dt = 1.0 / poll_hz
         self.long_press_s = long_press_s
         self.auto_init = auto_init
@@ -36,9 +71,21 @@ class FDOmega:
         #       -damping_b*velocity     damping everywhere (crisp, stable feel)
         #   then the force *vector magnitude* is clamped to max_force.
         self.spring_k = spring_k          # N/m
+        self.spring_max_force = (
+            None if spring_max_force is None else float(spring_max_force)
+        )
+        if self.spring_max_force is not None and self.spring_max_force < 0.0:
+            raise ValueError("spring_max_force cannot be negative")
+        self._centering_enabled = bool(self.spring_k > 0.0)
         self.wall_k = wall_k              # N/m
         self.damping_b = damping_b        # N/(m/s)
         self.max_force = max_force        # N (omega.6 peaks ~12 N)
+        self.reflected_tau_s = float(reflected_tau_s)
+        self.reflected_rate = float(reflected_rate)
+        if self.reflected_tau_s < 0.0:
+            raise ValueError("reflected_tau_s cannot be negative")
+        if self.reflected_rate < 0.0:
+            raise ValueError("reflected_rate cannot be negative")
         self.wall_half = None if wall_half is None else np.asarray(wall_half, dtype=float)
         # optional Cartesian home the device is driven to at startup and that the
         # spring/rate-control origin sits at (device coords, metres). None -> use
@@ -52,10 +99,23 @@ class FDOmega:
         self.has_gripper = False          # True on omega.7 (active force gripper)
         self._grip_force = 0.0            # commanded gripper force (N), omega.7
         self.grip_damping = grip_damping # gripper velocity damping N/(m/s) (anti-buzz)
+        self.grip_tau_s = float(grip_tau_s)
+        self.grip_rate_n_s = float(grip_rate_n_s)
+        self.max_grip_force = float(
+            max_force if max_grip_force is None else max_grip_force
+        )
+        if self.grip_tau_s < 0.0:
+            raise ValueError("grip_tau_s cannot be negative")
+        if self.grip_rate_n_s < 0.0:
+            raise ValueError("grip_rate_n_s cannot be negative")
+        if self.max_grip_force < 0.0:
+            raise ValueError("max_grip_force cannot be negative")
 
         # shared state (protected by _lock)
         self._lock = threading.Lock()
         self._pos = np.zeros(3)
+        self._vel = np.zeros(3)
+        self._velocity_valid = False
         self._rot = np.eye(3)
         self._orientation_valid = False
         self._orientation_sample_count = 0
@@ -65,8 +125,14 @@ class FDOmega:
         self._force_cmd = np.zeros(3)    # force we command (the felt resistance)
         self._force_meas = np.zeros(3)   # force the device reports applying
         self._reflected = np.zeros(3)    # externally-supplied force (e.g. sim contact)
-        self._reflected_applied = np.zeros(3)  # low-pass-smoothed reflected force
-        self._grip_applied = 0.0         # low-pass-smoothed gripper force
+        self._reflected_filtered = np.zeros(3)
+        self._reflected_applied = np.zeros(3)  # filtered + slew-limited servo force
+        self._servo_sequence = 0
+        self._servo_timestamp_ns = 0
+        self._servo_dt_s = self.poll_dt
+        self._grip_filtered = 0.0
+        self._grip_applied = 0.0
+        self._grip_cmd = 0.0
         self.short_press_count = 0
         self.long_press_count = 0
 
@@ -186,7 +252,15 @@ class FDOmega:
 
     # ------------------------------------------------------------ haptic loop
     def _loop(self):
+        last_tick = time.perf_counter() - self.poll_dt
+        next_tick = time.perf_counter()
         while self._running:
+            tick = time.perf_counter()
+            raw_servo_dt = max(tick - last_tick, 1e-6)
+            # A delayed Python wake-up means the previous force was physically
+            # held for longer; do not compensate with one unsafe force jump.
+            servo_dt = min(raw_servo_dt, 0.005)
+            last_tick = tick
             ret, x, y, z = fdsdk.GetPosition(self.id)
             pos = np.array([x, y, z]) if ret >= 0 else None
 
@@ -201,7 +275,8 @@ class FDOmega:
 
             gret, gap = fdsdk.GetGripperGap(self.id)
             vret, vx, vy, vz = fdsdk.GetLinearVelocity(self.id)
-            vel = np.array([vx, vy, vz]) if vret >= 0 else np.zeros(3)
+            velocity_sample = np.array([vx, vy, vz]) if vret >= 0 else None
+            vel = velocity_sample if velocity_sample is not None else np.zeros(3)
 
             # force command: elastic (spring + walls + sim contact) + damping.
             f = np.zeros(3)
@@ -209,14 +284,37 @@ class FDOmega:
                 with self._lock:
                     center = self._center.copy()
                     ref_target = self._reflected.copy()
+                    spring_k = self.spring_k if self._centering_enabled else 0.0
+                    spring_max_force = self.spring_max_force
+                    (
+                        self._reflected_filtered,
+                        self._reflected_applied,
+                    ) = advance_reflected_force(
+                        self._reflected_filtered,
+                        self._reflected_applied,
+                        ref_target,
+                        dt_s=servo_dt,
+                        tau_s=self.reflected_tau_s,
+                        rate_n_s=self.reflected_rate,
+                    )
+                    reflected_applied = self._reflected_applied.copy()
                 e = pos - center
-                # sim contact reflection, low-pass smoothed (source updates at
-                # ~20 Hz; smoothing avoids stepwise jolts that can oscillate)
-                self._reflected_applied += 0.1 * (ref_target - self._reflected_applied)
-
-                elastic = np.array(self._reflected_applied)
-                if self.spring_k > 0.0:                 # gentle centering spring
-                    elastic = elastic - self.spring_k * e
+                # Sim contact reflection, filtered and slew-limited on this
+                # independent servo schedule. The producer may update more or
+                # less regularly without changing the N/s force-rate setting.
+                elastic = reflected_applied
+                if spring_k > 0.0:                     # gentle centering spring
+                    spring_force = -spring_k * e
+                    spring_magnitude = np.linalg.norm(spring_force)
+                    if (
+                        spring_max_force is not None
+                        and spring_max_force >= 0.0
+                        and spring_magnitude > spring_max_force
+                    ):
+                        spring_force *= spring_max_force / max(
+                            spring_magnitude, 1e-12
+                        )
+                    elastic = elastic + spring_force
                 if self.wall_k > 0.0 and self.wall_half is not None:
                     over = e - np.clip(e, -self.wall_half, self.wall_half)
                     elastic = elastic - self.wall_k * over   # walls (outside box)
@@ -234,19 +332,32 @@ class FDOmega:
                 if mag > self.max_force:
                     f = f * (self.max_force / mag)
             if self.has_gripper:
-                # omega.7: also command a gripper force (wrist torques left 0),
-                # low-pass smoothed like the reflected force to avoid 20 Hz buzz
+                # The grasp channel gets the same measured-time filtering and
+                # slew limiting as translation.  This prevents a contact onset
+                # or simulator catch-up batch from snapping the user's fingers.
                 with self._lock:
                     fg_target = self._grip_force
-                self._grip_applied += 0.1 * (fg_target - self._grip_applied)
+                    self._grip_filtered, self._grip_applied = advance_grip_force(
+                        self._grip_filtered,
+                        self._grip_applied,
+                        fg_target,
+                        dt_s=servo_dt,
+                        tau_s=self.grip_tau_s,
+                        rate_n_s=self.grip_rate_n_s,
+                    )
+                    grip_applied = self._grip_applied
                 # gripper velocity damping -- ALWAYS on (a little viscosity on
                 # the gripper axis is unnoticeable but kills residual buzz that a
                 # force-scaled damping would leave undamped at small forces)
                 gret2, gvel = fdsdk.GetGripperLinearVelocity(self.id)
-                fg = self._grip_applied
+                fg = grip_applied
                 if self.grip_damping > 0.0 and gret2 >= 0:
                     fg = fg - self.grip_damping * gvel
-                fg = float(np.clip(fg, -self.max_force, self.max_force))
+                fg = float(
+                    np.clip(fg, -self.max_grip_force, self.max_grip_force)
+                )
+                with self._lock:
+                    self._grip_cmd = fg
                 fdsdk.SetForceAndTorqueAndGripperForce(
                     float(f[0]), float(f[1]), float(f[2]), 0.0, 0.0, 0.0,
                     fg, self.id)
@@ -262,6 +373,9 @@ class FDOmega:
             with self._lock:
                 if pos is not None:
                     self._pos = pos
+                if velocity_sample is not None:
+                    self._vel = velocity_sample
+                    self._velocity_valid = True
                 if rot is not None:
                     self._rot = rot
                     self._orientation_valid = True
@@ -271,8 +385,17 @@ class FDOmega:
                 self._force_cmd = f
                 if fmeas is not None:
                     self._force_meas = fmeas
+                self._servo_sequence += 1
+                self._servo_timestamp_ns = time.perf_counter_ns()
+                self._servo_dt_s = raw_servo_dt
 
-            time.sleep(self.poll_dt)
+            # Absolute scheduling avoids the old period of SDK-work + 1 ms.
+            next_tick += self.poll_dt
+            remaining = next_tick - time.perf_counter()
+            if remaining > 0.0:
+                time.sleep(remaining)
+            elif remaining < -5.0 * self.poll_dt:
+                next_tick = time.perf_counter()
 
     def _update_button(self):
         pressed = bool(fdsdk.GetButton(0, self.id))
@@ -295,15 +418,41 @@ class FDOmega:
     # --------------------------------------------------------------- consume
     def set_reflected_force(self, f):
         """Set an external force (device frame, N) added into the haptic loop,
-        e.g. reflecting sim contact. Updated from the control loop (~20 Hz)."""
+        e.g. reflecting the newest force from the simulation control loop."""
         with self._lock:
             self._reflected = np.asarray(f, dtype=float)
+
+    def clear_reflected_force(self):
+        """Immediately discard both pending and smoothed reflected force.
+
+        ``set_reflected_force(0)`` intentionally decays the device-side filter,
+        which is desirable during contact but can carry a stale impulse across
+        an episode reset. Collection boundaries need a hard reset instead.
+        """
+        with self._lock:
+            self._reflected = np.zeros(3)
+            self._reflected_filtered = np.zeros(3)
+            self._reflected_applied = np.zeros(3)
+            self._force_cmd = np.zeros(3)
 
     def set_grip_force(self, fg):
         """Set the gripper force (N) applied on the omega.7 force gripper.
         Positive closes / resists opening; sign depends on hand config."""
         with self._lock:
             self._grip_force = float(fg)
+
+    def clear_grip_force(self):
+        """Hard-clear pending and filtered omega.7 squeeze feedback."""
+        with self._lock:
+            self._grip_force = 0.0
+            self._grip_filtered = 0.0
+            self._grip_applied = 0.0
+            self._grip_cmd = 0.0
+
+    def set_centering_enabled(self, enabled):
+        """Enable or disable the configured Cartesian home spring at runtime."""
+        with self._lock:
+            self._centering_enabled = bool(enabled and self.spring_k > 0.0)
 
     def recenter(self):
         """Reset the spring/rate-control origin. If a home position was given,
@@ -317,15 +466,25 @@ class FDOmega:
         with self._lock:
             return {
                 "pos": self._pos.copy(),
+                "vel": self._vel.copy(),
+                "velocity_valid": self._velocity_valid,
                 "rot": self._rot.copy(),
                 "has_wrist": self.has_wrist,
                 "orientation_valid": self._orientation_valid,
                 "orientation_sample_count": self._orientation_sample_count,
                 "orientation_error_count": self._orientation_error_count,
                 "center": self._center.copy(),
+                "centering_enabled": self._centering_enabled,
                 "gripper": self._gripper,
+                "grip_force_target": self._grip_force,
+                "grip_force_applied": self._grip_cmd,
                 "force_cmd": self._force_cmd.copy(),
                 "force_meas": self._force_meas.copy(),
+                "reflected_target": self._reflected.copy(),
+                "reflected_applied": self._reflected_applied.copy(),
+                "servo_sequence": self._servo_sequence,
+                "servo_timestamp_ns": self._servo_timestamp_ns,
+                "servo_dt_s": self._servo_dt_s,
                 "short_press_count": self.short_press_count,
                 "long_press_count": self.long_press_count,
             }

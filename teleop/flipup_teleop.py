@@ -44,7 +44,7 @@ What this adds on top of it
 Measured notes that shaped the defaults (see teleop/README.md for the rest):
 
 * **Do not soften the task-space stiffness.** 16 kN/m looks unrenderable, but
-  the flip needs it: the fingertip pad is a 4.2 mm capsule contacting the book
+  the flip needs it: the fingertip pad is an 8 mm capsule contacting the book
   7.5 mm below its top edge, so a few mm of sag loses the edge. Sweeping the
   shipped heuristic over tool_kp, the flip succeeds at 16000 and 12000 and fails
   at every value at or below 8000. What makes the stiff arm renderable anyway is
@@ -115,6 +115,32 @@ DEFAULT_FORCE_CLIP = 200.0
 # anyone running much lower --arm-damping; to bound what the OPERATOR feels, use
 # --stiffness and --force-clip instead, which act on the rendering, not the robot.
 DEFAULT_TOOL_FORCE_LIMIT = 0.0
+DEFAULT_SURFACE_FORCE_LIMIT = 80.0
+DEFAULT_PAD_TIME_CONSTANT = 0.010
+
+# Teleoperation keeps the fixture in the better-conditioned placement used by
+# the earlier Force Dimension setup.  The floating controller does not need the
+# extra reach margin, but sharing one scene makes arm/floating demonstrations
+# directly comparable.
+TELEOP_BOOKEND_X_MIN = 0.4
+TELEOP_BOOKEND_X_SPAN = 0.2
+
+# Muted, high-contrast cover colours.  Sampling a palette instead of arbitrary
+# RGB avoids nearly-black books and neon colours that are implausible in the
+# real demonstrations this simulator is intended to approximate.
+BOOK_COLOR_PALETTE = np.array(
+    [
+        [0.64, 0.16, 0.14, 1.0],  # brick red
+        [0.13, 0.25, 0.48, 1.0],  # navy
+        [0.16, 0.43, 0.27, 1.0],  # forest green
+        [0.67, 0.43, 0.12, 1.0],  # ochre
+        [0.12, 0.43, 0.46, 1.0],  # teal
+        [0.42, 0.25, 0.16, 1.0],  # brown
+        [0.43, 0.20, 0.43, 1.0],  # plum
+        [0.32, 0.36, 0.40, 1.0],  # slate
+    ],
+    dtype=float,
+)
 
 
 def _wxyz_from_matrix(rotation_matrix):
@@ -151,7 +177,11 @@ def flipup_scene(seed=0, properties=DEFAULT_PHYSICAL_PROPERTIES, standoff=0.05):
     rng = np.random.RandomState(seed)
     bookend = SE3.Rt(
         SO3.RPY(90.0, 0.0, 180.0 + rng.uniform(-10.0, 10.0), unit="deg"),
-        [0.3 + rng.uniform(0.0, 0.2), rng.uniform(-0.2, 0.2), 0.2],
+        [
+            TELEOP_BOOKEND_X_MIN + rng.uniform(0.0, TELEOP_BOOKEND_X_SPAN),
+            rng.uniform(-0.2, 0.2),
+            0.2,
+        ],
     )
     book_relative = SE3.Rt(SO3.RPY(90.0, 0.0, 0.0, unit="deg"), [0.015, 0.035, 0.03])
     book = bookend * book_relative
@@ -204,11 +234,119 @@ def flipup_scene(seed=0, properties=DEFAULT_PHYSICAL_PROPERTIES, standoff=0.05):
         # checks on the device axis mapping.
         "push_dir": to_world(-unit_x) - origin,
         "lift_dir": to_world(unit_y) - origin,
+        # Columns map local bookend xyz to world xyz.  Local +x is the
+        # front/standoff direction, +y is lift, and +z is lateral.
+        "bookend_rotation": np.asarray(bookend.R, dtype=float),
+    }
+
+
+def sample_episode_properties(
+    base_properties,
+    rng,
+    *,
+    size_jitter=0.20,
+    mass_jitter=0.20,
+):
+    """Independently vary book height, width and mass around a nominal book.
+
+    ``length_m`` is the upright book height.  Thickness and contact friction
+    deliberately remain fixed so this is a controlled three-factor domain
+    randomization rather than the much broader legacy ``--randomize-physics``.
+    """
+    if not isinstance(base_properties, PhysicalProperties):
+        raise TypeError("base_properties must be a PhysicalProperties")
+    if not (0.0 <= size_jitter < 1.0 and 0.0 <= mass_jitter < 1.0):
+        raise ValueError("size and mass jitter must be in [0, 1)")
+
+    # Rejection only matters at the extreme corner where a -20% height and
+    # +20% width would make the nominal 15 x 10 cm book square.
+    for _ in range(100):
+        length = base_properties.length_m * rng.uniform(
+            1.0 - size_jitter, 1.0 + size_jitter
+        )
+        width = base_properties.width_m * rng.uniform(
+            1.0 - size_jitter, 1.0 + size_jitter
+        )
+        if length > width + 1e-4:
+            break
+    else:  # pragma: no cover - impossible for the shipped nominal geometry
+        raise RuntimeError("could not sample a book with length greater than width")
+    mass = base_properties.mass_kg * rng.uniform(
+        1.0 - mass_jitter, 1.0 + mass_jitter
+    )
+    return PhysicalProperties(
+        mass_kg=float(mass),
+        sliding_friction=base_properties.sliding_friction,
+        torsional_friction=base_properties.torsional_friction,
+        rolling_friction=base_properties.rolling_friction,
+        length_m=float(length),
+        width_m=float(width),
+        thickness_m=base_properties.thickness_m,
+    )
+
+
+def sample_book_color(rng):
+    """Return a reproducible realistic cover colour with slight variation."""
+    base = BOOK_COLOR_PALETTE[int(rng.integers(len(BOOK_COLOR_PALETTE)))].copy()
+    base[:3] = np.clip(base[:3] * rng.uniform(0.88, 1.12), 0.08, 0.82)
+    return base
+
+
+def sample_start_pose(
+    scene,
+    rng,
+    *,
+    prism_size=(0.04, 0.06, 0.05),
+    center_probability=0.70,
+    force_center=False,
+):
+    """Sample a tool start from a fixed prism in front of the book.
+
+    ``prism_size`` is full depth/lateral/vertical size in metres.  With the
+    default mixture, 70% of starts come from a tight clipped Gaussian around
+    the head-on centre and 30% uniformly cover the full prism.  The first
+    episode can use ``force_center`` so every collection begins with a known
+    reference demonstration.
+    """
+    size = np.asarray(prism_size, dtype=float)
+    if size.shape != (3,) or np.any(size < 0.0):
+        raise ValueError("prism_size must contain three nonnegative values")
+    if not 0.0 <= center_probability <= 1.0:
+        raise ValueError("center_probability must be in [0, 1]")
+
+    if force_center:
+        normalized = np.zeros(3)
+        component = "center"
+    elif rng.random() < center_probability:
+        # sigma 0.22 means most central samples stay within roughly the middle
+        # half of the volume.  Clipping retains the advertised hard bounds.
+        normalized = np.clip(rng.normal(0.0, 0.22, size=3), -0.5, 0.5)
+        component = "center_gaussian"
+    else:
+        normalized = rng.uniform(-0.5, 0.5, size=3)
+        component = "uniform"
+
+    # User-facing order is depth/lateral/vertical.  Bookend local coordinates
+    # are front(+x), lift(+y), lateral(+z).
+    offset_dlv = normalized * size
+    offset_local_xyz = np.array(
+        [offset_dlv[0], offset_dlv[2], offset_dlv[1]], dtype=float
+    )
+    rotation = np.asarray(scene["bookend_rotation"], dtype=float)
+    position = np.asarray(scene["prepare"], dtype=float) + rotation @ offset_local_xyz
+    return position, {
+        "component": component,
+        "prism_size_depth_lateral_vertical_m": size,
+        "normalized_depth_lateral_vertical": normalized,
+        "offset_depth_lateral_vertical_m": offset_dlv,
+        "position_world_m": position,
     }
 
 
 class FlipUpTeleop(FlipUpEnv):
     """FlipUp with a Cartesian-position interface and contact-force readout."""
+
+    controller_kind = "joint_arm"
 
     def __init__(
         self,
@@ -219,6 +357,7 @@ class FlipUpTeleop(FlipUpEnv):
         joint_kd=None,
         force_clip=DEFAULT_FORCE_CLIP,
         tool_force_limit=DEFAULT_TOOL_FORCE_LIMIT,
+        surface_force_limit=DEFAULT_SURFACE_FORCE_LIMIT,
         tool_damping=0.0,
         physical_properties=None,
         randomize_physics=False,
@@ -226,6 +365,7 @@ class FlipUpTeleop(FlipUpEnv):
         settle_s=2.5,
         settle_speed=0.25,
         offscreen=(1024, 768),
+        collision_envelope_dimensions=None,
     ):
         if physical_properties is None:
             physical_properties = (
@@ -244,17 +384,79 @@ class FlipUpTeleop(FlipUpEnv):
         self.tool_rot_kd = float(tool_rot_kd)
         self.force_clip = float(force_clip)
         self.tool_force_limit = float(tool_force_limit)
+        self.surface_force_limit = float(surface_force_limit)
+        if self.surface_force_limit < 0.0:
+            raise ValueError("surface_force_limit cannot be negative")
         self.tool_damping = float(tool_damping)
+        self.standoff = float(standoff)
         self.settle_s = float(settle_s)
         self.settle_speed = float(settle_speed)
         self._teleop_ready = False
+
+        if collision_envelope_dimensions is None:
+            collision_envelope_dimensions = np.array(
+                [
+                    1.2 * physical_properties.length_m,
+                    1.2 * physical_properties.width_m,
+                    physical_properties.thickness_m,
+                ],
+                dtype=float,
+            )
 
         super().__init__(
             self.scene["bookend_transform"],
             self.scene["book_transform"],
             show_viewer=False,
             physical_properties=physical_properties,
+            collision_envelope_dimensions=collision_envelope_dimensions,
         )
+        self.physical_properties = physical_properties
+
+        # Runtime book randomization keeps the compiled topology fixed, which
+        # lets the camera/render thread and the recorder remain valid across
+        # episodes.  Contact uses a box geom; the visual mesh is scaled from
+        # this immutable reference copy.
+        self.book_visual_geom_id = self.model.geom(
+            "book2_blend/book_visual"
+        ).id
+        self.book_mesh_id = int(self.model.geom_dataid[self.book_visual_geom_id])
+        mesh_start = int(self.model.mesh_vertadr[self.book_mesh_id])
+        mesh_count = int(self.model.mesh_vertnum[self.book_mesh_id])
+        self._book_mesh_slice = slice(mesh_start, mesh_start + mesh_count)
+        self._book_mesh_reference = np.asarray(
+            self.model.mesh_vert[self._book_mesh_slice], dtype=float
+        ).copy()
+        self._book_mesh_reference_dimensions = np.array(
+            [
+                physical_properties.thickness_m,
+                physical_properties.width_m,
+                physical_properties.length_m,
+            ],
+            dtype=float,
+        )
+        book_attachment_id = int(self.model.body_parentid[self.book_body_id])
+        self.book_free_joint_id = int(self.model.body_jntadr[book_attachment_id])
+        self.book_free_qpos_adr = int(
+            self.model.jnt_qposadr[self.book_free_joint_id]
+        )
+        self.book_color = np.array([0.42, 0.25, 0.16, 1.0], dtype=float)
+        self._book_mesh_version = 0
+
+        # Geom size/position and collision-mesh vertices are not generally safe
+        # runtime edits in MuJoCo.  This primitive was compiled at the largest
+        # episode dimensions, so shrinking it stays inside these conservative
+        # broad-phase bounds.  Preserve those bounds after mj_setConst updates
+        # the randomized body mass/inertia.
+        self._book_collision_envelope_dimensions = 2.0 * np.asarray(
+            self.model.geom_size[self.book_collision_geom_id], dtype=float
+        )
+        self._book_collision_geom_rbound = float(
+            self.model.geom_rbound[self.book_collision_geom_id]
+        )
+        self._book_collision_geom_aabb = np.asarray(
+            self.model.geom_aabb[self.book_collision_geom_id], dtype=float
+        ).copy()
+        self._compiled_bvh_aabb = np.asarray(self.model.bvh_aabb, dtype=float).copy()
 
         self.task_space_kp = np.diag(
             [self.tool_kp] * 3 + [self.tool_rot_kp] * 3
@@ -277,6 +479,7 @@ class FlipUpTeleop(FlipUpEnv):
             if int(self.model.body_rootid[i]) == robot_root
         )
         self._contact_buf = np.zeros(6, dtype=float)
+        self._init_surface_safety()
 
         self.wrist_force_adr = None
         self.wrist_torque_adr = None
@@ -307,6 +510,102 @@ class FlipUpTeleop(FlipUpEnv):
         self.settle_error = float("nan")
         self._teleop_ready = True
         self.reset()
+
+    def configure_episode(self, physical_properties, book_color, tool_home):
+        """Apply per-episode book and starting-pose parameters, then reset.
+
+        No model dimensions change, so complete MuJoCo state snapshots retain a
+        stable shape across all episodes in one dataset.
+        """
+        if not isinstance(physical_properties, PhysicalProperties):
+            raise TypeError("physical_properties must be a PhysicalProperties")
+        color = np.asarray(book_color, dtype=float)
+        if color.shape != (4,) or np.any(~np.isfinite(color)):
+            raise ValueError("book_color must be finite RGBA")
+        tool_home = np.asarray(tool_home, dtype=float)
+        if tool_home.shape != (3,) or np.any(~np.isfinite(tool_home)):
+            raise ValueError("tool_home must be a finite xyz position")
+
+        self.physical_properties = physical_properties
+        self.book_color = np.clip(color, 0.0, 1.0)
+        self.scene = flipup_scene(
+            self.seed, physical_properties, standoff=self.standoff
+        )
+        self.tool_home = tool_home.copy()
+
+        half_size = np.array(
+            [
+                physical_properties.length_m,
+                physical_properties.width_m,
+                physical_properties.thickness_m,
+            ],
+            dtype=float,
+        ) / 2.0
+        if np.any(2.0 * half_size > self._book_collision_envelope_dimensions + 1e-12):
+            raise ValueError(
+                "episode book dimensions exceed the compiled collision envelope"
+            )
+        self.model.geom_size[self.book_collision_geom_id] = half_size
+        self.model.geom_pos[self.book_collision_geom_id] = half_size
+        self.model.geom_friction[
+            self.book_collision_geom_id
+        ] = physical_properties.friction
+
+        # The compiled book mesh axes are thickness, width, length.  Its geom
+        # frame rotates those axes into the book body frame.
+        mesh_dimensions = np.array(
+            [
+                physical_properties.thickness_m,
+                physical_properties.width_m,
+                physical_properties.length_m,
+            ],
+            dtype=float,
+        )
+        self.model.mesh_vert[self._book_mesh_slice] = (
+            self._book_mesh_reference
+            * (mesh_dimensions / self._book_mesh_reference_dimensions)
+        )
+        self._book_mesh_version += 1
+        self.model.geom_pos[self.book_visual_geom_id] = half_size
+        # Disconnect the brick texture for this geom so RGBA is the actual
+        # sampled cover colour rather than a weak tint over a fixed texture.
+        self.model.geom_matid[self.book_visual_geom_id] = -1
+        self.model.geom_rgba[self.book_visual_geom_id] = self.book_color
+
+        mass = physical_properties.mass_kg
+        length, width, thickness = 2.0 * half_size
+        self.model.body_mass[self.book_body_id] = mass
+        self.model.body_ipos[self.book_body_id] = half_size
+        self.model.body_inertia[self.book_body_id] = mass / 12.0 * np.array(
+            [
+                length * length + width * width,
+                length * length + thickness * thickness,
+                width * width + thickness * thickness,
+            ]
+        )
+
+        book_transform = np.asarray(self.scene["book_transform"], dtype=float)
+        book_pose = np.concatenate(
+            [book_transform[:3, 3], _wxyz_from_matrix(book_transform[:3, :3])]
+        )
+        self._initial_qpos[
+            self.book_free_qpos_adr : self.book_free_qpos_adr + 7
+        ] = book_pose
+        self._configure_tool_home()
+        mujoco.mj_setConst(self.model.ptr, self.data.ptr)
+        self.model.geom_rbound[
+            self.book_collision_geom_id
+        ] = self._book_collision_geom_rbound
+        self.model.geom_aabb[
+            self.book_collision_geom_id
+        ] = self._book_collision_geom_aabb
+        self.model.bvh_aabb[:] = self._compiled_bvh_aabb
+        self.reset()
+        return self
+
+    def _configure_tool_home(self):
+        """Hook for the floating controller, whose free joint starts at home."""
+        return None
 
     # ------------------------------------------------------------------ state
     @property
@@ -487,6 +786,104 @@ class FlipUpTeleop(FlipUpEnv):
             force = force * (self.force_clip / magnitude)
         return force
 
+    # --------------------------------------------------------- surface safety
+    def _init_surface_safety(self):
+        names = (
+            "table/table_surface",
+            "bookend2_blender/robot_wall_surface",
+            "bookend2_blender/robot_pivot_surface",
+            "bookend2_blender/robot_floor_surface",
+        )
+        self._surface_guard_geom_ids = frozenset(
+            self.model.geom(name).id for name in names
+        )
+        self._surface_limit_normal = None
+        self._surface_limit_boundary = None
+        self._surface_contact_misses = 0
+        self._surface_contact_grace_steps = max(
+            1, int(round(0.020 / float(self.model.opt.timestep)))
+        )
+        self._requested_target = np.asarray(self.scene["prepare"], dtype=float).copy()
+        self._drive_target = self._requested_target.copy()
+
+    def _active_surface_normal(self):
+        """Return the average outward normal of protected robot contacts."""
+        normals = []
+        for index in range(self.data.ncon):
+            contact = self.data.contact[index]
+            if not self._surface_guard_geom_ids.intersection(
+                (int(contact.geom1), int(contact.geom2))
+            ):
+                continue
+            robot1 = int(self.model.geom_bodyid[contact.geom1]) in self._robot_bodies
+            robot2 = int(self.model.geom_bodyid[contact.geom2]) in self._robot_bodies
+            if robot1 == robot2:
+                continue
+            normal = np.asarray(contact.frame, dtype=float).reshape(3, 3)[0]
+            normals.append(normal if robot2 else -normal)
+        if not normals:
+            return None
+        normal = np.mean(normals, axis=0)
+        magnitude = np.linalg.norm(normal)
+        return None if magnitude < 1e-9 else normal / magnitude
+
+    def surface_safe_target(self, target_pos):
+        """Bound stored normal spring energy after visible-surface contact.
+
+        The operator can still slide tangentially and can pull away immediately.
+        Only the component continuing through the contacted table/support surface
+        is capped, at ``surface_force_limit / tool_kp`` metres of deflection.
+        """
+        target = np.asarray(target_pos, dtype=float)
+        if self.surface_force_limit <= 0.0:
+            return target.copy()
+
+        active_normal = self._active_surface_normal()
+        if self._surface_limit_normal is not None:
+            if active_normal is None:
+                self._surface_contact_misses += 1
+                if self._surface_contact_misses > self._surface_contact_grace_steps:
+                    self._surface_limit_normal = None
+                    self._surface_limit_boundary = None
+                    self._surface_contact_misses = 0
+            else:
+                self._surface_contact_misses = 0
+        if self._surface_limit_normal is None and active_normal is not None:
+            if np.dot(target - self.tool_pos, active_normal) < 0.0:
+                self._surface_limit_normal = active_normal
+                self._surface_limit_boundary = float(
+                    np.dot(self.tool_pos, active_normal)
+                )
+                self._surface_contact_misses = 0
+
+        normal = self._surface_limit_normal
+        if normal is None:
+            return target.copy()
+        target_coordinate = float(np.dot(target, normal))
+        if target_coordinate >= self._surface_limit_boundary:
+            self._surface_limit_normal = None
+            self._surface_limit_boundary = None
+            self._surface_contact_misses = 0
+            return target.copy()
+
+        normal_error = float(np.dot(target - self.tool_pos, normal))
+        max_deflection = self.surface_force_limit / self.tool_kp
+        if normal_error >= -max_deflection:
+            return target.copy()
+        return target + (-max_deflection - normal_error) * normal
+
+    @property
+    def requested_target(self):
+        return self._requested_target.copy()
+
+    @property
+    def drive_target(self):
+        return self._drive_target.copy()
+
+    @property
+    def surface_limit_active(self):
+        return self._surface_limit_normal is not None
+
     @property
     def home_rotvec(self):
         """Tool orientation at the start pose, as a rotation vector.
@@ -541,8 +938,12 @@ class FlipUpTeleop(FlipUpEnv):
     def step(self, target_pos, n_substeps=1, target_rotvec=None):
         """Advance ``n_substeps`` x 1 ms with the tool driven toward the target."""
         for _ in range(max(1, int(n_substeps))):
+            self._requested_target = np.asarray(target_pos, dtype=float).copy()
+            self._drive_target = self.limited_target(
+                self.surface_safe_target(self._requested_target)
+            )
             self.step_task_space(
-                self.target_pose7(self.limited_target(target_pos), target_rotvec)
+                self.target_pose7(self._drive_target, target_rotvec)
             )
         return self
 
@@ -550,6 +951,11 @@ class FlipUpTeleop(FlipUpEnv):
         super().reset()
         if not self._teleop_ready:
             return
+        self._surface_limit_normal = None
+        self._surface_limit_boundary = None
+        self._surface_contact_misses = 0
+        self._requested_target = self.tool_home.copy()
+        self._drive_target = self.tool_home.copy()
         self._wrist_tare = np.zeros(6)
         # Slew the target from the arm's joint home to the operator's start pose
         # instead of stepping it there: a 17 cm jump commands ~2.7 kN through a
@@ -633,7 +1039,7 @@ class FlipUpTeleop(FlipUpEnv):
         ]
 
     def make_camera(self, width=640, height=480, quality="fast",
-                    azimuth=45.0, elevation=-20.0, distance=0.65, lookat=None,
+                    azimuth=-30.0, elevation=-25.0, distance=0.75, lookat=None,
                     camera=None):
         """Return ``render() -> HxWx3 RGB`` for a camera on this scene.
 
@@ -679,6 +1085,17 @@ class FlipUpTeleop(FlipUpEnv):
             overrides = {mujoco.mjtRndFlag.mjRND_REFLECTION: False}
 
         def render():
+            uploaded_version = getattr(render, "book_mesh_version", -1)
+            if uploaded_version != self._book_mesh_version:
+                contexts = self.physics.contexts
+                with contexts.gl.make_current() as context:
+                    context.call(
+                        mujoco.mjr_uploadMesh,
+                        self.model.ptr,
+                        contexts.mujoco.ptr,
+                        self.book_mesh_id,
+                    )
+                render.book_mesh_version = self._book_mesh_version
             return view.render(scene_option=options,
                               render_flag_overrides=overrides)
 

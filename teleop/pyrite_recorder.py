@@ -1,4 +1,4 @@
-"""20 Hz Pyrite-compatible episode recording for FlipUp teleoperation.
+"""Full-rate Pyrite-compatible episode recording for FlipUp teleoperation.
 
 The on-disk layout matches PyriteML's current ``ReplayBuffer`` and
 ``VirtualTargetDataset`` contracts:
@@ -7,15 +7,14 @@ The on-disk layout matches PyriteML's current ``ReplayBuffer`` and
                     ts_pose_virtual_target_0, stiffness_0, wrench_0, ...}
     meta/{episode_rgb0_len, episode_robot0_len, episode_wrench0_len}
 
-Pyrite-facing wrench data is a tared 6D wrist F/T measurement in the tool
-frame. Solver-exact contact wrench, raw sensor data, complete MuJoCo integration
-state, commands, device state, object state, and controller state are retained
-as extra arrays for auditing and state-snapshot replay.
+Robot state, command, wrench and complete MuJoCo integration state are stored at
+the control rate (1 kHz by default). RGB is stored only when the asynchronous
+renderer produces a new frame, with independent timestamps; duplicating a
+30 Hz image at 1 kHz would waste memory without adding information.
 """
 
 from __future__ import annotations
 
-from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -29,8 +28,8 @@ from scipy.spatial.transform import Rotation
 
 
 SCHEMA_NAME = "pyrite_flipup_sim"
-SCHEMA_VERSION = 1
-DEFAULT_SAMPLE_HZ = 20.0
+SCHEMA_VERSION = 4
+DEFAULT_SAMPLE_HZ = 1000.0
 PYRITE_REQUIRED_KEYS = (
     "rgb_0",
     "rgb_time_stamps_0",
@@ -42,6 +41,52 @@ PYRITE_REQUIRED_KEYS = (
     "robot_time_stamps_0",
     "wrench_time_stamps_0",
 )
+
+
+class _NumericSampleBuffer:
+    """Growable contiguous arrays without one Python object per 1 kHz field.
+
+    The old list-of-small-arrays layout created hundreds of thousands of Python
+    and NumPy objects during a demonstration. That work ran in the control loop
+    and was a major source of 16-tick catch-up bursts. Allocation happens once
+    per channel, normally in sample zero before live control resumes.
+    """
+
+    def __init__(self, initial_capacity: int) -> None:
+        self.initial_capacity = max(1, int(initial_capacity))
+        self._storage: dict[str, np.ndarray] = {}
+        self._lengths: dict[str, int] = {}
+
+    def append(self, key: str, value: Any) -> None:
+        value_array = np.asarray(value)
+        if key not in self._storage:
+            self._storage[key] = np.empty(
+                (self.initial_capacity,) + value_array.shape,
+                dtype=value_array.dtype,
+            )
+            self._lengths[key] = 0
+        storage = self._storage[key]
+        length = self._lengths[key]
+        if value_array.shape != storage.shape[1:]:
+            raise ValueError(
+                f"sample shape for {key!r} changed from {storage.shape[1:]} "
+                f"to {value_array.shape}"
+            )
+        if length >= len(storage):
+            grown = np.empty((2 * len(storage),) + storage.shape[1:], storage.dtype)
+            grown[:length] = storage
+            storage = self._storage[key] = grown
+        storage[length] = value_array
+        self._lengths[key] = length + 1
+
+    def length(self, key: str) -> int:
+        return self._lengths.get(key, 0)
+
+    def arrays(self) -> dict[str, np.ndarray]:
+        return {
+            key: storage[: self._lengths[key]]
+            for key, storage in self._storage.items()
+        }
 
 
 def _zarr_modules():
@@ -212,6 +257,14 @@ class PyriteEpisodeRecorder:
                 raise RuntimeError(
                     f"dataset rate is {old_hz:g} Hz, requested {self.sample_hz:g} Hz"
                 )
+            old_schema_version = int(self.root.attrs.get("schema_version", 1))
+            if old_schema_version > SCHEMA_VERSION:
+                raise RuntimeError(
+                    f"dataset schema {old_schema_version} is newer than supported "
+                    f"schema {SCHEMA_VERSION}"
+                )
+            if old_schema_version < SCHEMA_VERSION:
+                self.root.attrs["schema_version"] = SCHEMA_VERSION
         else:
             self.root.attrs.update(
                 {
@@ -227,15 +280,19 @@ class PyriteEpisodeRecorder:
                     "platform": platform.platform(),
                 }
             )
-        self._samples: dict[str, list[np.ndarray | float | int]] = {}
+        self._buffer_capacity = max(1024, int(round(20.0 * self.sample_hz)))
+        self._samples = _NumericSampleBuffer(self._buffer_capacity)
         self._images: list[np.ndarray] = []
+        self._image_timestamps_ms: list[float] = []
+        self._last_image_id: int | None = None
         self._metadata: dict[str, Any] = {}
         self._started = False
         self._state_spec = int(mujoco.mjtState.mjSTATE_INTEGRATION)
+        self._state_size: int | None = None
 
     @property
     def sample_count(self) -> int:
-        return len(self._samples.get("robot_time_stamps_0", ()))
+        return self._samples.length("robot_time_stamps_0")
 
     @property
     def active(self) -> bool:
@@ -255,13 +312,15 @@ class PyriteEpisodeRecorder:
     def start_episode(self, metadata: dict[str, Any] | None = None) -> None:
         if self.active:
             raise RuntimeError("finish or discard the active episode first")
-        self._samples = defaultdict(list)
+        self._samples = _NumericSampleBuffer(self._buffer_capacity)
         self._images = []
+        self._image_timestamps_ms = []
+        self._last_image_id = None
         self._metadata = _jsonable(metadata or {})
         self._started = True
 
     def _append(self, key: str, value: Any) -> None:
-        self._samples[key].append(np.asarray(value).copy())
+        self._samples.append(key, value)
 
     def record_sample(
         self,
@@ -274,19 +333,37 @@ class PyriteEpisodeRecorder:
         sent_force: np.ndarray,
         image_rgb: np.ndarray | None,
         image_capture_time_s: float | None = None,
+        image_id: int | None = None,
+        wall_time_ns: int | None = None,
+        control_batch_size: int = 1,
+        control_batch_index: int = 0,
+        deadline_lateness_ms: float = 0.0,
     ) -> bool:
-        """Capture one aligned sample. Returns false if RGB is not ready yet."""
+        """Capture one control sample and, when new, one asynchronous RGB frame."""
         if not self._started:
             self.start_episode()
-        if self.include_rgb and image_rgb is None:
-            return False
 
         command_pose = env.target_pose7(target_pos, target_rotvec)
+        controller_target = np.asarray(
+            getattr(env, "drive_target", target_pos), dtype=np.float64
+        )
+        controller_pose = env.target_pose7(controller_target, target_rotvec)
         feedback_pose = np.concatenate([env.tool_pos, env.tool_quat])
-        sensed_tool = env.wrist_wrench(frame="tool")
-        sensed_world = env.wrist_wrench(frame="world")
-        truth_tool = env.contact_wrench(frame="tool")
-        truth_world = env.contact_wrench(frame="world")
+        if getattr(env, "controller_kind", None) == "floating_gripper":
+            # Both paths are cached once per physics tick by the floating env:
+            # exact solver contact remains ground truth while the optional
+            # causal sensor model is the observation available to BC.
+            truth_world = env.contact_wrench(frame="world")
+            truth_tool = env.contact_wrench(frame="tool")
+            sensed_tool = env.sensor_wrench(frame="tool")
+            sensed_world = env.sensor_wrench(frame="world")
+            sensor_raw = truth_tool
+        else:
+            sensed_tool = env.wrist_wrench(frame="tool")
+            sensed_world = env.wrist_wrench(frame="world")
+            sensor_raw = env.wrist_wrench_raw()
+            truth_tool = env.contact_wrench(frame="tool")
+            truth_world = env.contact_wrench(frame="world")
 
         tool_velocity = np.zeros(6)
         mujoco.mj_objectVelocity(
@@ -306,8 +383,9 @@ class PyriteEpisodeRecorder:
             book_velocity,
             0,
         )
-        state_size = mujoco.mj_stateSize(env.model.ptr, self._state_spec)
-        integration_state = np.empty(state_size, dtype=np.float64)
+        if self._state_size is None:
+            self._state_size = mujoco.mj_stateSize(env.model.ptr, self._state_spec)
+        integration_state = np.empty(self._state_size, dtype=np.float64)
         mujoco.mj_getState(
             env.model.ptr,
             env.data.ptr,
@@ -318,18 +396,87 @@ class PyriteEpisodeRecorder:
         state = device_state or {}
         self._append("robot_time_stamps_0", float(timestamp_ms))
         self._append("wrench_time_stamps_0", float(timestamp_ms))
+        self._append("wall_time_ns", 0 if wall_time_ns is None else int(wall_time_ns))
+        self._append("control_batch_size", int(control_batch_size))
+        self._append("control_batch_index", int(control_batch_index))
+        self._append("deadline_lateness_ms", float(deadline_lateness_ms))
         self._append("ts_pose_fb_0", feedback_pose)
         self._append("ts_pose_command_0", command_pose)
+        # Keep the operator's requested pose above, and separately store the
+        # target actually sent to the impedance controller.  They differ only
+        # while visible-surface anti-windup is active; retaining both prevents a
+        # safety projection from being mistaken for demonstrated compliance.
+        self._append("ts_pose_controller_0", controller_pose)
+        self._append("surface_limit_active", int(env.surface_limit_active))
+        self._append(
+            "workspace_limit_active",
+            int(getattr(env, "workspace_limit_active", False)),
+        )
         self._append("wrench_0", sensed_tool)
         self._append("wrench_sensor_world_0", sensed_world)
-        self._append("wrench_sensor_raw_0", env.wrist_wrench_raw())
+        self._append("wrench_sensor_raw_0", sensor_raw)
+        self._append("wrench_sensor_model_0", sensed_tool)
+        self._append("wrench_sensor_model_world_0", sensed_world)
         self._append("wrench_ground_truth_0", truth_tool)
         self._append("wrench_ground_truth_world_0", truth_world)
         self._append("robot_wrench_0", truth_tool)
         self._append("tool_twist_world", np.r_[tool_velocity[3:], tool_velocity[:3]])
         self._append("book_pose", np.r_[env.book_pos, env.book_quat])
+        self._append("object_pose", np.r_[env.book_pos, env.book_quat])
         self._append("book_twist_world", np.r_[book_velocity[3:], book_velocity[:3]])
+        self._append("object_twist_world", np.r_[book_velocity[3:], book_velocity[:3]])
         self._append("book_angle_deg", env.book_angle_deg())
+        self._append(
+            "task_metric",
+            (
+                env.task_metric_value()
+                if hasattr(env, "task_metric_value")
+                else env.book_angle_deg()
+            ),
+        )
+        self._append(
+            "object_height_m",
+            float(getattr(env, "object_height_m", env.book_pos[2])),
+        )
+        self._append(
+            "object_lift_height_m",
+            float(getattr(env, "lift_height_m", 0.0)),
+        )
+        self._append(
+            "gripper_command",
+            float(getattr(env, "gripper_command", 0.0)),
+        )
+        self._append(
+            "gripper_controller_target",
+            float(getattr(env, "gripper_controller_target", 0.0)),
+        )
+        self._append(
+            "gripper_opening",
+            float(getattr(env, "gripper_opening", 0.0)),
+        )
+        self._append(
+            "gripper_actuator_force",
+            float(getattr(env, "gripper_actuator_force", 0.0)),
+        )
+        grasp_force = float(
+            env.grasp_force() if hasattr(env, "grasp_force") else 0.0
+        )
+        table_force = float(
+            env.table_contact_force()
+            if hasattr(env, "table_contact_force")
+            else 0.0
+        )
+        grasp_limit = float(getattr(env, "grasp_force_limit", np.inf))
+        table_limit = float(getattr(env, "surface_force_limit", np.inf))
+        self._append("grasp_force", grasp_force)
+        self._append("table_contact_force", table_force)
+        self._append(
+            "grasp_force_limit_exceeded", int(grasp_force > grasp_limit + 1e-6)
+        )
+        self._append(
+            "table_contact_force_limit_exceeded",
+            int(table_force > table_limit + 1e-6),
+        )
         self._append("success", int(env.success()))
         self._append("contact_count", int(env.data.ncon))
         self._append("sim_time_s", float(env.data.time))
@@ -344,18 +491,29 @@ class PyriteEpisodeRecorder:
         self._append("mujoco_state", integration_state)
         self._append("target_rotvec", np.zeros(3) if target_rotvec is None else target_rotvec)
         self._append("device_pos", state.get("pos", np.zeros(3)))
+        self._append("device_vel", state.get("vel", np.zeros(3)))
         self._append("device_rotmat", state.get("rot", np.eye(3)))
         self._append("device_gripper", state.get("gripper", 0.0))
+        self._append("device_grip_force_target", state.get("grip_force_target", 0.0))
+        self._append("device_grip_force_applied", state.get("grip_force_applied", 0.0))
         self._append("device_force_cmd", state.get("force_cmd", np.zeros(3)))
         self._append("device_force_measured", state.get("force_meas", np.zeros(3)))
         self._append("device_orientation_valid", int(state.get("orientation_valid", False)))
+        self._append("device_servo_sequence", int(state.get("servo_sequence", -1)))
+        self._append("device_servo_timestamp_ns", int(state.get("servo_timestamp_ns", 0)))
+        self._append("device_servo_dt_s", float(state.get("servo_dt_s", 0.0)))
         self._append("haptic_force_sent", sent_force)
         self._append(
             "rgb_capture_sim_time_s",
             np.nan if image_capture_time_s is None else image_capture_time_s,
         )
 
-        if self.include_rgb:
+        new_image = (
+            self.include_rgb
+            and image_rgb is not None
+            and (image_id is None or image_id != self._last_image_id)
+        )
+        if new_image:
             import cv2
 
             image = np.asarray(image_rgb, dtype=np.uint8)
@@ -363,6 +521,14 @@ class PyriteEpisodeRecorder:
             if image.shape[:2] != (height, width):
                 image = cv2.resize(image, (width, height), interpolation=cv2.INTER_AREA)
             self._images.append(image.copy())
+            capture_timestamp_ms = (
+                float(timestamp_ms)
+                if image_capture_time_s is None
+                or not np.isfinite(image_capture_time_s)
+                else max(0.0, 1000.0 * float(image_capture_time_s))
+            )
+            self._image_timestamps_ms.append(capture_timestamp_ms)
+            self._last_image_id = image_id
         return True
 
     def _next_episode_id(self) -> int:
@@ -384,7 +550,12 @@ class PyriteEpisodeRecorder:
         elif key == "rgb_0":
             chunks = (1,) + value.shape[1:]
         else:
-            chunks = (min(256, len(value)),) + value.shape[1:]
+            # A rigid floating gripper has no actuators, so ctrl and
+            # actuator_force legitimately have shape (T, 0). Zarr chunk
+            # dimensions must still be positive.
+            chunks = (min(256, len(value)),) + tuple(
+                max(1, int(dimension)) for dimension in value.shape[1:]
+            )
         group.array(
             name=key,
             data=value,
@@ -422,18 +593,23 @@ class PyriteEpisodeRecorder:
         success: bool,
         termination_reason: str,
         final_book_angle_deg: float,
+        final_task_metric_name: str | None = None,
+        final_task_metric_value: float | None = None,
     ) -> str | None:
         count = self.sample_count
         if count < self.min_samples:
             self.discard()
             return None
-        arrays = {key: np.asarray(values) for key, values in self._samples.items()}
-        if self.include_rgb:
+        arrays = self._samples.arrays()
+        if self.include_rgb and self._images:
             arrays["rgb_0"] = np.asarray(self._images, dtype=np.uint8)
+            arrays["rgb_time_stamps_0"] = np.asarray(
+                self._image_timestamps_ms, dtype=np.float64
+            )
         else:
             width, height = self.image_size
-            arrays["rgb_0"] = np.zeros((count, height, width, 3), dtype=np.uint8)
-        arrays["rgb_time_stamps_0"] = arrays["robot_time_stamps_0"].copy()
+            arrays["rgb_0"] = np.zeros((1, height, width, 3), dtype=np.uint8)
+            arrays["rgb_time_stamps_0"] = np.zeros(1, dtype=np.float64)
 
         filtered = _causal_moving_average(
             arrays["wrench_0"],
@@ -464,7 +640,18 @@ class PyriteEpisodeRecorder:
                     "success": bool(success),
                     "termination_reason": str(termination_reason),
                     "final_book_angle_deg": float(final_book_angle_deg),
+                    "final_task_metric_name": (
+                        "book_angle_deg"
+                        if final_task_metric_name is None
+                        else str(final_task_metric_name)
+                    ),
+                    "final_task_metric_value": float(
+                        final_book_angle_deg
+                        if final_task_metric_value is None
+                        else final_task_metric_value
+                    ),
                     "sample_count": count,
+                    "rgb_sample_count": len(arrays["rgb_0"]),
                     "adaptive_compliance": self.adaptive_config,
                     "mujoco_state_spec": self._state_spec,
                     "metadata_json": json.dumps(self._metadata, sort_keys=True),
@@ -478,16 +665,20 @@ class PyriteEpisodeRecorder:
                 del self.data_group[temp_name]
             raise
         finally:
-            self._samples = {}
+            self._samples = _NumericSampleBuffer(self._buffer_capacity)
             self._images = []
+            self._image_timestamps_ms = []
+            self._last_image_id = None
             self._metadata = {}
             self._started = False
         return name
 
     def discard(self) -> int:
         count = self.sample_count
-        self._samples = {}
+        self._samples = _NumericSampleBuffer(self._buffer_capacity)
         self._images = []
+        self._image_timestamps_ms = []
+        self._last_image_id = None
         self._metadata = {}
         self._started = False
         return count
@@ -509,6 +700,7 @@ def validate_pyrite_dataset(dataset_path: str | Path) -> dict[str, Any]:
     if not episode_names:
         raise ValueError("dataset contains no episodes")
     lengths = []
+    rgb_lengths = []
     for name in episode_names:
         episode = root["data"][name]
         missing = [key for key in PYRITE_REQUIRED_KEYS if key not in episode]
@@ -516,23 +708,58 @@ def validate_pyrite_dataset(dataset_path: str | Path) -> dict[str, Any]:
             raise ValueError(f"{name} is missing {missing}")
         count = len(episode["ts_pose_fb_0"])
         lengths.append(count)
-        for key in PYRITE_REQUIRED_KEYS:
+        robot_keys = (
+            "ts_pose_fb_0",
+            "ts_pose_command_0",
+            "ts_pose_virtual_target_0",
+            "stiffness_0",
+            "robot_time_stamps_0",
+        )
+        wrench_keys = ("wrench_0", "wrench_time_stamps_0")
+        for key in robot_keys + wrench_keys:
             if len(episode[key]) != count:
                 raise ValueError(
                     f"{name}/{key} has {len(episode[key])} rows, expected {count}"
                 )
+        rgb_count = len(episode["rgb_0"])
+        rgb_lengths.append(rgb_count)
+        if len(episode["rgb_time_stamps_0"]) != rgb_count:
+            raise ValueError(
+                f"{name}/rgb_time_stamps_0 has "
+                f"{len(episode['rgb_time_stamps_0'])} rows, expected {rgb_count}"
+            )
         times = np.asarray(episode["robot_time_stamps_0"])
         if count > 1 and not np.allclose(np.diff(times), period_ms, atol=1e-6):
             raise ValueError(f"{name} is not sampled at {sample_hz:g} Hz")
+        rgb_times = np.asarray(episode["rgb_time_stamps_0"], dtype=float)
+        if not np.all(np.isfinite(rgb_times)):
+            raise ValueError(f"{name}/rgb_time_stamps_0 contains non-finite values")
+        if rgb_count > 1 and np.any(np.diff(rgb_times) <= 0.0):
+            raise ValueError(f"{name}/rgb_time_stamps_0 is not strictly increasing")
+        if count and rgb_count and (
+            rgb_times[0] < times[0] - period_ms
+            or rgb_times[-1] > times[-1] + period_ms
+        ):
+            raise ValueError(
+                f"{name}/rgb_time_stamps_0 [{rgb_times[0]:.3f}, "
+                f"{rgb_times[-1]:.3f}] ms does not share the episode-relative "
+                f"origin of robot timestamps [{times[0]:.3f}, "
+                f"{times[-1]:.3f}] ms"
+            )
         for key in ("ts_pose_fb_0", "ts_pose_command_0", "ts_pose_virtual_target_0"):
             quat_norm = np.linalg.norm(np.asarray(episode[key])[:, 3:], axis=1)
             if not np.allclose(quat_norm, 1.0, atol=1e-5):
                 raise ValueError(f"{name}/{key} contains non-unit quaternions")
 
     meta_lengths = np.asarray(root["meta"]["episode_rgb0_len"])
-    if not np.array_equal(meta_lengths, np.asarray(lengths)):
+    if not np.array_equal(meta_lengths, np.asarray(rgb_lengths)):
         raise ValueError(
-            f"meta/episode_rgb0_len {meta_lengths.tolist()} does not match {lengths}"
+            f"meta/episode_rgb0_len {meta_lengths.tolist()} does not match {rgb_lengths}"
+        )
+    robot_meta_lengths = np.asarray(root["meta"]["episode_robot0_len"])
+    if not np.array_equal(robot_meta_lengths, np.asarray(lengths)):
+        raise ValueError(
+            f"meta/episode_robot0_len {robot_meta_lengths.tolist()} does not match {lengths}"
         )
     return {
         "path": str(path),
@@ -541,5 +768,6 @@ def validate_pyrite_dataset(dataset_path: str | Path) -> dict[str, Any]:
         "episodes": len(episode_names),
         "samples": int(sum(lengths)),
         "episode_lengths": lengths,
+        "rgb_episode_lengths": rgb_lengths,
         "keys": sorted(root["data"][episode_names[0]].array_keys()),
     }

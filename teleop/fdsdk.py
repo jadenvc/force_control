@@ -14,12 +14,34 @@ with the ``FORCEDIMENSION_LIB`` environment variable.
 import ctypes
 import ctypes.util
 import os
+from pathlib import Path
 
 import numpy as np
 
-# libdrd re-exports the dhd* symbols. Prefer the system library search path;
-# FORCEDIMENSION_LIB can point at a specific SDK installation when needed.
-_DEFAULT_LIB = ctypes.util.find_library("drd") or "libdrd.so.3"
+def _default_library():
+    """Find libdrd in the loader path or common unpacked-SDK locations."""
+    system_library = ctypes.util.find_library("drd")
+    if system_library:
+        return system_library
+    home = Path.home()
+    search_roots = (
+        home / "Documents" / "Force Dimension",
+        home / "Downloads",
+    )
+    for root in search_roots:
+        matches = sorted(
+            root.glob("sdk-*/lib/release/lin-x86_64-gcc/libdrd.so.3"),
+            reverse=True,
+        )
+        if matches:
+            # Prefer Documents over Downloads and the newest version in each.
+            return str(matches[0])
+    return "libdrd.so.3"
+
+
+# libdrd re-exports the dhd* symbols. FORCEDIMENSION_LIB remains the explicit
+# override; otherwise discover the system library or an unpacked SDK.
+_DEFAULT_LIB = _default_library()
 
 libdrd = None
 

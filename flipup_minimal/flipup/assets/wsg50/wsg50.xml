@@ -10,15 +10,16 @@
         <default class="collision">
             <geom type="mesh" group="3" />
         </default>
-        <default class="finray_collision">
-            <!-- Softer/less sticky mesh contact reduces snagging against object edges. -->
-            <geom condim="4" friction="1.2 0.03 0.001" solref="0.02 1.0"
-                solimp="0.92 0.97 0.002" margin="0.001" group="3" priority="1" />
+        <default class="finger_guard_collision">
+            <!-- A smooth envelope follows the visible fin-ray shaft.  Primitive
+                 contact is less snag-prone and gives a cleaner 1 kHz wrench than
+                 the detailed concave-looking render mesh. -->
+            <geom condim="4" friction="1.2 0.01 0.0005" solref="0.01 1.0"
+                solimp="0.85 0.95 0.003" margin="0.0015" group="3" priority="8" />
         </default>
         <default class="tip_pad_collision">
-            <!-- Rounded fingertip pad to emulate smooth probe-like contact. -->
-            <geom condim="4" friction="0.9 0.01 0.0005" solref="0.015 1.0"
-                solimp="0.90 0.96 0.002" margin="0.001" group="3" priority="8" />
+            <geom condim="4" friction="1.2 0.01 0.0005" solref="0.01 1.0"
+                solimp="0.85 0.95 0.003" margin="0.0015" group="3" priority="8" />
         </default>
     </default>
 
@@ -33,8 +34,6 @@
         <material name="finray_material" texture="texture" specular="0.5" shininess="0.0" />
         <mesh name="finger" file="../finray/one_piece_wide_grasp_finray_finger.obj"
             scale="0.76923076923 1.0 1.0" />
-        <mesh name="finger_collider" file="../finray/collider.obj" scale="0.76923076923 1.0 1.0" />
-
         <mesh name="mount" file="meshes/mount.obj" />
         <mesh name="mount_collider_1" file="meshes/mount_collider_1.obj" />
         <mesh name="mount_collider_2" file="meshes/mount_collider_2.obj" />
@@ -70,18 +69,24 @@
                 <joint name="right_driver_joint" range="0.00 0.054" damping="20"
                     type="slide" axis="0 -1 0" />
                 <geom mesh="finger" type="mesh" class="visual" mass="0.1" material="finray_material" />
-                <geom mesh="finger_collider" type="mesh" class="finray_collision" />
-                <geom type="capsule" fromto="-0.009 -0.004 0.147 0.009 -0.004 0.147"
-                    size="0.0042" class="tip_pad_collision" />
+                <geom name="right_finger_guard" type="ellipsoid"
+                    pos="0 -0.015 0.076" size="0.014 0.021 0.055"
+                    class="finger_guard_collision" />
+                <geom name="right_tip_pad" type="capsule"
+                    fromto="-0.008 0 0.1435 0.008 0 0.1435"
+                    size="0.008" class="tip_pad_collision" />
                 <geom size="0.015 0.01 0.01" type="box" class="collision" pos="0 -0.012 0.0105" />
             </body>
             <body name="left_finger" pos="0 0 0.102" euler="0 0 -1.57079632679">
                 <joint name="left_driver_joint" range="0.00 0.054" damping="20"
                     type="slide" axis="0 -1 0" />
                 <geom mesh="finger" type="mesh" class="visual" mass="0.1" material="finray_material" />
-                <geom mesh="finger_collider" type="mesh" class="finray_collision" />
-                <geom type="capsule" fromto="-0.009 -0.004 0.147 0.009 -0.004 0.147"
-                    size="0.0042" class="tip_pad_collision" />
+                <geom name="left_finger_guard" type="ellipsoid"
+                    pos="0 -0.015 0.076" size="0.014 0.021 0.055"
+                    class="finger_guard_collision" />
+                <geom name="left_tip_pad" type="capsule"
+                    fromto="-0.008 0 0.1435 0.008 0 0.1435"
+                    size="0.008" class="tip_pad_collision" />
                 <geom size="0.015 0.01 0.01" type="box" class="collision" pos="0 -0.012 0.0105" />
             </body>
             <!-- IK / control site for generic flip-up heuristic, matched to big_probe frame convention -->

@@ -23,6 +23,8 @@ Verify the complete control path without a haptic device:
 
 ```sh
 python teleop/teleop_flipup.py --dry-run --no-view
+python teleop/teleop_floating_flipup.py --dry-run --no-view
+python teleop/teleop_floating_cube_lift.py --dry-run --no-view
 ```
 
 See [`README_flipup.md`](README_flipup.md) for controls, tuning, dataset

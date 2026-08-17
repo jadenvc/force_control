@@ -1,10 +1,10 @@
 """Validate or replay an episode written by ``--collect-dataset``.
 
 Examples:
-    python replay_pyrite_flipup.py ~/data/flipup_sim_20hz.zarr --list
-    python replay_pyrite_flipup.py ~/data/flipup_sim_20hz.zarr --validate-only
-    python replay_pyrite_flipup.py ~/data/flipup_sim_20hz.zarr --episode episode_0
-    python replay_pyrite_flipup.py ~/data/flipup_sim_20hz.zarr --mode state \
+    python replay_pyrite_flipup.py ~/data/flipup_sim_1khz.zarr --list
+    python replay_pyrite_flipup.py ~/data/flipup_sim_1khz.zarr --validate-only
+    python replay_pyrite_flipup.py ~/data/flipup_sim_1khz.zarr --episode episode_0
+    python replay_pyrite_flipup.py ~/data/flipup_sim_1khz.zarr --mode state \
         --output /tmp/replay.mp4 --no-view
 """
 
@@ -36,15 +36,53 @@ def _episode_names(root) -> list[str]:
 
 def _make_env(metadata: dict) -> FlipUpTeleop:
     controller = metadata["controller"]
-    return FlipUpTeleop(
+    kind = metadata.get("model", {}).get("controller_kind", "joint_arm")
+    task_kind = metadata.get("task_kind", "flipup")
+    if task_kind == "cube_lift":
+        from floating_cube_lift_teleop import CubeProperties, FloatingCubeLiftTeleop
+
+        env_class = FloatingCubeLiftTeleop
+        properties = CubeProperties(**metadata["physical_properties"])
+    elif kind == "floating_gripper":
+        from floating_flipup_teleop import FloatingFlipUpTeleop
+
+        env_class = FloatingFlipUpTeleop
+        properties = PhysicalProperties(**metadata["physical_properties"])
+    else:
+        env_class = FlipUpTeleop
+        properties = PhysicalProperties(**metadata["physical_properties"])
+    kwargs = dict(
         seed=int(metadata["seed"]),
-        physical_properties=PhysicalProperties(**metadata["physical_properties"]),
+        physical_properties=properties,
         tool_kp=float(controller["tool_kp"]),
         tool_rot_kp=float(controller["tool_rot_kp"]),
         tool_rot_kd=float(controller["tool_rot_kd"]),
         joint_kd=np.asarray(controller["joint_kd"], dtype=float),
         settle_s=0.0,
     )
+    if task_kind == "cube_lift":
+        kwargs.update(
+            grasp_force_limit=float(controller.get("grasp_force_limit", 25.0)),
+            gripper_speed=float(controller.get("gripper_speed", 0.12)),
+            success_height=float(controller.get("success_height", 0.08)),
+            surface_force_limit=float(controller.get("surface_force_limit", 40.0)),
+        )
+    env = env_class(**kwargs)
+    configure_kwargs = {}
+    if task_kind == "cube_lift":
+        configure_kwargs["object_xy"] = np.asarray(
+            metadata.get("scene", {}).get("object_center", [0.35, 0.0])[:2],
+            dtype=float,
+        )
+    env.configure_episode(
+        properties,
+        np.asarray(metadata.get("object_color_rgba", metadata.get(
+            "book_color_rgba", [0.42, 0.25, 0.16, 1.0]
+        ))),
+        np.asarray(metadata.get("initial_tool_position_world_m", env.tool_home)),
+        **configure_kwargs,
+    )
+    return env
 
 
 def main() -> None:
@@ -54,6 +92,8 @@ def main() -> None:
     parser.add_argument("--mode", choices=["rgb", "state"], default="rgb",
                         help="replay stored RGB or render restored MuJoCo states")
     parser.add_argument("--output", type=Path, default=None, help="optional MP4 output")
+    parser.add_argument("--fps", type=float, default=30.0,
+                        help="state-render playback/output rate (default 30 fps)")
     parser.add_argument("--no-view", action="store_true")
     parser.add_argument("--list", action="store_true",
                         help="list saved episodes and exit")
@@ -65,18 +105,27 @@ def main() -> None:
     root = zarr.open(str(args.dataset.expanduser()), mode="r")
     names = _episode_names(root)
     if args.list:
-        print("\nepisode       samples  duration  success  final angle  termination")
-        print("------------  -------  --------  -------  -----------  -----------")
+        print("\nepisode       samples  duration  success  final metric       termination")
+        print("------------  -------  --------  -------  -----------------  -----------")
         for episode_name in names:
             item = root["data"][episode_name]
             count = int(item.attrs.get("sample_count", len(item["rgb_0"])))
             hz = float(item.attrs.get("sample_hz", summary["sample_hz"]))
             success = "yes" if bool(item.attrs.get("success", False)) else "no"
-            angle = float(item.attrs.get("final_book_angle_deg", np.nan))
+            metric = float(item.attrs.get(
+                "final_task_metric_value",
+                item.attrs.get("final_book_angle_deg", np.nan),
+            ))
+            metric_name = str(item.attrs.get("final_task_metric_name", "book_angle_deg"))
+            metric_text = (
+                f"{100.0 * metric:10.1f} cm"
+                if metric_name == "cube_lift_height_m"
+                else f"{metric:10.1f} deg"
+            )
             reason = str(item.attrs.get("termination_reason", "unknown"))
             print(
                 f"{episode_name:12s}  {count:7d}  {count / hz:7.2f}s  "
-                f"{success:7s}  {angle:10.1f}°  {reason}"
+                f"{success:7s}  {metric_text:17s}  {reason}"
             )
         return
     if args.validate_only:
@@ -86,7 +135,21 @@ def main() -> None:
     if name not in root["data"]:
         raise SystemExit(f"no {name!r}; available episodes: {names}")
     episode = root["data"][name]
-    fps = float(episode.attrs["sample_hz"])
+    sample_hz = float(episode.attrs["sample_hz"])
+    if args.mode == "rgb":
+        rgb_times = np.asarray(episode["rgb_time_stamps_0"], dtype=float)
+        fps = (
+            1000.0 / float(np.median(np.diff(rgb_times)))
+            if len(rgb_times) > 1 and np.all(np.diff(rgb_times) > 0.0)
+            else float(args.fps)
+        )
+        replay_indices = np.arange(len(episode["rgb_0"]), dtype=int)
+    else:
+        fps = float(args.fps)
+        state_stride = max(1, int(round(sample_hz / fps)))
+        replay_indices = np.arange(
+            0, len(episode["mujoco_state"]), state_stride, dtype=int
+        )
 
     env = None
     render = None
@@ -121,7 +184,7 @@ def main() -> None:
     state_spec = int(episode.attrs["mujoco_state_spec"])
     max_qpos_error = 0.0
     try:
-        for index in range(len(episode["rgb_0"])):
+        for index in replay_indices:
             if args.mode == "rgb":
                 rgb = np.asarray(episode["rgb_0"][index])
             else:
@@ -144,7 +207,7 @@ def main() -> None:
             if writer is not None:
                 writer.write(bgr)
             if not args.no_view:
-                cv2.imshow(f"Pyrite FlipUp replay: {name}", bgr)
+                cv2.imshow(f"Pyrite teleop replay: {name}", bgr)
                 key = cv2.waitKey(max(1, int(round(1000.0 / fps)))) & 0xFF
                 if key in (ord("q"), 27):
                     break
@@ -154,6 +217,10 @@ def main() -> None:
             print(f"wrote {args.output}")
         if env is not None:
             env.close()
+            try:
+                env.physics.free()
+            except Exception:
+                pass
         cv2.destroyAllWindows()
     if args.mode == "state":
         print(f"maximum restored qpos error: {max_qpos_error:.3e}")

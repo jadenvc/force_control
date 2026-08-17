@@ -6,7 +6,7 @@
     <default class="collision">
       <!-- Softer/less sticky contact makes table and finger interactions smoother for flip-up. -->
       <geom group="3" condim="4" friction="0.12 0.002 0.0001" solref="0.02 1.0"
-        solimp="0.90 0.96 0.002" margin="0.001" />
+        solimp="0.90 0.96 0.002" margin="0.0005" />
     </default>
   </default>
   <asset>

@@ -11,6 +11,9 @@ cd teleop
 python teleop_flipup.py                 # seed 0
 python teleop_flipup.py --seed 1        # a scene the shipped scripted flip also solves
 python teleop_flipup.py --dry-run --no-view      # no device: walks the scripted arc
+python teleop_floating_flipup.py         # WSG50 rigid body, no UR5e joints
+python teleop_floating_flipup.py --dry-run --no-view
+python teleop_floating_cube_lift.py      # analogue grasp + rounded-cube lift
 ```
 
 Keys in the cv2 window: **`r`** reset, **`q`/ESC** quit. On the omega.6 a long
@@ -25,6 +28,10 @@ Files:
   a threaded-safe camera factory. Also `flipup_scene(seed)`, which re-derives the
   scene and the flip arc from `flipup.heuristic`'s conventions.
 - `teleop_flipup.py` — the launcher: device, mapping, haptics, viewer, recording.
+- `floating_flipup_teleop.py` — the dynamical floating-WSG50 environment: direct
+  Cartesian wrench control, physical gripper mass/inertia, and gravity compensation.
+- `teleop_floating_flipup.py` — the floating-controller launcher; it shares the
+  collection, haptic, viewer, and command-line interface with the arm launcher.
 - `pyrite_recorder.py` — exact-rate Pyrite Zarr writer, adaptive-compliance
   label generation, and schema validation.
 - `replay_pyrite_flipup.py` — stored-RGB or MuJoCo-state episode replay.
@@ -137,21 +144,49 @@ Collect demonstrations directly into the dataset PyriteML will train from:
 ```bash
 export PYRITE_DATASET_FOLDERS="$HOME/data/real_processed"
 python teleop_flipup.py \
-  --collect-dataset "$PYRITE_DATASET_FOLDERS/flipup_sim_20hz.zarr"
+  --collect-dataset "$PYRITE_DATASET_FOLDERS/flipup_sim_1khz.zarr"
 ```
 
-Collection is exactly **20 Hz** by default. `--control-freq` must be an integer
-multiple of `--dataset-hz`; the default 1000/20 configuration records every 50
-control ticks. RGB is stored as 224×224 HWC `uint8` and low-dimensional channels
-are timestamp-aligned in milliseconds.
+State, command, wrench, contact truth, controller state and complete MuJoCo state
+contain one sample per **1 ms simulation tick (1000 Hz)** by default. RGB is
+stored as 224×224 HWC `uint8` only when the asynchronous renderer produces a new
+frame, with its own timestamps; the recorder does not duplicate the same image
+33 times between 30 Hz frames. Use the timestamps to select any later training
+rate. `--control-freq` must be an integer multiple of `--dataset-hz` if a lower
+raw state rate is explicitly chosen.
+
+The timing paths are deliberately separate: every physics tick publishes a new
+sim-force target, the Force Dimension thread filters/rate-limits and sends that
+target on its own 1 kHz schedule, numeric recording uses preallocated arrays,
+and RGB rendering plus plot/window composition run in lower-priority background
+threads at `--view-fps`. Thus a slow visual frame no longer freezes force
+feedback. The timestamps in the numeric stream remain exactly 1 ms apart even
+if software rendering makes simulation run slightly slower than wall time;
+`wall_time_ns`, `deadline_lateness_ms`, and the control-batch fields retain that
+wall-time behavior for auditing.
 
 Collection controls:
 
-- The collector starts **idle**. Press **`s`** to start an episode.
+- The collector starts **idle at the sampled initial tool pose**. The tool is
+  held there and cannot drift while the operator moves the handle. In idle, a
+  damped 100 N/m haptic spring gently pulls the physical handle toward fixed
+  `--home`, independently capped at 2 N. Relax your grip and let it settle; the
+  overlay turns green after it is within 3 mm and slower than 15 mm/s for 250 ms.
+  Only then will **`s`** start. The centering spring switches off before data
+  collection, so it is not part of the demonstrated motion or recorded contact.
+  Every randomized simulated start therefore maps to the same physical center
+  instead of rebasing to wherever the handle happened to be.
+- Starting holds the simulated tool for 100 ms, clears all old reflected-force
+  filter state, and smoothly engages haptic feedback over the next 400 ms.
+  Tune these gates with `--collection-home-*`, `--collection-takeover-hold-ms`,
+  and `--collection-force-ramp-ms`. Tune or disable the pull with
+  `--collection-recenter-stiffness`, setting it to zero to disable, and cap it
+  separately with `--collection-recenter-max-force`.
 - Press **`s`** again to stop. The simulation pauses on the final frame.
 - Click **KEEP** or **DELETE** in the viewer. Keyboard shortcuts are **`k`** and
   **`d`**. Only KEEP writes the episode into the Zarr dataset.
-- After the decision, the task resets and returns to idle for the next episode.
+- After the decision, the next book properties, colour, and start pose are
+  sampled; the task resets there and returns to idle.
 - **`q`** or ESC quits while idle. If an episode is active, it first moves to
   the KEEP/DELETE review screen. Ctrl-C discards unconfirmed samples.
 - A device long press also toggles idle → recording → review.
@@ -160,7 +195,7 @@ Automatically stop when the book reaches the task's success angle:
 
 ```bash
 python teleop_flipup.py \
-  --collect-dataset "$PYRITE_DATASET_FOLDERS/flipup_sim_20hz.zarr" \
+  --collect-dataset "$PYRITE_DATASET_FOLDERS/flipup_sim_1khz.zarr" \
   --auto-finish
 ```
 
@@ -170,19 +205,32 @@ demonstration to the training set.
 Every episode contains PyriteML's required raw fields:
 
 - `rgb_0`, `ts_pose_fb_0`, `ts_pose_command_0`, and their timestamps.
-- `wrench_0`: tared simulated wrist F/T measurement in the tool frame,
-  `[Fx,Fy,Fz,Tx,Ty,Tz]`.
+- `wrench_0`: the sensor observation available to BC in the tool frame,
+  `[Fx,Fy,Fz,Tx,Ty,Tz]`. For the floating gripper this is the tunable causal
+  sensor model, or exact contact when `--force-sensor-cutoff 0`.
 - `ts_pose_virtual_target_0` and `stiffness_0`: adaptive-compliance labels
   generated from a causal F/T filter using Pyrite's virtual-target rule.
 
 Additional channels retain the information needed to audit or replay a demo:
 
+- `ts_pose_controller_0` stores the pose actually sent to the impedance
+  controller. `ts_pose_command_0` remains the operator's unsaturated request;
+  `surface_limit_active` marks samples where visible-surface anti-windup makes
+  those differ.
 - `wrench_ground_truth_0`: solver-exact contact wrench transported to the tool
   origin; world-frame ground truth, world-frame sensed wrench, and untared raw
   wrist sensor values are stored separately.
+- `wrench_sensor_model_0` and `wrench_sensor_model_world_0`: explicit copies of
+  the sensed wrench in tool/world axes. These equal `wrench_0` (after the frame
+  transform), while the ground-truth channels always retain the unfiltered
+  MuJoCo constraint wrench for analysis and alternate preprocessing.
 - Complete MuJoCo integration state plus `qpos`, `qvel`, `qacc`, controls,
   actuator/constraint forces, sensor data, book pose/twist, tool twist, contact
   count, device pose/rotation/forces, mapped command, and haptic force.
+- `wall_time_ns`, `deadline_lateness_ms`, `control_batch_size`, and
+  `control_batch_index` expose wall-clock stalls/catch-up explicitly. On real
+  hardware, `device_servo_sequence`, `device_servo_timestamp_ns`, and
+  `device_servo_dt_s` expose the independent Force Dimension servo cadence.
 - Episode attributes contain scene seed, sampled book physics, controller gains,
   mappings, camera, haptic settings, model dimensions, termination reason, and
   success.
@@ -190,19 +238,19 @@ Additional channels retain the information needed to audit or replay a demo:
 Validate or replay a dataset:
 
 ```bash
-python replay_pyrite_flipup.py "$PYRITE_DATASET_FOLDERS/flipup_sim_20hz.zarr" \
+python replay_pyrite_flipup.py "$PYRITE_DATASET_FOLDERS/flipup_sim_1khz.zarr" \
   --validate-only
 
 # List saved episode names, duration, success, angle, and termination reason
-python replay_pyrite_flipup.py "$PYRITE_DATASET_FOLDERS/flipup_sim_20hz.zarr" \
+python replay_pyrite_flipup.py "$PYRITE_DATASET_FOLDERS/flipup_sim_1khz.zarr" \
   --list
 
 # Replay stored observations
-python replay_pyrite_flipup.py "$PYRITE_DATASET_FOLDERS/flipup_sim_20hz.zarr" \
+python replay_pyrite_flipup.py "$PYRITE_DATASET_FOLDERS/flipup_sim_1khz.zarr" \
   --episode episode_0
 
 # Restore and render every MuJoCo state snapshot
-python replay_pyrite_flipup.py "$PYRITE_DATASET_FOLDERS/flipup_sim_20hz.zarr" \
+python replay_pyrite_flipup.py "$PYRITE_DATASET_FOLDERS/flipup_sim_1khz.zarr" \
   --mode state
 ```
 
@@ -225,29 +273,39 @@ accelerate launch train.py --config-name=train_spec_workspace \
   task=flipup_sim_adaptive_compliance_20hz
 ```
 
-Both use two RGB frames, three pose frames, eight sensed-F/T frames, and a
-16-step action horizon at 20 Hz. The default adaptive labels range from
+Both training configurations expect data subsampled/aligned to 20 Hz; do that
+from the stored 1 kHz streams before training. They use two RGB frames, three
+pose frames, eight sensed-F/T frames, and a 16-step action horizon. The default
+compatibility labels range from
 16,000 N/m in light contact to 2,000 N/m under heavy load; tune with
 `--ac-k-max`, `--ac-k-min`, `--ac-f-low`, and `--ac-f-high`.
 
 ## Contact allowlist
 
-The simulation permits only **robot ↔ book** and **book ↔ bookend support**
-contact. Collision bits disable every other combination, including robot
-self-contact, robot ↔ bookend/table/floor, and book ↔ the decorative table or
-floor. The visible small support under the book belongs to the
-`bookend2_blender` fixture; it is not the separate `table/table` asset.
+The simulation now permits four deliberately separated contact classes:
 
-This uses MuJoCo collision filtering rather than explicit contact pairs, so the
-book's configured friction and the original contact solver parameters are
-preserved.
+- robot/gripper ↔ book;
+- book ↔ the physical bookend wall, pivot, and floor;
+- every physical robot geom ↔ the complete visible wooden tabletop;
+- WSG50 geoms ↔ low-friction collision copies aligned exactly with the visible
+  bookend wall, pivot, and floor.
+
+Independent collision bits prevent duplicate book/support contacts and keep
+robot self-contact disabled. The old oversized invisible shelf guard is not
+used. Fin-ray shafts use smooth ellipsoid envelopes and the distal pads use
+8 mm capsules, avoiding edge snagging while covering the visible finger.
+
+After a visible table/bookend contact, `--surface-force-limit 80` caps only the
+continued inward spring deflection (5 mm at 16 kN/m). Sliding and pulling away
+remain unconstrained, and book contact is not capped. Pass
+`--surface-force-limit 0` for an unbounded A/B test.
 
 ## Haptics
 
-Identical machinery to `teleop_ball.py`: absolute position mapping →
-slew-limited target → sim contact force → gain → one-pole filter → magnitude
-clamp → `FDOmega.set_reflected_force`, with velocity damping that ramps in with
-force so free space stays effortless.
+Absolute position mapping → slew-limited target → sim contact force → gain →
+`FDOmega.set_reflected_force`. The independent 1 kHz device servo then applies
+the one-pole filter, vector slew-rate limit, damping and magnitude clamp before
+sending the force. Damping ramps in with force so free space stays effortless.
 
 ### Why the arm stays stiff, and where the force gain comes from
 
@@ -260,7 +318,7 @@ k_handle = tool_kp × scale × force_gain          (N/m at the handle)
 and the loop is only passive while `k_handle < 2 × damping / T_effective`, where
 `T_effective = 1/control_freq + 2 × force_tau`. The obvious move — soften the
 arm until `tool_kp` is "renderable" — **does not work here**: the fingertip pad
-is a 4.2 mm capsule bearing on the book 7.5 mm below its top edge, so a few mm of
+is an 8 mm capsule bearing on the book 7.5 mm below its top edge, so a few mm of
 sag loses the edge. Sweeping the shipped heuristic trajectory over `tool_kp`:
 
 | `tool_kp` (N/m) | scripted flip on the seeds it solves | free-space lag |
@@ -273,10 +331,10 @@ What makes the stiff arm renderable anyway is that this task's contact forces ar
 about **10× BallPush's** (22 N median while levering a 1.375 kg book, versus ~2 N
 sliding a light block), so the gain that lands the felt force in the same 1–9 N
 band is ~10× smaller, and `k_handle` still comes out in the same few-kN/m band.
-So `--stiffness` (default **3000 N/m**, as in `teleop_ball.py`) derives
+For the full arm, `--stiffness` (default **1500 N/m**) derives
 
 ```
-force_gain = stiffness / (tool_kp × scale) = 3000 / (16000 × 4) = 0.047
+force_gain = stiffness / (tool_kp × scale) = 1500 / (16000 × 4) = 0.0234
 ```
 
 **Do not use `--tool-kp` to soften the feel** — it changes the sim's task
@@ -337,7 +395,8 @@ Both are rendering problems, so the fixes are on the rendering side:
    This halves the ripple, the onset and every contact force at once. It is the
    dominant lever, because the ripple is exactly `k_handle × hand tremor`.
 2. **`--force-rate 120` N/s**, new. A slew limit on the handle force vector, applied
-   after the filter and before the clamp. It targets the onset step specifically and,
+   after the filter and before the clamp by the 1 kHz device servo using its
+   measured elapsed time. It targets the onset step specifically and,
    unlike raising `--force-tau`, does **not** lag the steady force or the ripple —
    and unlike `--force-tau` it does not eat passivity margin. Measured onset slope
    0.35 → 0.12 N/ms at 120 N/s, 0.06 at 60 N/s, with the dwell force unchanged.
@@ -393,7 +452,7 @@ Two caveats specific to an arm, both matching what `teleop_ball --arm` says abou
   hand feels. In contact the series compliance is set by the contact and the book,
   not by the task-space controller, so the margin above is conservative.
 - The honest knob on an arm is therefore the **force gain** itself (`--force-gain`,
-  0.047 by default here). It comes out ~10× smaller than `PivotArm`'s
+  0.0234 by default here). It comes out ~10× smaller than `PivotArm`'s
   `--arm-force-gain 0.4` purely because this task's contact forces are ~10× that
   scene's — the *felt* newtons are the same.
 
@@ -440,12 +499,14 @@ full scripted flip:
 ## Viewer
 
 Off-screen osmesa render blitted into a cv2 window (this workstation cannot do
-on-screen GL — see the main README), with the same force strip chart along the
-bottom (green = force sent to the handle, red = sim force × gain) and the same
-per-axis panel on the right (bright = sent, dim = sim × gain, **in device axes**,
-each channel autoscaled with its scale printed).
+on-screen GL — see the main README). The lower force strip shows handle-scale
+forces (green = force sent to the handle, red = sim force × gain). A separate
+upper strip shows solver-exact MuJoCo world-frame `Fx/Fy/Fz` in actual simulator
+newtons with its own scale and live numeric values. The per-axis panel on the
+right retains the device-axis rendered/sent traces and prints the current actual
+world force beside the felt device force.
 
-The default camera looks **just off head-on**: `--cam-azimuth 15
+The default camera restores the original **left-oblique** view: `--cam-azimuth -30
 --cam-elevation -25 --cam-distance 0.75`, aimed at the middle of the flip arc, with
 **`--arm-view hidden`** drawing only the WSG50 and not the UR5e links. Hiding the
 arm is what makes that view usable — the forearm otherwise fills 14–39% of the frame
@@ -455,12 +516,13 @@ links translucent instead, `full` restores them. It is a visualization change on
 (`geom_group`/`geom_rgba` play no part in collision detection), so the physics is
 bit-for-bit identical.
 
-**Why 15° and not 0°.** At *exactly* azimuth 0 the flip angle is geometrically
+**Why an oblique view and not 0°.** At *exactly* azimuth 0 the flip angle is geometrically
 invisible: the book's long axis rotates in the world x–z plane, that plane contains
 the view direction, so the axis projects to a *vertical line for every tilt and
 every elevation* — only its apparent length changes, and not even monotonically (at
 elevation −25 the projected length runs 0.91 → 0.57 → 0.09 → 0.42 as the tilt goes
-0° → 30° → 60° → 90°). 15° of side angle is enough to break that degeneracy.
+0° → 30° → 60° → 90°). The restored −30° view breaks that degeneracy and matches
+the earlier Force Dimension setup.
 Measured apparent tilt against a true 35.4°, arm hidden, at the default elevation
 and distance:
 
@@ -468,17 +530,24 @@ and distance:
 | --- | --- | --- | --- |
 | 0 | 89.9° — carries no information | 7.4% | 22.8k |
 | 10 | 63.2° | 7.1% | 21.9k |
-| **15 (default)** | **59.2°** | 6.9% | 21.3k |
+| 15 | 59.2° | 6.9% | 21.3k |
 | 20 | 56.4° | 6.7% | 20.5k |
-| 30 | 52.6° | 6.0% | 18.5k |
+| **−30 (default)** | **52.6°** | 6.0% | 18.5k |
 
-The angle still reads exaggerated at 15° (59° for a true 35°), so the viewer prints
+The angle still reads exaggerated in an oblique view, so the viewer prints
 **`book NN.N deg from vertical (need < 15)`** in the top-left, turning green on
 success. Raise `--cam-azimuth` toward 45–90 to judge the angle geometrically rather
 than off that overlay.
 
-At the defaults the loop holds **real-time factor 1.00 at 1000 Hz** with the
-viewer at 25–30 fps. `--no-view` runs headless (still records video if asked).
+The visual and force rates are independent. With the normal visual meshes,
+`--render-quality fast --view-fps 30` typically delivers about 25–30 fps; the
+precise rate depends on CPU/software-renderer speed. For a responsive 30–60 fps
+control display, use `--render-quality collision --view-fps 30` (or 60 on a fast
+CPU). That choice also determines the RGB images saved in a dataset. `--no-view`
+runs without a window (and still renders dataset RGB unless `--dataset-no-rgb`
+is set). The on-screen window is enlarged to twice the native canvas width and
+height by default without increasing render or dataset resolution; use
+`--viewer-scale 1` to restore the old window size.
 
 ## Recording
 
@@ -501,10 +570,158 @@ viewer at 25–30 fps. `--no-view` runs headless (still records video if asked).
 ## Scene randomization
 
 `--seed` moves the bookend (position and ±10° of yaw) and the book on it.
-`--randomize-physics` samples the book's mass, three friction coefficients and
-all three dimensions from flipup's own ranges; `--book-mass`, `--book-friction`,
-`--book-length`, `--book-width`, `--book-thickness` override individual values.
-The sampled values are printed at startup.
+Every episode independently samples book upright height, width, and mass within
+±20% of nominal and chooses a realistic cover colour. Thickness and friction are
+held fixed to avoid confounding the requested factors. Tune the ranges with
+`--book-size-jitter` and `--book-mass-jitter`, or disable them with
+`--no-episode-randomization`.
+
+The tool starts inside a fixed prism centred at the nominal standoff in front of
+the book. Its default full depth/lateral/vertical size is 4×6×5 cm. The first
+attempt is exactly centred; afterward 70% use a tight centre distribution and
+30% uniformly cover the prism, so head-on starts dominate without losing edge
+coverage. Change this with `--start-prism D L V` and `--start-center-prob`.
+Candidates that start with more than 0.5 N of robot contact or retain more than
+10 mm of settling error are automatically rejected and resampled; this keeps
+the broad distribution without turning an overlapping or unreachable reset into
+a haptic impulse. The thresholds are configurable with `--start-max-contact-force`
+and `--start-max-settle-error`.
+Each attempt's component, normalized offset, world pose, dimensions, mass,
+colour, and deterministic seed are stored in episode metadata.
+
+The older `--randomize-physics` flag still samples a broad nominal book including
+friction and thickness; the controlled per-episode ±20% variation is then
+applied around it. Explicit `--book-*` values select the nominal values.
+
+## Floating gripper
+
+`teleop_floating_flipup.py` removes the UR5e but keeps the compiled WSG50,
+RealSense, book, support, contact parameters, and the gripper's 1.89 kg physical
+mass/inertia. It applies Cartesian force and moment directly at the gripper,
+cancels gravity body-by-body, and retains real acceleration/contact dynamics.
+Because flip-up is nonprehensile, both finger sliders are projected to zero
+opening after every physics step; contact cannot back-drive or chatter them.
+There is no manipulator Jacobian, arm singularity, joint damping, or arm torque
+saturation. The default target speed is 0.6 m/s instead of 0.3 m/s. Rotational
+stiffness is 300 N m/rad rather than 3000 because the free gripper has much less
+rotational inertia; damping is derived from that inertia. Solver-exact contact
+wrench remains the default haptic source and is always retained as dataset
+ground truth; the recorder's sensed-wrench field can instead use the causal
+sensor model below.
+
+Its translational impedance defaults to **5,000 N/m**, with critically scaled
+damping of about **204 N·s/m**, rather than inheriting the arm's 16,000 N/m.
+On the same scripted flip this reduced simulated contact from 33.9 N median /
+173.8 N peak to **15.3 N median / 68.2 N peak**, while still succeeding. The
+floating handle target is **1,800 N/m** (versus 1,500 for the arm), giving a
+default force gain of `1800 / (5000 × 4) = 0.09`. In the matched run the felt
+contact changed from 0.81 N median / 3.57 N peak to **1.38 N median / 4.98 N
+peak**, with a 6.7× passivity margin.
+
+Fingertip compliance is an opt-in A/B knob. `--tip-softness 0` leaves the two
+tip-pad contacts unchanged. `--tip-softness 0.5` uses a 15 ms contact time
+constant, damping ratio 1.5, and 4 mm impedance width; `1` uses 20 ms, ratio 2,
+and 5 mm. Only the two fingertip pads change. The resolved contact parameters
+are printed at startup and stored in each dataset episode's model metadata.
+
+Force-sensor bandwidth is a separate opt-in knob:
+
+```bash
+python teleop_floating_flipup.py \
+  --tip-softness 0.5 --force-sensor-cutoff 30
+```
+
+`--force-sensor-cutoff 0` is an identity path and exactly preserves the old raw
+measurement. A positive value runs two cascaded causal first-order poles in the
+tool frame at every 1 ms physics tick; the value is the cutoff of each pole.
+At 30 Hz the modeled step reaches 50% in about 8.9 ms and has about 10.6 ms of
+low-frequency group delay. This removes much of the instantaneous
+constraint/friction switching while remaining substantially faster than the
+250 ms causal moving average used to make the optional adaptive-compliance
+labels. The plot draws raw force as a thin muted trace and the sensor as a thick
+trace, and both are stored at the full numeric sample rate.
+
+The default `--force-source contact` deliberately keeps haptic reflection on
+the immediate raw contact path even when the recorded sensor is enabled. Use
+`--force-source wrist` only if you intentionally want to feel the modeled
+sensor too; its added delay reduces haptic passivity margin, so lower
+`--stiffness` and confirm the result with `--diagnose`.
+
+## Rounded-cube lift
+
+`teleop_floating_cube_lift.py` reuses the floating WSG50, gravity compensation,
+1 kHz Force Dimension servo, force-sensor model, viewer, randomized reset gate,
+KEEP/DELETE workflow, and Pyrite recorder. The new scene has a rounded 2.75 cm
+cube on the complete visible tabletop and maps the omega.7 gap continuously to
+the WSG50 finger opening.
+
+```bash
+python teleop_floating_cube_lift.py \
+  --collect-dataset ~/data/cube_lift_floating_1khz.zarr \
+  --auto-finish --render-quality fast
+```
+
+The task is set up for fast top-down pickups: the simulated gripper starts 10
+cm above the cube centre, the device is homed at `0.02 0 0.015` (raised relative
+to flip-up), translation scale is `5 5 5`, target speed is 0.8 m/s, and wrist
+orientation stays vertical unless `--enable-rotation` is passed. Success occurs
+when the cube bottom clears the table by `--success-height 0.08` m.
+
+At the default scale, the 10 cm descent takes 2 cm of handle travel and the
+14 cm lift takes 2.8 cm. The simulated safety workspace spans 40 cm in x/y, but
+the physical device walls retain their conservative 9 x 8 x 9.6 cm box. Later
+episodes sample the gripper throughout a 10 x 10 x 5 cm start prism and move the
+cube within a separate 10 x 10 cm placement region; the existing 70% centred
+Gaussian mixture still concentrates most demonstrations near the nominal pose.
+
+Contact and workspace protection are independent:
+
+- `--grasp-force-limit 25` smoothly saturates simulated closing force with a
+  tanh law instead of allowing the position actuator to wind up through the
+  cube. `--gripper-speed 0.12` also rate-limits the simulated jaw target.
+- `--table-contact-force-limit 40` (an alias for `--surface-force-limit`)
+  smoothly saturates only the Cartesian spring component pressing through the
+  tabletop. Sliding and lifting remain free.
+- The tool target is constrained to the printed task workspace. The physical
+  handle has a matching conservative wall around the raised home position;
+  tune it with `--workspace-wall-half` and `--workspace-wall-stiffness`.
+- Cube-lift defaults to `--tip-softness 0.5` and
+  `--force-sensor-cutoff 30`, unlike flip-up's opt-in defaults.
+
+The omega.7 grasp return is its own 1 kHz feedback loop. Simulated two-finger
+contact load is mapped with `--grip-force-gain 0.08`, then filtered by
+`--grip-force-tau 10`, slew-limited by `--grip-force-rate 60`, damped by
+`--grip-damping 6`, and capped by `--max-grip-force 3`. The normal sign is
+`--grip-feedback-sign -1`, which pushes the physical jaws open to resist a
+squeeze; switch it to `1` only if the particular hand configuration feels
+assisting instead of resisting. During collection idle, a gentle opening force
+and the Cartesian centering pull return both device channels to a repeatable
+start before `S` is accepted.
+
+By default, episodes independently randomize plausible cube colour, mass by
+±20%, x/y placement, and the gripper's start pose while keeping the requested
+2.75 cm cube size exact; attempt zero is centred. Alongside the normal
+pose/wrench/MuJoCo channels, every 1 kHz sample
+stores `object_pose`, `object_height_m`, `object_lift_height_m`, `task_metric`,
+`gripper_command`, `gripper_controller_target`, `gripper_opening`,
+`gripper_actuator_force`, `grasp_force`, physical device gap and applied grip
+feedback, plus surface/workspace-limit flags. State replay automatically selects
+the cube environment from episode metadata.
+
+The viewer reports current and episode-maximum grasp and robot/table contact
+forces beside their explicit configured limits. Each line changes from `OK` to
+`EXCEEDED` when its solver-measured maximum crosses the threshold, and the same
+`table_contact_force` plus per-sample exceedance flags are recorded at 1 kHz.
+
+The omega.7's measured maximum gap is not assumed to be exactly 25 mm. During
+the first idle reset, release the grip and let the gentle opening force settle;
+the collector learns the direction and largest stable gap after 350 ms and uses
+that endpoint for both the `S` start gate and analogue jaw mapping. Negative gap
+readings, including approximately -26 mm on a left-hand omega.7, are supported.
+The learned value persists
+across resets and is saved in episode metadata. `--device-grip-open` is therefore
+only a nominal upper bound by default. Use `--no-device-grip-auto-calibration`
+only when supplying a measured endpoint explicitly.
 
 ## Environment notes
 

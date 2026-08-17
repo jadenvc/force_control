@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import os
 import sys
 import unittest
@@ -26,6 +27,39 @@ def _tool_rotation(environment: FlipUpTeleop) -> Rotation:
 
 
 class WristInputTest(unittest.TestCase):
+    def test_viewer_wrist_state_is_initialized_before_thread_start(self) -> None:
+        """Keep rotation overlays safe when their worker draws immediately."""
+        source = (TELEOP_DIR / "teleop_flipup.py").read_text()
+        module = ast.parse(source)
+        main = next(
+            node
+            for node in module.body
+            if isinstance(node, ast.FunctionDef) and node.name == "main"
+        )
+
+        def assignment_line(name: str) -> int:
+            return min(
+                node.lineno
+                for node in ast.walk(main)
+                if isinstance(node, ast.Assign)
+                and any(
+                    isinstance(target, ast.Name) and target.id == name
+                    for target in node.targets
+                )
+            )
+
+        viewer_start_line = min(
+            node.lineno
+            for node in ast.walk(main)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "start"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "viewer_thread"
+        )
+        self.assertLess(assignment_line("rot_home"), viewer_start_line)
+        self.assertLess(assignment_line("wrist_delta"), viewer_start_line)
+
     def test_rotation_matrix_validation(self) -> None:
         valid = Rotation.from_euler("xyz", [0.2, -0.1, 0.3]).as_matrix()
         self.assertTrue(FDOmega._is_rotation_matrix(valid))

@@ -1,0 +1,58 @@
+name: build
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  ubuntu-22-04:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Configure
+        run: cmake --preset release
+
+      - name: Build
+        run: cmake --build --preset release
+
+      - name: Test
+        run: ctest --preset release
+
+      - name: Install
+        run: cmake --install build/release
+
+      - name: Verify installed CMake package
+        run: >
+          cmake -S tests/consumer -B build/consumer
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_PREFIX_PATH="$PWD/build/install"
+          && cmake --build build/consumer --parallel
+          && ./build/consumer/force_control_consumer
+
+  flipup:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes python3-venv libgl1 libglib2.0-0 libosmesa6
+
+      - name: Install Python dependencies
+        run: |
+          python3 -m venv .venv
+          .venv/bin/python -m pip install --upgrade pip
+          .venv/bin/python -m pip install --editable ./flipup_minimal
+          .venv/bin/python -m pip install --requirement teleop/requirements.txt pytest
+
+      - name: Test FlipUp
+        env:
+          MUJOCO_GL: osmesa
+        run: |
+          .venv/bin/python -m pytest -q flipup_minimal/tests teleop/tests
+          .venv/bin/python teleop/teleop_flipup.py --dry-run --no-view

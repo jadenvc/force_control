@@ -1,0 +1,3 @@
+# PyriteML currently depends on the Zarr 2.x API.
+zarr>=2.16,<3
+numcodecs>=0.12

@@ -1,0 +1,7 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+find_dependency(yaml-cpp 0.8 CONFIG)
+
+include("${CMAKE_CURRENT_LIST_DIR}/force_controlTargets.cmake")
+check_required_components(force_control)

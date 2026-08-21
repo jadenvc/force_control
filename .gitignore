@@ -2,3 +2,13 @@ test/data/*.txt
 .vscode/
 *sublime*
 build/
+*.log
+.venv/
+**/__pycache__/
+**/.pytest_cache/
+*.py[cod]
+*.zarr/
+teleop/*.csv
+teleop/*.mp4
+teleop/*.webm
+teleop/MUJOCO_LOG.TXT

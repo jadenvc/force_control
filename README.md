@@ -47,36 +47,116 @@ For your own safety, the following steps are recommended before launching a forc
 8. Redo the above for rotational axes. Note the order of magnitude of parameters are quiet different between rotational and translational axes.
 
 # Install
-## Dependency
-Please install the following packages:
-* [cpplibrary](https://github.com/yifan-hou/cpplibrary)
 
-## Build
-``` sh
+## Reproducible dependencies
+
+The default CMake build downloads and verifies the same core dependency
+versions used by the audited development environment:
+
+* Eigen 3.4.0
+* yaml-cpp 0.8.0
+* [cpplibrary](https://github.com/yifan-hou/cpplibrary) commit
+  `e01dc4ccd68363a571e1f6a3c8cd3ba6dbec130c`
+
+Each source archive is protected by a SHA-256 checksum in
+[`CMakeLists.txt`](CMakeLists.txt). Nothing needs to be installed under
+`/usr/local` or `~/.local` before configuring this project.
+
+The baseline system used for the container and CI build is Ubuntu 22.04 with
+GCC 11 and C++17. The Dockerfile pins the multi-platform Ubuntu image by digest.
+
+## Native build
+
+Install CMake 3.20 or newer, a C++ compiler, and Git. On Ubuntu 22.04:
+
+```sh
+sudo apt-get update
+sudo apt-get install --yes build-essential ca-certificates cmake git
+```
+
+Then configure, build, test, and install:
+
+```sh
+git clone https://github.com/jadenvc/force_control.git
 cd force_control
-mkdir build && cd build
-cmake ..
-make -j
-make install
+cmake --preset release
+cmake --build --preset release
+ctest --preset release
+cmake --install build/release
+```
+
+The preset installs into `build/install`, keeping the host system unchanged.
+Use `--prefix /your/prefix` with the final command to choose another
+installation location.
+
+## Container build
+
+The checked-in `Dockerfile` performs the same release build and smoke test:
+
+```sh
+docker build --tag force-control:0.1.0 .
+```
+
+## FlipUp MuJoCo environment
+
+The standalone UR5e + WSG50 book-pivot environment and all required MuJoCo
+assets are included in [`flipup_minimal`](flipup_minimal). The optional
+Force Dimension haptic bridge is in [`teleop`](teleop).
+
+Use a current Python 3.10-or-newer environment rather than trying to reproduce
+one workstation package-for-package. On Ubuntu, a minimal setup is:
+
+```sh
+sudo apt-get install python3-venv libgl1 libglfw3 libosmesa6 ffmpeg
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install --editable ./flipup_minimal
+python -m pip install --requirement teleop/requirements.txt
+```
+
+Run the environment without hardware or a viewer:
+
+```sh
+python teleop/teleop_flipup.py --dry-run --no-view
+```
+
+For physical haptics, install a compatible Force Dimension SDK separately,
+install [`teleop/50-forcedimension.rules`](teleop/50-forcedimension.rules), and
+set `FORCEDIMENSION_LIB` to the SDK's `libdrd.so.3` if it is not on the system
+library path. See [`teleop/README.md`](teleop/README.md) for details.
+
+## Optional plotting environment
+
+The controller library itself does not require Python. To reproduce the
+environment used by `scripts/plot.py`, create a virtual environment and install
+the two pinned plotting packages:
+
+```sh
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install --requirement requirements-plot.txt
 ```
 
 # How to use
-## Use with cmake
-``` makefile
-# replace ${CMAKE_INSTALL_PREFIX} with your install location
-find_library(FORCE_CONTROLLERS FORCE_CONTROLLERS HINTS ${CMAKE_INSTALL_PREFIX}/lib/)
-find_library(RUT Utilities HINTS ${CMAKE_INSTALL_PREFIX}/lib/RobotUtilities)
 
-# your executable
+## Use with cmake
+
+After installing, point `CMAKE_PREFIX_PATH` at the chosen prefix and consume the
+exported target:
+
+```cmake
+find_package(force_control 0.1 CONFIG REQUIRED)
+
 add_executable(force_control_demo src/main.cc)
-target_link_libraries(force_control_demo
-  ${RUT}
-  ${FORCE_CONTROLLERS}
-)
+target_link_libraries(force_control_demo PRIVATE force_control::force_control)
 ```
 
 ## config example
-Save the following as `config.yaml`:
+
+A complete, smoke-tested configuration is checked in at
+[`config/example.yaml`](config/example.yaml):
+
 ``` yaml
 admittance_controller:
   dt: 0.002
@@ -99,6 +179,10 @@ admittance_controller:
     D_rot: 0
   direct_force_control_I_limit: [0, 0, 0, 0, 0, 0]
 ```
+
+MuJoCo is not a dependency of the C++ force-control library. The bundled
+FlipUp environment is an independent Python package and does not change the
+native library build.
 
 ## c++ code example
 Headers:

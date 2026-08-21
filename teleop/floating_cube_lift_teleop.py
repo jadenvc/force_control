@@ -21,6 +21,12 @@ from flipup.environment import ASSET_DIR, FlipUpEnv
 
 TABLE_TOP_Z = 0.05
 CUBE_CENTER_XY = np.array([0.35, 0.0], dtype=float)
+# Mirror the RealSense to the other side of the WSG50 and turn the physical
+# camera around its optical axis.  The x offset compensates the D435i model's
+# internal +32.507 mm RGB-camera offset, keeping the optical centre over the
+# gripper after the 180 degree mount rotation.
+CUBE_WRIST_CAMERA_MOUNT_POS = np.array([0.032507, 0.065, 0.054202])
+CUBE_WRIST_CAMERA_MOUNT_EULER = np.array([0.0, 0.0, np.pi])
 CUBE_COLOURS = np.array(
     [
         [0.78, 0.22, 0.16, 1.0],
@@ -229,6 +235,7 @@ class FloatingCubeLiftTeleop(FloatingFlipUpTeleop):
     default_cam_azimuth = -45.0
     default_cam_elevation = -32.0
     default_cam_distance = 0.70
+    default_cam_name = "wsg50/d435i/rgb"
     default_surface_force_limit = 40.0
     default_device_wall_half = np.array([0.045, 0.040, 0.048])
     default_device_wall_stiffness = 800.0
@@ -336,6 +343,8 @@ class FloatingCubeLiftTeleop(FloatingFlipUpTeleop):
         gripper_collision_geoms = FlipUpEnv._collision_geoms(gripper_model)
         robot_collision_geoms = gripper_collision_geoms
         camera_mount_site = gripper_model.find("site", "cam_mount")
+        camera_mount_site.pos = CUBE_WRIST_CAMERA_MOUNT_POS
+        camera_mount_site.euler = CUBE_WRIST_CAMERA_MOUNT_EULER
         camera_model = mjcf.from_path(
             str(
                 ASSET_DIR
@@ -448,6 +457,8 @@ class FloatingCubeLiftTeleop(FloatingFlipUpTeleop):
         normal_error = float(np.dot(target - self.tool_pos, normal))
         if normal_error >= 0.0:
             return target.copy()
+        # Static tool_kp on purpose -- see the matching comment in
+        # flipup_teleop.py's surface_safe_target.
         max_deflection = self.surface_force_limit / self.tool_kp
         limited_error = -max_deflection * np.tanh(
             -normal_error / max(max_deflection, 1e-12)

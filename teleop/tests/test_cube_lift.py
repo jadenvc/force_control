@@ -29,10 +29,16 @@ class CubeLiftTest(unittest.TestCase):
 
     def test_default_mapping_and_sampling_cover_larger_workspace(self) -> None:
         np.testing.assert_allclose(FloatingCubeLiftTeleop.default_scale, 5.0)
+        self.assertEqual(
+            FloatingCubeLiftTeleop.default_cam_name, "wsg50/d435i/rgb"
+        )
         np.testing.assert_allclose(
             FloatingCubeLiftTeleop.default_start_prism, [0.10, 0.10, 0.05]
         )
         with FloatingCubeLiftTeleop() as env:
+            self.assertIn(
+                FloatingCubeLiftTeleop.default_cam_name, env.camera_names()
+            )
             np.testing.assert_allclose(
                 env.workspace_high - env.workspace_low, [0.40, 0.40, 0.395]
             )

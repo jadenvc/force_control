@@ -171,7 +171,7 @@ Collection controls:
   held there and cannot drift while the operator moves the handle. In idle, a
   damped 100 N/m haptic spring gently pulls the physical handle toward fixed
   `--home`, independently capped at 2 N. Relax your grip and let it settle; the
-  overlay turns green after it is within 3 mm and slower than 15 mm/s for 250 ms.
+  overlay turns green after it is within 5 mm and slower than 15 mm/s for 250 ms.
   Only then will **`s`** start. The centering spring switches off before data
   collection, so it is not part of the demonstrated motion or recorded contact.
   Every randomized simulated start therefore maps to the same physical center
@@ -653,7 +653,11 @@ sensor too; its added delay reduces haptic passivity margin, so lower
 1 kHz Force Dimension servo, force-sensor model, viewer, randomized reset gate,
 KEEP/DELETE workflow, and Pyrite recorder. The new scene has a rounded 2.75 cm
 cube on the complete visible tabletop and maps the omega.7 gap continuously to
-the WSG50 finger opening.
+the WSG50 finger opening. Its viewer and saved RGB observations default to the
+moving wrist RealSense (`wsg50/d435i/rgb`), mounted on the opposite side of the
+gripper and looking down between the fingertips. Its optical frame is rotated
+180 degrees so both image axes follow the requested orientation; pass
+`--free-camera` to restore the external view.
 
 ```bash
 python teleop_floating_cube_lift.py \
@@ -679,9 +683,11 @@ Contact and workspace protection are independent:
 - `--grasp-force-limit 25` smoothly saturates simulated closing force with a
   tanh law instead of allowing the position actuator to wind up through the
   cube. `--gripper-speed 0.12` also rate-limits the simulated jaw target.
-- `--table-contact-force-limit 40` (an alias for `--surface-force-limit`)
-  smoothly saturates only the Cartesian spring component pressing through the
-  tabletop. Sliding and lifting remain free.
+- `--table-normal-force-limit 40` (also accepted as
+  `--table-contact-force-limit` or `--surface-force-limit`) smoothly saturates
+  only the Cartesian spring component pressing through the tabletop. It uses
+  the detected table-contact normal; sliding and lifting remain free. Set it
+  to `0` to disable the limiter and retain the unbounded impedance target.
 - The tool target is constrained to the printed task workspace. The physical
   handle has a matching conservative wall around the raised home position;
   tune it with `--workspace-wall-half` and `--workspace-wall-stiffness`.

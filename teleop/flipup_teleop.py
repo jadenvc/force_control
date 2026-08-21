@@ -867,6 +867,12 @@ class FlipUpTeleop(FlipUpEnv):
             return target.copy()
 
         normal_error = float(np.dot(target - self.tool_pos, normal))
+        # Deliberately the static tool_kp, NOT the approach-compliance-
+        # softened effective kp: this budget is a hard safety cap on
+        # penetration, and letting it grow as kp is ramped down would let
+        # sustained pushing drive the target far deeper before the force
+        # limit engages (e.g. 15 N / (0.2*700 N/m) = 10.7 cm instead of
+        # 15 N / 700 N/m = 2.1 cm).
         max_deflection = self.surface_force_limit / self.tool_kp
         if normal_error >= -max_deflection:
             return target.copy()

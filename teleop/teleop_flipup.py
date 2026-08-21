@@ -508,6 +508,31 @@ def main(env_class=None):
              "default 0 preserves current behavior",
     )
     parser.add_argument(
+        "--table-solref",
+        type=float,
+        nargs=2,
+        default=None,
+        metavar=("TIME_CONSTANT_S", "DAMPING_RATIO"),
+        help="floating gripper only: override the visible table surface's raw "
+             "MuJoCo solref [time_constant, damping_ratio], replacing table.xml's "
+             "compiled (0.015, 2.0). Smaller time_constant makes the table "
+             "resist penetration sooner (stiffer, higher peak force); larger "
+             "makes it softer and slower to push back (more penetration, "
+             "lower peak force). Leave unset to keep the compiled value",
+    )
+    parser.add_argument(
+        "--table-solimp",
+        type=float,
+        nargs=5,
+        default=None,
+        metavar=("D0", "D_WIDTH", "WIDTH", "MIDPOINT", "POWER"),
+        help="floating gripper only: override the visible table surface's raw "
+             "MuJoCo solimp [d0, d_width, width, midpoint, power], replacing "
+             "table.xml's compiled (0.85, 0.95, 0.004, 0.5, 2.0). Increasing "
+             "width spreads the impedance transition over more penetration for "
+             "a more gradual onset. Leave unset to keep the compiled value",
+    )
+    parser.add_argument(
         "--force-sensor-cutoff",
         type=float,
         default=float(getattr(env_class, "default_force_sensor_cutoff", 0.0)),
@@ -644,13 +669,72 @@ def main(env_class=None):
                              "ball_force_limit. The scripted flip itself peaks at "
                              "~145 N, so this only clips a hard jam")
     parser.add_argument(
-        "--surface-force-limit", "--table-contact-force-limit",
+        "--surface-force-limit",
+        "--table-contact-force-limit",
+        "--table-normal-force-limit",
         dest="surface_force_limit",
         type=float,
         default=float(getattr(env_class, "default_surface_force_limit", DEFAULT_SURFACE_FORCE_LIMIT)),
         help="maximum steady Cartesian spring force (N) pressing through the "
-             "visible table or bookend surfaces (default 80). Tangential motion "
-             "and book contact are unchanged; 0 disables surface anti-windup",
+             "visible support-surface normal (table only for cube lift; table "
+             "and bookend for flip-up). Tangential motion and object contact "
+             "are unchanged; 0 disables support-surface anti-windup",
+    )
+    parser.add_argument(
+        "--book-normal-force-limit",
+        dest="book_normal_force_limit",
+        type=float,
+        default=float(getattr(env_class, "default_book_normal_force_limit", 0.0)),
+        help="EXPERIMENTAL, floating gripper only. Maximum steady Cartesian "
+             "spring force (N) pressing through the fingertip-book contact "
+             "normal once contact is detected -- caps sustained wedging "
+             "instead of impact. Tangential motion is unchanged; 0 (default) "
+             "disables it. Try book_force / tool_kp for a starting deflection "
+             "budget, e.g. 18/4000 ~= 4.5mm",
+    )
+    parser.add_argument(
+        "--approach-compliance-distance",
+        dest="approach_compliance_distance",
+        type=float,
+        default=0.0,
+        metavar="METRES",
+        help="floating gripper only: turn on variable compliance near the "
+             "table/bookend. Above this many metres from the nearest guarded "
+             "surface, --tool-kp is used unchanged; within it, kp (and its "
+             "matching critically-damped kd) ramp linearly down to "
+             "--approach-compliance-min-kp-ratio times tool_kp at, or below, "
+             "the surface. 0 (default) disables the ramp -- current "
+             "behavior. This targets the FIRST-CONTACT impact spike that the "
+             "surface anti-windup cannot prevent (it only bounds sustained "
+             "penetration after contact is already detected); try 0.03",
+    )
+    parser.add_argument(
+        "--approach-compliance-min-kp-ratio",
+        dest="approach_compliance_min_kp_ratio",
+        type=float,
+        default=0.2,
+        help="floating gripper only: fraction of --tool-kp used once the "
+             "tool is at or below the guarded surface, when "
+             "--approach-compliance-distance > 0. Must be in (0, 1]; "
+             "default 0.2 (i.e. 5x softer right at the surface)",
+    )
+    parser.add_argument(
+        "--approach-compliance-max-speed",
+        dest="approach_compliance_max_speed",
+        type=float,
+        default=0.0,
+        metavar="M_PER_S",
+        help="floating gripper only: the knob that actually limits impact "
+             "energy. Requires --approach-compliance-distance > 0. Once "
+             "within that distance of a guarded surface, clamps how fast "
+             "the incoming target may move INTO the surface to this many "
+             "m/s (tangential/outward motion is unaffected). 0 (default) "
+             "disables it. The kp/kd ramp alone does NOT slow the tool down "
+             "-- a critically damped spring tracking a constant-velocity "
+             "target settles into a bigger lag at the SAME tool velocity as "
+             "kp drops, so without this the tool still hits the surface at "
+             "full --max-speed and the impact is absorbed entirely by the "
+             "raw contact solver. Try 0.03-0.05",
     )
     parser.add_argument("--workspace-wall-stiffness", type=float,
                         default=float(getattr(env_class, "default_device_wall_stiffness", 0.0)),
@@ -750,14 +834,25 @@ def main(env_class=None):
                         help="degrees above the horizontal, negative = looking down. "
                              "Steeper hides more of the book behind the gripper "
                              "(measured 3.8%% occluded at -20, 13.6%% at -40)")
-    parser.add_argument("--cam-name", type=str, default=None,
+    parser.add_argument("--cam-name", type=str,
+                        default=getattr(env_class, "default_cam_name", None),
                         help="render a fixed camera compiled into the scene instead of "
-                             "the free one, e.g. 'ur5e/wsg50/d435i/rgb' -- the wrist "
+                             "the free one, e.g. 'wsg50/d435i/rgb' for the floating "
+                             "gripper or 'ur5e/wsg50/d435i/rgb' for the arm -- the wrist "
                              "RealSense, literally the robot's own viewpoint. Note it "
                              "moves WITH the tool, so the book looks static while the "
                              "world rotates around it; fine for recording policy "
                              "observations, disorienting to drive from. Overrides "
                              "--cam-azimuth/--cam-elevation/--cam-distance")
+    parser.add_argument(
+        "--free-camera",
+        dest="cam_name",
+        action="store_const",
+        const=None,
+        help="use the external free camera even when the task defaults to a fixed "
+             "wrist camera; configure it with --cam-azimuth, --cam-elevation, and "
+             "--cam-distance",
+    )
     parser.add_argument("--cam-distance", type=float,
                         default=float(getattr(env_class, "default_cam_distance", 0.75)),
                         help="metres from the middle of the flip arc. The default "
@@ -799,9 +894,9 @@ def main(env_class=None):
                              "placeholder RGB frames for low-dimensional experiments")
     parser.add_argument("--dataset-min-samples", type=int, default=20,
                         help="discard episodes shorter than this many control samples")
-    parser.add_argument("--collection-home-tolerance", type=float, default=0.003,
+    parser.add_argument("--collection-home-tolerance", type=float, default=0.005,
                         help="maximum handle distance from fixed --home before S can "
-                             "start a dataset episode, in m (default 0.003)")
+                             "start a dataset episode, in m (default 0.005)")
     parser.add_argument("--collection-home-speed", type=float, default=0.015,
                         help="maximum handle speed before S can start a dataset episode, "
                              "in m/s (default 0.015)")
@@ -852,6 +947,31 @@ def main(env_class=None):
         parser.error("--viewer-scale must be greater than zero")
     if args.surface_force_limit < 0.0:
         parser.error("--surface-force-limit cannot be negative")
+    if args.book_normal_force_limit < 0.0:
+        parser.error("--book-normal-force-limit cannot be negative")
+    if args.book_normal_force_limit > 0.0 and not floating:
+        parser.error("--book-normal-force-limit is only supported on the floating gripper")
+    if args.approach_compliance_distance < 0.0:
+        parser.error("--approach-compliance-distance cannot be negative")
+    if not 0.0 < args.approach_compliance_min_kp_ratio <= 1.0:
+        parser.error("--approach-compliance-min-kp-ratio must be in (0, 1]")
+    if args.approach_compliance_distance > 0.0 and not floating:
+        parser.error(
+            "--approach-compliance-distance is available only for the floating gripper"
+        )
+    if args.approach_compliance_max_speed < 0.0:
+        parser.error("--approach-compliance-max-speed cannot be negative")
+    if args.approach_compliance_max_speed > 0.0 and not floating:
+        parser.error(
+            "--approach-compliance-max-speed is available only for the floating gripper"
+        )
+    if (
+        args.approach_compliance_max_speed > 0.0
+        and args.approach_compliance_distance <= 0.0
+    ):
+        parser.error(
+            "--approach-compliance-max-speed requires --approach-compliance-distance > 0"
+        )
     if args.grasp_force_limit <= 0.0:
         parser.error("--grasp-force-limit must be positive")
     if args.gripper_speed <= 0.0:
@@ -898,6 +1018,14 @@ def main(env_class=None):
         parser.error("--tip-softness must be in [0, 1]")
     if not floating and not np.isclose(args.tip_softness, 0.0):
         parser.error("--tip-softness is available only for the floating gripper")
+    if not floating and args.table_solref is not None:
+        parser.error("--table-solref is available only for the floating gripper")
+    if not floating and args.table_solimp is not None:
+        parser.error("--table-solimp is available only for the floating gripper")
+    if args.table_solref is not None and args.table_solref[0] <= 0.0:
+        parser.error("--table-solref time constant must be positive")
+    if args.table_solref is not None and args.table_solref[1] <= 0.0:
+        parser.error("--table-solref damping ratio must be positive")
     if args.force_sensor_cutoff < 0.0:
         parser.error("--force-sensor-cutoff cannot be negative")
     if args.force_sensor_cutoff >= 0.5 * args.control_freq:
@@ -1016,6 +1144,14 @@ def main(env_class=None):
     if floating:
         env_kwargs["tip_softness"] = args.tip_softness
         env_kwargs["force_sensor_cutoff_hz"] = args.force_sensor_cutoff
+        env_kwargs["book_normal_force_limit"] = args.book_normal_force_limit
+        env_kwargs["table_solref"] = args.table_solref
+        env_kwargs["table_solimp"] = args.table_solimp
+        env_kwargs["approach_compliance_distance_m"] = args.approach_compliance_distance
+        env_kwargs["approach_compliance_min_kp_ratio"] = (
+            args.approach_compliance_min_kp_ratio
+        )
+        env_kwargs["approach_max_speed_mps"] = args.approach_compliance_max_speed
     if cube_lift:
         env_kwargs.update(
             {
@@ -1314,6 +1450,16 @@ def main(env_class=None):
         )
     else:
         print("[contact] surface anti-windup OFF")
+    if floating:
+        if env.book_force_limit > 0.0:
+            print(
+                f"[contact] fingertip-book normal anti-windup enabled; caps steady "
+                f"controller deflection into the book at "
+                f"{1000.0 * env.book_force_limit / env.tool_kp:.1f} mm "
+                f"({env.book_force_limit:.0f} N), tangential sliding remains free"
+            )
+        else:
+            print("[contact] fingertip-book normal anti-windup OFF")
     print(
         f"[scene] {task_metric_summary()}. Tool starts "
         f"{args.standoff * 100:.1f} cm from the "
@@ -2301,11 +2447,22 @@ def main(env_class=None):
                     "sim_timestep_s": env.timestep,
                     "substeps": substeps,
                     "surface_force_limit": env.surface_force_limit,
+                    "book_normal_force_limit": getattr(env, "book_force_limit", None),
                     "workspace_low": getattr(env, "workspace_low", None),
                     "workspace_high": getattr(env, "workspace_high", None),
                     "grasp_force_limit": getattr(env, "grasp_force_limit", None),
                     "gripper_speed": getattr(env, "gripper_speed", None),
                     "success_height": getattr(env, "success_height", None),
+                    "approach_compliance": {
+                        "enabled": getattr(env, "_approach_compliance_enabled", False),
+                        "distance_m": getattr(
+                            env, "approach_compliance_distance_m", 0.0
+                        ),
+                        "min_kp_ratio": getattr(
+                            env, "approach_compliance_min_kp_ratio", None
+                        ),
+                        "max_speed_mps": getattr(env, "approach_max_speed_mps", 0.0),
+                    },
                 },
                 "mapping": {
                     "position_matrix": pos_map,
@@ -2377,6 +2534,7 @@ def main(env_class=None):
                     "na": env.model.na,
                     "nsensordata": env.model.nsensordata,
                     "tip_contact": getattr(env, "tip_contact_parameters", None),
+                    "table_contact": getattr(env, "table_contact_parameters", None),
                     "force_sensor": getattr(env, "force_sensor_parameters", None),
                 },
                 "device": (

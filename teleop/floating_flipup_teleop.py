@@ -29,6 +29,11 @@ from flipup.physical_properties import DEFAULT_PHYSICAL_PROPERTIES, PhysicalProp
 DEFAULT_FLOATING_TOOL_ROT_KP = 300.0
 DEFAULT_FLOATING_TOOL_KP = 5000.0
 DEFAULT_FLOATING_HAPTIC_STIFFNESS = 1800.0
+# 0 = off. Mirrors surface_force_limit's convention: the visible table/bookend
+# anti-windup deliberately excludes the book (see FLOATING_FLIPUP_COMPLIANCE_
+# TELEOP.md section 10.1), so this is a separate opt-in cap on fingertip-book
+# normal deflection, off by default until validated against real pad data.
+DEFAULT_BOOK_NORMAL_FORCE_LIMIT = 0.0
 TIP_CONTACT_GEOM_NAMES = (
     "wsg50/right_tip_pad",
     "wsg50/left_tip_pad",
@@ -74,6 +79,12 @@ class FloatingFlipUpTeleop(FlipUpTeleop):
         collision_envelope_dimensions=None,
         tip_softness=0.0,
         force_sensor_cutoff_hz=0.0,
+        book_normal_force_limit=DEFAULT_BOOK_NORMAL_FORCE_LIMIT,
+        table_solref=None,
+        table_solimp=None,
+        approach_compliance_distance_m=0.0,
+        approach_compliance_min_kp_ratio=0.2,
+        approach_max_speed_mps=0.0,
     ):
         del settle_s, settle_speed, joint_kd, randomize_physics
         if physical_properties is None:
@@ -88,6 +99,24 @@ class FloatingFlipUpTeleop(FlipUpTeleop):
             raise ValueError("tip_softness must be in [0, 1]")
         if float(force_sensor_cutoff_hz) < 0.0:
             raise ValueError("force_sensor_cutoff_hz cannot be negative")
+        if table_solref is not None and len(table_solref) != 2:
+            raise ValueError(
+                "table_solref must have exactly 2 values (time_constant, "
+                "damping_ratio), matching MuJoCo's positive solref convention"
+            )
+        if table_solimp is not None and len(table_solimp) != 5:
+            raise ValueError(
+                "table_solimp must have exactly 5 values (d0, d_width, "
+                "width, midpoint, power), matching MuJoCo's solimp convention"
+            )
+        if float(approach_compliance_distance_m) < 0.0:
+            raise ValueError("approach_compliance_distance_m cannot be negative")
+        if not 0.0 < float(approach_compliance_min_kp_ratio) <= 1.0:
+            raise ValueError(
+                "approach_compliance_min_kp_ratio must be in (0, 1]"
+            )
+        if float(approach_max_speed_mps) < 0.0:
+            raise ValueError("approach_max_speed_mps cannot be negative")
 
         self.seed = int(seed)
         self.physical_properties = physical_properties
@@ -103,10 +132,27 @@ class FloatingFlipUpTeleop(FlipUpTeleop):
         self.surface_force_limit = float(surface_force_limit)
         if self.surface_force_limit < 0.0:
             raise ValueError("surface_force_limit cannot be negative")
+        self.book_force_limit = float(book_normal_force_limit)
+        if self.book_force_limit < 0.0:
+            raise ValueError("book_normal_force_limit cannot be negative")
         self.tool_damping = float(tool_damping)
         self.damping_ratio = float(damping_ratio)
         self.tip_softness = float(tip_softness)
         self.force_sensor_cutoff_hz = float(force_sensor_cutoff_hz)
+        self.table_solref = (
+            None if table_solref is None else tuple(float(v) for v in table_solref)
+        )
+        self.table_solimp = (
+            None if table_solimp is None else tuple(float(v) for v in table_solimp)
+        )
+        self.approach_compliance_distance_m = float(approach_compliance_distance_m)
+        self.approach_compliance_min_kp_ratio = float(approach_compliance_min_kp_ratio)
+        self._approach_compliance_enabled = self.approach_compliance_distance_m > 0.0
+        self.approach_max_speed_mps = float(approach_max_speed_mps)
+        # Recomputed every step in step(); the pre-step defaults below only
+        # matter for code that reads them before the first step() call.
+        self._effective_translation_kp = self.tool_kp
+        self._effective_translation_kd = None
         self.gravity_compensation = bool(gravity_compensation)
         self._teleop_ready = False
         self.viewer = None
@@ -206,6 +252,7 @@ class FloatingFlipUpTeleop(FlipUpTeleop):
             dtype=np.int32,
         )
         self._configure_tip_contact()
+        self._configure_table_contact()
 
         self.free_joint_id = self.model.joint("wsg50/").id
         self.free_qpos_adr = int(self.model.jnt_qposadr[self.free_joint_id])
@@ -220,6 +267,7 @@ class FloatingFlipUpTeleop(FlipUpTeleop):
         )
         self._contact_buf = np.zeros(6, dtype=float)
         self._init_surface_safety()
+        self._init_book_safety()
 
         # Kept for recorder/controller compatibility with the arm environment.
         # For the floating body this is Cartesian damping, not joint damping.
@@ -259,6 +307,7 @@ class FloatingFlipUpTeleop(FlipUpTeleop):
         )
         self.task_space_kd = np.array([translation_kd] * 3 + [self.tool_rot_kd] * 3)
         self.task_space_cartesian_kd = self.task_space_kd.copy()
+        self._effective_translation_kd = translation_kd
 
         self.wrist_force_adr = None
         self.wrist_torque_adr = None
@@ -363,6 +412,136 @@ class FloatingFlipUpTeleop(FlipUpTeleop):
             "solref_damping_ratio": float(resolved_solref[0, 1]),
             "solimp_width_m": float(resolved_width[0]),
         }
+
+    def _configure_table_contact(self):
+        """Apply optional direct overrides to the visible table's contact.
+
+        Unlike ``tip_softness``, which interpolates the fingertip pads along a
+        single normalized knob, ``table_solref``/``table_solimp`` set the
+        table surface's raw MuJoCo contact parameters directly. Either may be
+        left as ``None`` to keep the compiled ``table.xml`` values -- a
+        positive solref of ``[time_constant, damping_ratio]`` and the default
+        ``solimp`` impedance curve. Passing only one of the two leaves the
+        other at its compiled default.
+        """
+        table_geom_id = self.model.geom("table/table_surface").id
+        if self.table_solref is not None:
+            self.model.geom_solref[table_geom_id] = self.table_solref
+        if self.table_solimp is not None:
+            self.model.geom_solimp[table_geom_id] = self.table_solimp
+        self.table_contact_parameters = {
+            "solref": np.asarray(
+                self.model.geom_solref[table_geom_id], dtype=float
+            ).tolist(),
+            "solimp": np.asarray(
+                self.model.geom_solimp[table_geom_id], dtype=float
+            ).tolist(),
+        }
+
+    def _nearest_guarded_surface(self, pos):
+        """(distance, outward_normal) to the closest guarded surface.
+
+        Guarded surfaces are the table/bookend box geoms tracked by
+        ``_surface_guard_geom_ids`` (see ``_init_surface_safety``). Each is
+        assumed to be a box whose local +Z axis is its outward contact
+        normal -- true for the table and bookend fixtures modeled here.
+        Non-box guarded geoms are skipped. Returns ``(None, None)`` if no
+        guarded box geom exists yet (e.g. before ``_init_surface_safety`` has
+        run) or the allowlist contains no box geoms. Distance is positive
+        above the surface, negative if already penetrating it.
+        """
+        guard_ids = getattr(self, "_surface_guard_geom_ids", None)
+        if not guard_ids:
+            return None, None
+        pos = np.asarray(pos, dtype=float)
+        nearest_distance, nearest_normal = None, None
+        for geom_id in guard_ids:
+            if int(self.model.geom_type[geom_id]) != mujoco.mjtGeom.mjGEOM_BOX:
+                continue
+            half_extent_z = float(self.model.geom_size[geom_id][2])
+            center = np.asarray(self.data.geom_xpos[geom_id], dtype=float)
+            rotation = np.asarray(self.data.geom_xmat[geom_id], dtype=float).reshape(
+                3, 3
+            )
+            normal = rotation[:, 2]
+            top = center + half_extent_z * normal
+            distance = float(np.dot(pos - top, normal))
+            if nearest_distance is None or distance < nearest_distance:
+                nearest_distance, nearest_normal = distance, normal
+        return nearest_distance, nearest_normal
+
+    def _nearest_guarded_surface_distance(self, pos):
+        """Signed distance (m) from ``pos`` to the closest guarded surface.
+
+        See ``_nearest_guarded_surface`` for the sign convention and box
+        assumption.
+        """
+        distance, _ = self._nearest_guarded_surface(pos)
+        return distance
+
+    def _approach_speed_limited_target(self, target_pos):
+        """Cap how fast the incoming target may move THROUGH a guarded surface.
+
+        This is the mechanism that actually controls impact kinetic energy.
+        The kp/kd ramp in ``_effective_translation_gains`` does NOT slow the
+        tool down on approach: a critically damped spring tracking a
+        constant-velocity target settles into a steady-state lag of
+        ``2*damping_ratio*v*sqrt(mass/kp)`` while still MOVING AT THE SAME
+        VELOCITY v, so softening kp near the surface only grows the lag --
+        the tool still arrives at the surface at full commanded speed, and
+        the entire impact then has to be absorbed by the raw contact solver
+        instead of the controller. Confirmed against a real training run:
+        tool velocity was unchanged (~0.17 m/s, essentially --max-speed) in
+        every step immediately before a 67 N impact spike, despite the ramp
+        being active for the full 3+ cm approach.
+
+        Off unless ``approach_max_speed_mps > 0``. When enabled, only the
+        component of the requested step (relative to the previous drive
+        target) pointing INTO the nearest guarded surface is clamped, and
+        only once within ``approach_compliance_distance_m`` of it -- outward
+        and tangential motion, and everything outside the band, are
+        unaffected.
+        """
+        target = np.asarray(target_pos, dtype=float)
+        if not self._approach_compliance_enabled or self.approach_max_speed_mps <= 0.0:
+            return target
+        distance, normal = self._nearest_guarded_surface(self.tool_pos)
+        if distance is None or distance > self.approach_compliance_distance_m:
+            return target
+        max_step = self.approach_max_speed_mps * float(self.model.opt.timestep)
+        delta = target - self._drive_target
+        inward = float(np.dot(delta, -normal))
+        if inward <= max_step:
+            return target
+        return self._drive_target + delta - (inward - max_step) * (-normal)
+
+    def _effective_translation_gains(self, pos):
+        """Cartesian translational (kp, kd), scheduled by approach compliance.
+
+        Off by default (``approach_compliance_distance_m == 0``), in which
+        case this always returns ``(tool_kp, task_space_kd[0])`` -- current
+        behavior is unchanged. When enabled, ``kp`` is ramped linearly from
+        ``tool_kp`` at ``approach_compliance_distance_m`` (or farther) above
+        the nearest guarded surface down to
+        ``approach_compliance_min_kp_ratio * tool_kp`` at, or below (already
+        penetrating), the surface. ``kd`` is recomputed at the same
+        ``damping_ratio`` so the controller stays near-critically damped as
+        it softens, instead of becoming underdamped and bouncy.
+        """
+        if not self._approach_compliance_enabled:
+            return self.tool_kp, self.task_space_kd[0]
+        distance = self._nearest_guarded_surface_distance(pos)
+        if distance is None:
+            ratio = 1.0
+        else:
+            clipped = float(np.clip(distance, 0.0, self.approach_compliance_distance_m))
+            min_ratio = self.approach_compliance_min_kp_ratio
+            ratio = min_ratio + (1.0 - min_ratio) * (
+                clipped / self.approach_compliance_distance_m
+            )
+        kp = ratio * self.tool_kp
+        kd = 2.0 * self.damping_ratio * np.sqrt(kp * max(self.gripper_mass_kg, 1e-6))
+        return float(kp), float(kd)
 
     @staticmethod
     def _desired_tool_transform(tool_position):
@@ -493,6 +672,101 @@ class FloatingFlipUpTeleop(FlipUpTeleop):
         )
         return mjcf.Physics.from_mjcf_model(world_model)
 
+    # ------------------------------------------------------ book-normal safety
+    def _init_book_safety(self):
+        """State for the opt-in fingertip-book normal anti-windup.
+
+        Separate from ``_init_surface_safety`` because the visible-surface
+        guard (table/bookend) deliberately excludes the book -- see
+        FLOATING_FLIPUP_COMPLIANCE_TELEOP.md section 10.1. Reuses
+        ``_surface_contact_grace_steps`` for the release debounce so both
+        latches release on the same ~20 ms miss window.
+        """
+        self._book_limit_normal = None
+        self._book_limit_boundary = None
+        self._book_contact_misses = 0
+
+    def _active_book_normal(self):
+        """Average outward normal of active fingertip-pad/book contacts.
+
+        Mirrors ``_active_surface_normal``'s geom-pair scan and sign
+        convention, but filters on ``tip_contact_geom_ids`` vs.
+        ``book_collision_geom_id`` instead of the table/bookend allowlist.
+        """
+        tip_ids = frozenset(int(g) for g in self.tip_contact_geom_ids)
+        book_id = int(self.book_collision_geom_id)
+        normals = []
+        for index in range(self.data.ncon):
+            contact = self.data.contact[index]
+            g1, g2 = int(contact.geom1), int(contact.geom2)
+            if g1 == book_id and g2 in tip_ids:
+                tip_is_geom2 = True
+            elif g2 == book_id and g1 in tip_ids:
+                tip_is_geom2 = False
+            else:
+                continue
+            normal = np.asarray(contact.frame, dtype=float).reshape(3, 3)[0]
+            normals.append(normal if tip_is_geom2 else -normal)
+        if not normals:
+            return None
+        normal = np.mean(normals, axis=0)
+        magnitude = np.linalg.norm(normal)
+        return None if magnitude < 1e-9 else normal / magnitude
+
+    def book_normal_safe_target(self, target_pos):
+        """Bound stored normal spring energy after fingertip-book contact.
+
+        Same latch/debounce/release state machine as ``surface_safe_target``
+        (see that docstring), applied to the book instead of the visible
+        table/bookend surfaces. Off by default: 0 disables it, matching the
+        ``surface_force_limit`` convention. Tangential motion, and any
+        table/bookend contact handled by ``surface_safe_target``, are
+        unaffected.
+        """
+        target = np.asarray(target_pos, dtype=float)
+        if self.book_force_limit <= 0.0:
+            return target.copy()
+
+        active_normal = self._active_book_normal()
+        if self._book_limit_normal is not None:
+            if active_normal is None:
+                self._book_contact_misses += 1
+                if self._book_contact_misses > self._surface_contact_grace_steps:
+                    self._book_limit_normal = None
+                    self._book_limit_boundary = None
+                    self._book_contact_misses = 0
+            else:
+                self._book_contact_misses = 0
+        if self._book_limit_normal is None and active_normal is not None:
+            if np.dot(target - self.tool_pos, active_normal) < 0.0:
+                self._book_limit_normal = active_normal
+                self._book_limit_boundary = float(
+                    np.dot(self.tool_pos, active_normal)
+                )
+                self._book_contact_misses = 0
+
+        normal = self._book_limit_normal
+        if normal is None:
+            return target.copy()
+        target_coordinate = float(np.dot(target, normal))
+        if target_coordinate >= self._book_limit_boundary:
+            self._book_limit_normal = None
+            self._book_limit_boundary = None
+            self._book_contact_misses = 0
+            return target.copy()
+
+        normal_error = float(np.dot(target - self.tool_pos, normal))
+        # Static tool_kp on purpose -- see the matching comment in
+        # flipup_teleop.py's surface_safe_target.
+        max_deflection = self.book_force_limit / self.tool_kp
+        if normal_error >= -max_deflection:
+            return target.copy()
+        return target + (-max_deflection - normal_error) * normal
+
+    @property
+    def book_limit_active(self):
+        return self._book_limit_normal is not None
+
     def reset(self):
         self.data.qpos[:] = self._initial_qpos
         self.data.qvel[:] = 0.0
@@ -510,6 +784,10 @@ class FloatingFlipUpTeleop(FlipUpTeleop):
             self._surface_contact_misses = 0
             self._requested_target = self.tool_home.copy()
             self._drive_target = self.tool_home.copy()
+        if hasattr(self, "_book_limit_normal"):
+            self._book_limit_normal = None
+            self._book_limit_boundary = None
+            self._book_contact_misses = 0
         self.settle_error = float(np.linalg.norm(self.tool_pos - self.tool_home))
         self.data.time = 0.0
 
@@ -548,8 +826,20 @@ class FloatingFlipUpTeleop(FlipUpTeleop):
         target_pos = np.asarray(target_pos, dtype=float)
         for _ in range(max(1, int(n_substeps))):
             self._requested_target = target_pos.copy()
+            # Schedule translational (kp, kd) off the tool's CURRENT position;
+            # this only shapes tracking stiffness/damping, not approach
+            # speed (see _approach_speed_limited_target's docstring for why
+            # that distinction matters).
+            self._effective_translation_kp, self._effective_translation_kd = (
+                self._effective_translation_gains(self.tool_pos)
+            )
+            speed_limited_target = self._approach_speed_limited_target(
+                self._requested_target
+            )
             self._drive_target = self.limited_target(
-                self.surface_safe_target(self._requested_target)
+                self.book_normal_safe_target(
+                    self.surface_safe_target(speed_limited_target)
+                )
             )
             target_pose = self.target_pose7(self._drive_target, target_rotvec)
             target_rotation = Rotation.from_quat(target_pose[[4, 5, 6, 3]])
@@ -568,8 +858,8 @@ class FloatingFlipUpTeleop(FlipUpTeleop):
             omega_world = velocity[:3]
             linear_world = velocity[3:]
             force = (
-                self.tool_kp * (target_pose[:3] - self.tool_pos)
-                - self.task_space_kd[0] * linear_world
+                self._effective_translation_kp * (target_pose[:3] - self.tool_pos)
+                - self._effective_translation_kd * linear_world
             )
             torque_at_tool = (
                 self.tool_rot_kp * rotation_error

@@ -452,6 +452,15 @@ class ConveyorEnv:
         return self.layout.is_in_target_bin(self.object_pose[:3])
 
     @property
+    def current_episode_index(self) -> int:
+        """Index of the episode currently loaded.
+
+        :attr:`episode_index` holds the index the *next* bare :meth:`reset` will
+        use, so callers labelling the running episode want this instead.
+        """
+        return int(self.episode_index) - 1
+
+    @property
     def home_tool_pose(self) -> FloatArray:
         """Tool pose the arm settles at after a reset: above the belt, facing down."""
         return grasp_pose7(

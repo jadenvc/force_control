@@ -574,7 +574,7 @@ class ConveyorTeleop(ConveyorEnv):
         return {
             "task": "conveyor_pick_place",
             "seed": int(self.seed),
-            "episode_index": int(self.episode_index) - 1,
+            "episode_index": self.current_episode_index,
             "conveyor_speed_m_per_s": float(self.conveyor_speed_m_per_s),
             "belt_speed_range": [
                 float(self.belt_speed_range.minimum),

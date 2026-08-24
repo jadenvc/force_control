@@ -81,10 +81,16 @@ def test_reset_randomizes_the_belt_speed_and_is_reproducible_per_index(env):
 
 def test_successive_resets_advance_the_episode_index(env):
     env.reset(episode_index=0)
+    assert env.current_episode_index == 0
     first = env.conveyor_speed_m_per_s
     env.reset()
+    assert env.current_episode_index == 1
     second = env.conveyor_speed_m_per_s
     assert first != second
+    # Coming back to an index reproduces it.
+    env.reset(episode_index=0)
+    assert env.current_episode_index == 0
+    assert env.conveyor_speed_m_per_s == first
 
 
 def test_reset_randomizes_the_layout_within_the_configured_ranges(env):

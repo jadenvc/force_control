@@ -1,0 +1,2 @@
+[console_scripts]
+conveyor-demo = conveyor.cli:main

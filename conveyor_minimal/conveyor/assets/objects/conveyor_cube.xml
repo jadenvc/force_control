@@ -1,0 +1,23 @@
+<mujoco model="conveyor_cube">
+  <!-- The source task's conveyor cube: a textured box with a red top marker so
+       in-plane yaw is visible in camera views. Size, mass and friction are
+       rewritten from CubeProperties before the model is compiled, so the values
+       here are the defaults. -->
+  <asset>
+    <texture file="../textures/light-wood.png" type="cube" name="cube-texture" />
+    <material name="cube_mat" reflectance="0.7" texrepeat="1 1" texture="cube-texture"
+      texuniform="true" />
+  </asset>
+
+  <worldbody>
+    <body name="cube">
+      <geom name="cube_collision" pos="0 0 0" size="0.025 0.025 0.025" type="box"
+        solimp="0.7 0.8 0.03 0.5 2" solref="0.03 0.5"
+        mass="0.1" friction="1.0 0.3 0.1" material="cube_mat" group="0" condim="4" />
+      <geom name="yaw_marker" pos="0.015 0 0.0262" size="0.008 0.004 0.0012" type="box"
+        mass="0" rgba="0.90 0.20 0.20 1" contype="0" conaffinity="0" group="1" />
+      <site name="bottom_site" rgba="0 0 0 0" size="0.005" pos="0 0 -0.025" />
+      <site name="top_site" rgba="0 0 0 0" size="0.005" pos="0 0 0.025" />
+    </body>
+  </worldbody>
+</mujoco>

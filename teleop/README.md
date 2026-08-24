@@ -1,7 +1,16 @@
-# FlipUp haptic teleoperation
+# Haptic teleoperation
 
 This directory adds Force Dimension omega teleoperation and force reflection to
-the self-contained MuJoCo environment in `../flipup_minimal`.
+the self-contained MuJoCo environments in `../flipup_minimal` and
+`../conveyor_minimal`.
+
+Per-task guides:
+
+- [`README_flipup.md`](README_flipup.md) — the book pivot: controls, tuning,
+  dataset collection, replay.
+- [`README_conveyor.md`](README_conveyor.md) — the conveyor pick-place: the
+  gripper channel, where this task's force actually is, and what has not yet
+  been checked against hardware.
 
 ## Basic setup
 
@@ -12,6 +21,7 @@ python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install --editable ./flipup_minimal
+python -m pip install --editable ./conveyor_minimal
 python -m pip install --requirement teleop/requirements.txt
 ```
 
@@ -25,8 +35,9 @@ Verify the complete control path without a haptic device:
 python teleop/teleop_flipup.py --dry-run --no-view
 ```
 
-See [`README_flipup.md`](README_flipup.md) for controls, tuning, dataset
-collection, and replay.
+```sh
+python teleop/collect_conveyor.py --dry-run --episodes 1 --auto-finish
+```
 
 ## Force Dimension hardware
 

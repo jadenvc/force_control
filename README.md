@@ -97,11 +97,18 @@ The checked-in `Dockerfile` performs the same release build and smoke test:
 docker build --tag force-control:0.1.0 .
 ```
 
-## FlipUp MuJoCo environment
+## MuJoCo environments
 
-The standalone UR5e + WSG50 book-pivot environment and all required MuJoCo
-assets are included in [`flipup_minimal`](flipup_minimal). The optional
-Force Dimension haptic bridge is in [`teleop`](teleop).
+Two standalone MuJoCo tasks are included, each with all the assets it needs and
+no dependency on the research stack they came from:
+
+- [`flipup_minimal`](flipup_minimal) — UR5e + WSG50 pivoting a book upright
+  against a bookend. Nonprehensile, gripper closed throughout.
+- [`conveyor_minimal`](conveyor_minimal) — UR5e + fin-ray WSG50 grasping a cube
+  off a moving belt and placing it in a bin. The belt speed is randomized on
+  every reset.
+
+The optional Force Dimension haptic bridge for both is in [`teleop`](teleop).
 
 Use a current Python 3.10-or-newer environment rather than trying to reproduce
 one workstation package-for-package. On Ubuntu, a minimal setup is:
@@ -112,13 +119,18 @@ python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install --editable ./flipup_minimal
+python -m pip install --editable ./conveyor_minimal
 python -m pip install --requirement teleop/requirements.txt
 ```
 
-Run the environment without hardware or a viewer:
+Run either environment without hardware or a viewer:
 
 ```sh
 python teleop/teleop_flipup.py --dry-run --no-view
+```
+
+```sh
+python teleop/collect_conveyor.py --dry-run --episodes 1 --auto-finish
 ```
 
 For physical haptics, install a compatible Force Dimension SDK separately,

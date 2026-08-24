@@ -1,4 +1,4 @@
-"""20 Hz Pyrite-compatible episode recording for FlipUp teleoperation.
+"""20 Hz Pyrite-compatible episode recording for MuJoCo teleoperation.
 
 The on-disk layout matches PyriteML's current ``ReplayBuffer`` and
 ``VirtualTargetDataset`` contracts:
@@ -11,6 +11,11 @@ Pyrite-facing wrench data is a tared 6D wrist F/T measurement in the tool
 frame. Solver-exact contact wrench, raw sensor data, complete MuJoCo integration
 state, commands, device state, object state, and controller state are retained
 as extra arrays for auditing and state-snapshot replay.
+
+Everything above is task-agnostic. Task-specific channels come from the env: if
+it defines ``recorder_task_channels() -> dict``, those entries are stored, and
+otherwise the FlipUp book channels are stored, which is what an env predating
+that hook expects.
 """
 
 from __future__ import annotations
@@ -29,6 +34,8 @@ from scipy.spatial.transform import Rotation
 
 
 SCHEMA_NAME = "pyrite_flipup_sim"
+CONVEYOR_SCHEMA_NAME = "pyrite_conveyor_sim"
+KNOWN_SCHEMA_NAMES = (SCHEMA_NAME, CONVEYOR_SCHEMA_NAME)
 SCHEMA_VERSION = 1
 DEFAULT_SAMPLE_HZ = 20.0
 PYRITE_REQUIRED_KEYS = (
@@ -174,11 +181,18 @@ class PyriteEpisodeRecorder:
         ac_f_high: float = 100.0,
         ac_dim: int = 3,
         ac_characteristic_length: float = 0.02,
+        schema_name: str = SCHEMA_NAME,
     ) -> None:
         if sample_hz <= 0.0:
             raise ValueError("sample_hz must be positive")
         if any(int(v) <= 0 for v in image_size):
             raise ValueError("image_size must be positive")
+        if schema_name not in KNOWN_SCHEMA_NAMES:
+            raise ValueError(
+                f"unknown schema name {schema_name!r}, expected one of "
+                f"{KNOWN_SCHEMA_NAMES}"
+            )
+        self.schema_name = schema_name
         self.zarr, self.numcodecs = _zarr_modules()
         self.dataset_path = Path(dataset_path).expanduser().resolve()
         self.dataset_path.parent.mkdir(parents=True, exist_ok=True)
@@ -202,10 +216,11 @@ class PyriteEpisodeRecorder:
         self.data_group = self.root.require_group("data")
         self.meta_group = self.root.require_group("meta")
         if "schema_name" in self.root.attrs:
-            if self.root.attrs["schema_name"] != SCHEMA_NAME:
+            if self.root.attrs["schema_name"] != self.schema_name:
                 raise RuntimeError(
                     f"{self.dataset_path} uses schema "
-                    f"{self.root.attrs['schema_name']!r}, expected {SCHEMA_NAME!r}"
+                    f"{self.root.attrs['schema_name']!r}, expected "
+                    f"{self.schema_name!r}"
                 )
             old_hz = float(self.root.attrs["sample_hz"])
             if not np.isclose(old_hz, self.sample_hz):
@@ -215,7 +230,7 @@ class PyriteEpisodeRecorder:
         else:
             self.root.attrs.update(
                 {
-                    "schema_name": SCHEMA_NAME,
+                    "schema_name": self.schema_name,
                     "schema_version": SCHEMA_VERSION,
                     "sample_hz": self.sample_hz,
                     "timestamp_unit": "milliseconds",
@@ -297,15 +312,6 @@ class PyriteEpisodeRecorder:
             tool_velocity,
             0,
         )
-        book_velocity = np.zeros(6)
-        mujoco.mj_objectVelocity(
-            env.model.ptr,
-            env.data.ptr,
-            mujoco.mjtObj.mjOBJ_BODY,
-            env.book_body_id,
-            book_velocity,
-            0,
-        )
         state_size = mujoco.mj_stateSize(env.model.ptr, self._state_spec)
         integration_state = np.empty(state_size, dtype=np.float64)
         mujoco.mj_getState(
@@ -327,10 +333,6 @@ class PyriteEpisodeRecorder:
         self._append("wrench_ground_truth_world_0", truth_world)
         self._append("robot_wrench_0", truth_tool)
         self._append("tool_twist_world", np.r_[tool_velocity[3:], tool_velocity[:3]])
-        self._append("book_pose", np.r_[env.book_pos, env.book_quat])
-        self._append("book_twist_world", np.r_[book_velocity[3:], book_velocity[:3]])
-        self._append("book_angle_deg", env.book_angle_deg())
-        self._append("success", int(env.success()))
         self._append("contact_count", int(env.data.ncon))
         self._append("sim_time_s", float(env.data.time))
         self._append("qpos", env.data.qpos)
@@ -354,6 +356,29 @@ class PyriteEpisodeRecorder:
             "rgb_capture_sim_time_s",
             np.nan if image_capture_time_s is None else image_capture_time_s,
         )
+
+        # Task-specific channels. An env that predates the hook gets the FlipUp
+        # book channels, so its stored schema is unchanged.
+        task_channels = getattr(env, "recorder_task_channels", None)
+        if task_channels is None:
+            book_velocity = np.zeros(6)
+            mujoco.mj_objectVelocity(
+                env.model.ptr,
+                env.data.ptr,
+                mujoco.mjtObj.mjOBJ_BODY,
+                env.book_body_id,
+                book_velocity,
+                0,
+            )
+            self._append("book_pose", np.r_[env.book_pos, env.book_quat])
+            self._append(
+                "book_twist_world", np.r_[book_velocity[3:], book_velocity[:3]]
+            )
+            self._append("book_angle_deg", env.book_angle_deg())
+            self._append("success", int(env.success()))
+        else:
+            for key, value in task_channels().items():
+                self._append(key, value)
 
         if self.include_rgb:
             import cv2
@@ -421,8 +446,15 @@ class PyriteEpisodeRecorder:
         *,
         success: bool,
         termination_reason: str,
-        final_book_angle_deg: float,
+        final_book_angle_deg: float | None = None,
+        episode_attrs: dict[str, Any] | None = None,
     ) -> str | None:
+        """Append the accumulated episode to the dataset and return its name.
+
+        ``final_book_angle_deg`` is FlipUp's task metric and is written only when
+        given. ``episode_attrs`` carries any other task-specific episode
+        attributes, so a different task does not need its own recorder.
+        """
         count = self.sample_count
         if count < self.min_samples:
             self.discard()
@@ -457,20 +489,22 @@ class PyriteEpisodeRecorder:
         try:
             for key, value in arrays.items():
                 self._write_array(episode, key, value)
-            episode.attrs.update(
-                {
-                    "schema_version": SCHEMA_VERSION,
-                    "sample_hz": self.sample_hz,
-                    "success": bool(success),
-                    "termination_reason": str(termination_reason),
-                    "final_book_angle_deg": float(final_book_angle_deg),
-                    "sample_count": count,
-                    "adaptive_compliance": self.adaptive_config,
-                    "mujoco_state_spec": self._state_spec,
-                    "metadata_json": json.dumps(self._metadata, sort_keys=True),
-                    "committed_utc": datetime.now(timezone.utc).isoformat(),
-                }
-            )
+            attrs = {
+                "schema_version": SCHEMA_VERSION,
+                "sample_hz": self.sample_hz,
+                "success": bool(success),
+                "termination_reason": str(termination_reason),
+                "sample_count": count,
+                "adaptive_compliance": self.adaptive_config,
+                "mujoco_state_spec": self._state_spec,
+                "metadata_json": json.dumps(self._metadata, sort_keys=True),
+                "committed_utc": datetime.now(timezone.utc).isoformat(),
+            }
+            if final_book_angle_deg is not None:
+                attrs["final_book_angle_deg"] = float(final_book_angle_deg)
+            if episode_attrs:
+                attrs.update(_jsonable(episode_attrs))
+            episode.attrs.update(attrs)
             self.data_group.move(temp_name, name)
             self._update_meta()
         except Exception:
@@ -498,8 +532,11 @@ def validate_pyrite_dataset(dataset_path: str | Path) -> dict[str, Any]:
     zarr, _ = _zarr_modules()
     path = Path(dataset_path).expanduser().resolve()
     root = zarr.open(str(path), mode="r")
-    if root.attrs.get("schema_name") != SCHEMA_NAME:
-        raise ValueError(f"{path} is not a {SCHEMA_NAME} dataset")
+    if root.attrs.get("schema_name") not in KNOWN_SCHEMA_NAMES:
+        raise ValueError(
+            f"{path} schema {root.attrs.get('schema_name')!r} is not one of "
+            f"{KNOWN_SCHEMA_NAMES}"
+        )
     sample_hz = float(root.attrs["sample_hz"])
     period_ms = 1000.0 / sample_hz
     episode_names = sorted(
@@ -536,6 +573,7 @@ def validate_pyrite_dataset(dataset_path: str | Path) -> dict[str, Any]:
         )
     return {
         "path": str(path),
+        "schema_name": str(root.attrs["schema_name"]),
         "schema_version": int(root.attrs["schema_version"]),
         "sample_hz": sample_hz,
         "episodes": len(episode_names),

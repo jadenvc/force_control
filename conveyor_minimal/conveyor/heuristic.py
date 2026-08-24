@@ -67,7 +67,11 @@ class ConveyorHeuristic:
 
     # Heights, all relative to the belt surface or the bin floor.
     hover_height_over_conveyor_m: float = 0.14
-    grasp_height_over_object_m: float = -0.034
+    # Measured: the source task's -0.034 drives the fin-ray pads 173 N into the
+    # belt surface on the way to the grasp. Backing off to -0.018 keeps the pads
+    # off the belt entirely (0.0 N of robot-belt contact) with no loss of grasp
+    # success, so the only contact the operator feels is the cube.
+    grasp_height_over_object_m: float = -0.018
     lift_height_over_conveyor_m: float = 0.20
     bin_travel_height_over_center_m: float = 0.20
     bin_release_height_over_center_m: float = 0.08

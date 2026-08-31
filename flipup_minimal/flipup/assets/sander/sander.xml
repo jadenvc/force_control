@@ -1,0 +1,70 @@
+<mujoco model="sander">
+    <compiler angle="radian" autolimits="true" />
+    <default>
+        <default class="visual">
+            <geom contype="0" conaffinity="0" group="2" />
+        </default>
+        <!-- Every collision geom below is a capsule or ellipsoid on purpose: both
+             are smooth, edge-free convex primitives. A flat-faced cylinder's rim
+             (where the flat face meets the round side) is a real geometric
+             corner, and MuJoCo's contact normal is discontinuous across it,
+             exactly the kind of feature that produces torque spikes/chatter
+             during teleop. Rounding the whole tool avoids that class of problem
+             the same way the WSG50 fingertip pads already use capsules. -->
+        <default class="pad_collision">
+            <geom condim="4" friction="1.0 0.01 0.0005" solref="0.010 1.0"
+                solimp="0.85 0.95 0.003" margin="0.0015" group="3" priority="8" />
+        </default>
+    </default>
+
+    <asset>
+        <material name="sander_housing" rgba="0.85 0.55 0.10 1" reflectance="0.1" />
+        <material name="sander_pad" rgba="0.90 0.75 0.40 1" reflectance="0.0" />
+    </asset>
+
+    <worldbody>
+        <body name="base">
+            <site name="mount" group="3" />
+            <site name="ft_sensor_site" group="3" />
+
+            <!-- Housing stub: a capsule, i.e. a cylinder with rounded caps, no
+                 flat-to-round edge anywhere. -->
+            <geom name="sander_housing_visual" class="visual" type="capsule"
+                material="sander_housing" size="0.035" fromto="0 0 0.015 0 0 0.085" />
+            <geom name="sander_housing_collision" type="capsule" class="visual"
+                contype="0" conaffinity="0" size="0.035" fromto="0 0 0.015 0 0 0.085" />
+
+            <!-- Sanding pad: a flattened (oblate) ellipsoid. Unlike a flat-faced
+                 disc, an ellipsoid's surface is smooth everywhere; there is no
+                 rim/edge at all, only a continuously varying normal. This is the
+                 pad/panel contact surface and the contact-point source for the
+                 sanding-dose grid. -->
+            <geom name="sander_pad_visual" class="visual" type="ellipsoid"
+                material="sander_pad" pos="0 0 0.010" size="0.045 0.045 0.010" />
+            <geom name="sander_pad_collision" type="ellipsoid" class="pad_collision"
+                pos="0 0 0.010" size="0.045 0.045 0.010" />
+
+            <inertial pos="0 0 0.04" mass="0.4" diaginertia="0.0006 0.0006 0.0004" />
+
+            <!-- Tool-control site, matching wsg50.xml's planner_tip_site convention
+                 so the shared Cartesian task-space controller can target the pad
+                 center without any per-task special-casing. -->
+            <site name="planner_tip_site" group="3" pos="0 0 0.010" />
+            <site name="end_effector" group="3" pos="0 0 0.010" />
+
+            <!-- Wrist camera: mounted above the pad, tilted ~35deg off
+                 straight-down so it looks slightly ahead of the pad rather
+                 than only straight at the spot directly beneath it.
+                 xyaxes local x=(1,0,0) keeps the image's horizontal axis
+                 aligned with the housing's x; local y=(0,cos35,sin35) tilts
+                 the view direction (-cross(x,y)) from straight down toward
+                 +y. -->
+            <camera name="wrist_cam" pos="0 0.10 -0.11" xyaxes="1 0 0 0 -0.71 -0.71" />
+        </body>
+    </worldbody>
+
+    <sensor>
+        <force name="wrist_force_sensor" site="ft_sensor_site" />
+        <torque name="wrist_torque_sensor" site="ft_sensor_site" />
+    </sensor>
+</mujoco>

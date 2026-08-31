@@ -1,0 +1,40 @@
+<mujoco model="sanding_panel">
+    <compiler angle="radian" autolimits="true" />
+    <default>
+        <default class="visual">
+            <geom type="box" contype="0" conaffinity="0" group="2" />
+        </default>
+        <default class="collision">
+            <!-- A workpiece surface, not a rigid fixture: modest friction/priority
+                 similar to the table. -->
+            <geom type="box" group="3" condim="3"
+                friction="0.6 0.01 0.0002" solref="0.012 1.5"
+                solimp="0.85 0.95 0.004" margin="0.0005" priority="10" />
+        </default>
+    </default>
+
+    <asset>
+        <material name="panel_wood" rgba="0.70 0.60 0.45 1" reflectance="0" specular="0.05"
+            shininess="0" />
+    </asset>
+
+    <worldbody>
+        <!-- A short leg block under the panel purely so it reads visually as a
+             workpiece sitting on something, not a floating slab. Not load-bearing
+             physics; the panel itself has no freejoint, it's a static fixture. -->
+        <body name="stand">
+            <geom class="visual" pos="0 0 -0.10" size="0.15 0.11 0.10"
+                material="panel_wood" />
+        </body>
+        <body name="panel">
+            <!-- Half-extents must match SandingProperties.panel_length_m/2 and
+                 panel_width_m/2 in sanding_teleop.py. There is no shared
+                 source of truth between this compiled geometry and those
+                 dose-grid-sizing properties, so keep the two in sync by hand
+                 whenever either changes. -->
+            <geom name="panel_visual" class="visual" material="panel_wood"
+                size="0.17 0.13 0.01" />
+            <geom name="panel_surface" class="collision" size="0.17 0.13 0.01" />
+        </body>
+    </worldbody>
+</mujoco>

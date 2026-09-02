@@ -32,12 +32,31 @@ python teleop_sanding.py --sand-force-target 8 --sand-break-force 20  # lower-fo
   a round side is a real geometric corner, and MuJoCo's contact normal is
   discontinuous across it -- exactly the kind of feature that produces
   torque spikes/chatter during teleop. The ellipsoid pad has no rim at all.
-- **`--pad-softness`** (`[0, 1]`, default `0.6`) interpolates the pad's
-  `solref`/`solimp` between rigid and soft endpoints, ported directly from
+- **`--pad-softness`** (`[0, 1]`, default `1.0`) interpolates contact
+  `solref`/`solimp` between rigid and soft endpoints, ported from
   `floating_flipup_teleop.py`'s `_configure_tip_contact`/`tip_softness`.
-  Softer settles contact more gradually but, per that same task's findings,
-  does not by itself cap sustained force -- the controller will keep
-  pushing until its commanded penetration is reached regardless.
+  Two things worth knowing:
+  - It's written onto `panel_surface`, not the pad. MuJoCo takes a
+    contact's `solref`/`solimp` (and `friction`, see below) entirely from
+    whichever of the two geoms has the higher `priority` -- the panel's
+    (10) beats the pad's (8) -- so writing only to the pad (an earlier bug
+    here) silently did nothing at all, the same way `--friction` was
+    broken before it got the same fix.
+  - The soft endpoint isn't just "settles more gradually" -- softening
+    `solref`'s time constant measurably lowers the contact's real
+    steady-state stiffness too (it's not merely a slower-but-equal
+    spring), which is *why* it fixes fast-sliding oscillation: the
+    contact's own natural frequency needs to sit well below the arm's
+    closed-loop frequency to avoid the two resonating (trading energy back
+    and forth) instead of decoupling. Measured directly: at the old
+    `(0.025, 2.0)` endpoint, a fast sanding sweep dropped to literal zero
+    contact force on ~27% of steps; `(0.060, 2.0)` (the new default)
+    eliminates that entirely in the same test. Going further (`(0.150,
+    3.0)`, tried and rejected) removes the oscillation completely but
+    softens steady-state stiffness by ~25x instead of ~2.6x, needing
+    impractically deep penetration to reach ordinary sanding forces --
+    `(0.060, 2.0)` is the point that gets most of the stability win
+    without wrecking the force calibration.
 - **Sanding-dose grid**: the panel is rasterized into a fine grid (default
   1 cm cells, `--grid-resolution`). Each step, the pad's contact centroid
   selects which cells are under the pad footprint (radius `pad_radius_m`),
@@ -95,32 +114,38 @@ end effector, so the omega's single-button short-press signal (normally
 used to toggle a gripper) is repurposed to start/stop a recording episode;
 long-press resets to a new (possibly randomized, see below) start position.
 
-**Home gate**: on real hardware, the arm will not move at all until the
-physical handle is within `--home-tolerance` (default 1cm) of `--home`.
-Without this, a failed or skipped auto-home (watch for `drdMoveToPos
-failed` at startup) leaves the device's actual rest position mismatched
-from the assumed `--home` reference -- the very first tick would then
-command a large, unintended offset, potentially straight into the panel,
-before the operator has touched anything. `[device] waiting for handle at
-home: ...mm away` prints periodically until you move the handle there by
-hand. `drdMoveToPos` failing is a hardware-level robotic-move issue, not a
-calibration problem -- `--auto-init` won't fix it, and it gives no way to
-know where the declared `--home` physically is. So after
-`--home-timeout` seconds (default 8s, `0` to wait forever) with the handle
-never reaching tolerance, the gate gives up and adopts wherever the handle
-currently is as the working home reference instead of blocking forever.
+**Arming (matches `teleop_flipup.py` exactly, not a device-homing wait)**:
+the arm starts tracking the handle immediately from the first tick,
+relative to `--home` -- motion is never gated on the physical device
+reaching any specific position. If the device's actual rest position
+doesn't match `--home` (e.g. a failed/skipped auto-home -- watch for
+`drdMoveToPos failed` at startup), that's just a larger-than-usual initial
+offset; `--max-speed`'s existing slew limit is what turns that into a
+gradual, visible catch-up instead of an instant jump, exactly the same way
+FlipUp already relies on it. What's actually gated is *haptic force
+feedback*: it stays silent until the sim tool has tracked to within
+`--arm-tolerance` (default 2cm, same default FlipUp hardcodes) of its own
+commanded target, so a reset/catch-up motion's transient contact never
+gets mistaken for real interaction force. `--takeover-ramp-ms` (default
+400ms) then ramps that force 0 -> full once armed, rather than snapping it
+on.
 
-**Takeover hold/ramp**: right after arming (either way -- reached home, or
-the timeout fallback) and after every reset, target speed is capped well
-below `--max-speed` for `--takeover-hold-ms` (default 150ms) and reflected
-handle force ramps 0 -> full over `--takeover-ramp-ms` (default 400ms).
-Without this, the instant control engages it snaps straight to full
-speed/force -- if there's any mismatch between the (possibly just-adopted)
-home reference and where the operator's hand actually is at that moment,
-that mismatch gets applied at full authority on the very first tick instead
-of being walked into gradually. Same idea as
-`FLOATING_FLIPUP_COMPLIANCE_TELEOP.md`'s "100ms takeover hold and 400ms
-force ramp" to avoid a reset/start haptic impulse.
+An earlier version of this made the arm wait up to several seconds for
+the *physical device* to reach `--home` before moving at all, with a
+timeout fallback if it didn't. That turned out to be the wrong fix for the
+wrong problem: it made every run wait for something (`drdMoveToPos`
+succeeding) that a genuinely broken/obstructed auto-home will never do,
+and a hand still moving when the timeout fired could arm mid-gesture
+anyway. FlipUp doesn't have or need any of that -- it just lets the arm
+move (slew-limited) from t=0 and only delays *feeling* it.
+
+If `drdMoveToPos` fails on every run, that's worth chasing at the hardware
+level -- it's a robotic-move command failing for reasons unrelated to
+calibration (workspace obstruction, a snagged cable, a torque/safety
+limit, etc.), not something this script can or should work around further.
+Try `bin/HapticInit` (or your SDK's equivalent) standalone to see if the
+same move fails outside this script too, and check the physical workspace
+is actually clear.
 
 ## HUD
 

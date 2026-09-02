@@ -107,8 +107,15 @@ def build_arg_parser():
     parser.add_argument("--dose-max", type=float, default=DEFAULT_SANDING_PROPERTIES.dose_max,
                         help="dose accumulator clip ceiling")
     parser.add_argument("--pad-softness", type=float, default=DEFAULT_SANDING_PROPERTIES.pad_softness,
-                        help="[0,1] sander pad contact compliance, see "
+                        help="[0,1] sander pad contact compliance -- higher = softer/more "
+                             "gradual contact onset, 1.0 is the softest available. See "
                              "SandingEnv._configure_pad_contact")
+    parser.add_argument("--friction", type=float, nargs=3, default=DEFAULT_SANDING_PROPERTIES.friction,
+                        metavar=("SLIDING", "TORSIONAL", "ROLLING"),
+                        help="pad-vs-panel Coulomb friction. Lower sliding friction = less "
+                             "resistance/drag as the pad moves across the panel. Written onto "
+                             "the panel geom, not the pad -- MuJoCo resolves contact friction "
+                             "from whichever geom has higher `priority`, and the panel wins")
     parser.add_argument("--grid-resolution", type=float, default=DEFAULT_SANDING_PROPERTIES.grid_resolution_m,
                         help="dose-accumulation grid cell size (m)")
     parser.add_argument("--vis-cell", type=float, default=DEFAULT_SANDING_PROPERTIES.vis_cell_m,
@@ -117,9 +124,18 @@ def build_arg_parser():
                         help="fraction of TARGET REGION area (not the whole panel) that "
                              "must be in the just-right dose band for success")
     parser.add_argument("--num-regions", type=int, default=DEFAULT_SANDING_PROPERTIES.num_regions,
-                        help="how many discrete square regions need sanding, in [5, 10] "
-                             "-- highlighted amber until touched; the rest of the panel "
-                             "doesn't count toward coverage/success")
+                        help="pin an exact number of discrete square regions -- "
+                             "highlighted amber until touched; the rest of the panel "
+                             "doesn't count toward coverage/success. Leave unset "
+                             "(default) to randomize the count every episode within "
+                             "[--num-regions-min, --num-regions-max]; the line's "
+                             "start position along the panel randomizes either way")
+    parser.add_argument("--num-regions-min", type=int, default=DEFAULT_SANDING_PROPERTIES.num_regions_min,
+                        help="randomized region-count lower bound, used unless "
+                             "--num-regions pins an exact count")
+    parser.add_argument("--num-regions-max", type=int, default=DEFAULT_SANDING_PROPERTIES.num_regions_max,
+                        help="randomized region-count upper bound, used unless "
+                             "--num-regions pins an exact count")
     parser.add_argument("--region-radius", type=float, default=DEFAULT_SANDING_PROPERTIES.region_radius_m,
                         help="radius (m) of each target region")
     parser.add_argument("--seed", type=int, default=0,
@@ -144,8 +160,11 @@ def build_arg_parser():
                              "derived as stiffness/(tool_kp*scale) unless --force-gain is given")
     parser.add_argument("--force-gain", type=float, default=None,
                         help="N of handle force per N of simulated contact force")
-    parser.add_argument("--force-clip", type=float, default=60.0,
-                        help="ceiling on the reflected sim force (N) before force-gain")
+    parser.add_argument("--force-clip", type=float, default=90.0,
+                        help="ceiling on the reflected sim force (N) before force-gain. "
+                             "Kept at 2x --sand-break-force so the operator still feels "
+                             "the full ramp-up as force approaches breaking, not a "
+                             "clipped/truncated version of it")
     parser.add_argument("--max-force", type=float, default=10.0,
                         help="clamp on the handle force vector magnitude (N)")
     parser.add_argument("--force-tau", type=float, default=2.0,
@@ -168,27 +187,18 @@ def build_arg_parser():
                         help="which device axis (optionally negated) drives sim x, y, z")
     parser.add_argument("--auto-init", action="store_true",
                         help="auto-calibrate the omega on open (it will move)")
-    parser.add_argument("--home-tolerance", type=float, default=0.01,
-                        help="the arm will not move at all until the physical handle is "
-                             "within this many metres of --home. Protects against a "
-                             "failed/skipped auto-home commanding a large unintended "
-                             "offset the instant the script starts, before the operator "
-                             "has touched the handle")
-    parser.add_argument("--home-timeout", type=float, default=8.0,
-                        help="seconds to wait for the handle to reach --home before giving "
-                             "up and adopting wherever it currently is as home instead. "
-                             "0 = wait forever. Needed because the device's automatic "
-                             "move-to-home (drdMoveToPos) can fail for hardware reasons "
-                             "unrelated to calibration, leaving no way to know where the "
-                             "declared --home physically is")
-    parser.add_argument("--takeover-hold-ms", type=float, default=150.0,
-                        help="milliseconds right after arming (handle reaches home, or "
-                             "--home-timeout fires) during which target speed is capped "
-                             "much lower than --max-speed, easing into tracking instead "
-                             "of snapping to full speed the instant control engages")
+    parser.add_argument("--arm-tolerance", type=float, default=0.02,
+                        help="handle FORCE FEEDBACK stays silent (zero) until the sim "
+                             "tool has tracked to within this many metres of the "
+                             "commanded target -- same idea and default as "
+                             "teleop_flipup.py's hardcoded 0.02 armed-check. Motion is "
+                             "NOT gated on this (the --max-speed slew limiter already "
+                             "prevents an instant jump; a device home mismatch just "
+                             "becomes a gradual, visible catch-up instead of a snap)")
     parser.add_argument("--takeover-ramp-ms", type=float, default=400.0,
-                        help="milliseconds right after arming during which reflected "
-                             "handle force ramps 0 -> full instead of snapping on")
+                        help="milliseconds right after arming (see --arm-tolerance) "
+                             "during which reflected handle force ramps 0 -> full "
+                             "instead of snapping on")
 
     # ---- reset position -----------------------------------------------------------
     parser.add_argument(
@@ -224,7 +234,7 @@ def build_arg_parser():
                         help="hide the wrist-camera picture-in-picture inset")
     parser.add_argument("--wrist-cam-width", type=int, default=160)
     parser.add_argument("--wrist-cam-height", type=int, default=120)
-    parser.add_argument("--viewer-scale", type=float, default=1.0,
+    parser.add_argument("--viewer-scale", type=float, default=1.5,
                         help="resize factor for the displayed cv2 window (rendering "
                              "itself always happens at --render-width/height)")
     parser.add_argument("--plot-span", type=float, default=6.0,
@@ -272,10 +282,12 @@ def _scripted_dry_run_target(t_s, home_xy, contact_z, radius=0.05):
     which the pad JUST touches the panel (0 penetration)."""
     x = home_xy[0] + radius * np.sin(0.3 * t_s)
     y = home_xy[1] + radius * np.sin(0.11 * t_s)
-    # Cycles from 3mm clear of the panel down to ~1mm of penetration
-    # (~16N at the default tool_kp=16000), covering both free-space and
-    # in-contact behavior in one scripted run.
-    z = contact_z + 0.003 - 0.004 * (0.5 + 0.5 * np.sin(0.7 * t_s))
+    # Cycles from 3mm clear of the panel down to ~4mm of penetration
+    # (~25N at the default pad_softness=1.0's much-softened contact
+    # stiffness -- NOT tool_kp*penetration, that assumes rigid contact;
+    # see SOFT_PAD_SOLREF's comment), covering both free-space and
+    # in-contact behavior across the actual force band in one scripted run.
+    z = contact_z + 0.003 - 0.007 * (0.5 + 0.5 * np.sin(0.7 * t_s))
     return np.array([x, y, z])
 
 
@@ -316,10 +328,13 @@ def main():
         dose_high=args.dose_high,
         dose_max=args.dose_max,
         pad_softness=args.pad_softness,
+        friction=tuple(args.friction),
         grid_resolution_m=args.grid_resolution,
         vis_cell_m=args.vis_cell,
         success_threshold=args.success_threshold,
         num_regions=args.num_regions,
+        num_regions_min=args.num_regions_min,
+        num_regions_max=args.num_regions_max,
         region_radius_m=args.region_radius,
     )
     env = SandingTeleop(
@@ -488,7 +503,7 @@ def main():
         cov = env.coverage_fraction("just_right")
         done = env.success()
         state_text = (
-            f"sanded {100.0 * cov:5.1f}% of {properties.num_regions} regions  "
+            f"sanded {100.0 * cov:5.1f}% of {env.num_regions} regions  "
             f"(need >= {100.0 * properties.success_threshold:.0f}%)"
         )
         cv2.putText(frame, state_text, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
@@ -539,11 +554,13 @@ def main():
             home_pos=np.array(args.home, dtype=float),
         ).open()
         print(
-            f"[device] move the handle to {tuple(args.home)} (device m) before it will "
-            f"start moving the arm -- tolerance +/-{args.home_tolerance * 1000.0:.0f}mm. "
-            f"If you saw 'drdMoveToPos failed', the device did NOT auto-center: move it "
-            f"there by hand, or just wait {args.home_timeout:.0f}s and the current handle "
-            f"position will be adopted as home automatically (--home-timeout 0 to disable)."
+            f"[device] the arm starts tracking the handle immediately, relative to "
+            f"--home {tuple(args.home)} (device m). If you saw 'drdMoveToPos failed', "
+            f"the device did NOT auto-center there -- the arm will still move right "
+            f"away, just from a possibly-offset starting point; --max-speed limits how "
+            f"fast it can close that gap, so it'll be a gradual catch-up, not a jump. "
+            f"Haptic force feedback stays silent until the tool has actually caught up "
+            f"(--arm-tolerance)."
         )
 
     # 2cm clear of first touch, centered on the panel (not hardcoded -- this
@@ -576,19 +593,18 @@ def main():
     max_step = args.max_speed * dt if args.max_speed > 0.0 else float("inf")
 
     def do_reset(advance_episode=False):
-        nonlocal target, reset_target, armed_at
+        nonlocal target, reset_target, device_armed
         with render_model_lock:
             env.reset()
         if advance_episode:
             episode_attempt[0] += 1
         reset_target = sample_reset_target(episode_attempt[0])
         target = env.tool_pos.copy()
-        # A new episode's reset_target may differ from the last one (random
-        # start position), and the operator's hand won't be tracking it yet
-        # -- ease back in with the same takeover hold/ramp used on initial
-        # arming, rather than snapping to full speed/force immediately.
-        if device_armed:
-            armed_at = time.monotonic()
+        # Same as teleop_flipup.py's do_reset: force feedback goes silent
+        # again until the tool re-converges. dry-run has no physical device
+        # to protect, so it stays armed (matches the initial-arming default
+        # above) -- immediately true again anyway since target==tool_pos.
+        device_armed = bool(args.dry_run)
 
     def start_episode():
         if collection["state"] != "idle":
@@ -722,21 +738,22 @@ def main():
 
     t_start = time.monotonic()
     last_print = t_start
-    last_home_warning = 0.0
     step_index = 0
     last_short_press_count = 0
-    # The arm stays frozen at its current target until the physical handle
-    # is actually near --home. Without this, a failed/skipped auto-home (or
-    # simply not having picked up the handle yet) means device_xyz starts
-    # arbitrarily far from the assumed home reference, and the very first
-    # tick would command a large, unintended offset -- potentially straight
-    # into the panel -- before the operator has touched anything.
+    # Matches teleop_flipup.py's own "armed" pattern exactly: motion is
+    # NEVER gated on this (the --max-speed slew limiter is what prevents an
+    # instant jump if the device's actual rest position doesn't match
+    # --home -- e.g. after a failed auto-home -- turning that mismatch into
+    # a gradual, visible catch-up instead of a snap). Only haptic force
+    # reflection stays silent until the SIM tool has tracked to within
+    # --arm-tolerance of wherever it's currently being commanded. This is
+    # deliberately NOT a wait for the physical device to reach any specific
+    # position -- an earlier version of this gate did that and took 8+
+    # seconds every run for hardware that never successfully auto-homes;
+    # this should arm in a similar ballpark to FlipUp's, normally well
+    # under a second.
     device_armed = bool(args.dry_run)
-    home_wait_start = None  # set on the first tick the handle isn't at home
-    home_xyz = np.array(args.home, dtype=float)  # may fall back to current pos, see below
-    # Takeover moment: dry-run has no physical mismatch risk, so it's "armed"
-    # from t=0 already (device_armed above) and gets full authority
-    # immediately -- the None here just means "no ramp/hold in effect".
+    home_xyz = np.array(args.home, dtype=float)
     armed_at = None if not args.dry_run else t_start
 
     if recorder is not None and args.dry_run:
@@ -796,48 +813,13 @@ def main():
                 state = device.get_state()
                 device_state = state
                 device_xyz = state["pos"][:3]
-                home_distance = np.linalg.norm(device_xyz - home_xyz)
-                if not device_armed:
-                    if home_wait_start is None:
-                        home_wait_start = now
-                    timed_out = (
-                        args.home_timeout > 0.0 and now - home_wait_start > args.home_timeout
-                    )
-                    if np.isfinite(home_distance) and home_distance <= args.home_tolerance:
-                        device_armed = True
-                        armed_at = now
-                        print("\n[device] handle at home -- teleop engaged")
-                    elif timed_out:
-                        # The declared --home was never reached (e.g. the
-                        # device's own auto-move there failed for hardware
-                        # reasons, per the drdMoveToPos warning). Rather than
-                        # wait forever with no way to know where --home
-                        # physically is, adopt wherever the handle actually
-                        # is right now as the working home reference.
-                        home_xyz = device_xyz.copy()
-                        device_armed = True
-                        armed_at = now
-                        print(
-                            f"\n[device] gave up waiting for handle at {tuple(args.home)} "
-                            f"after {args.home_timeout:.0f}s; using current handle position "
-                            f"{np.round(home_xyz, 3).tolist()} as home instead -- teleop engaged"
-                        )
-                    else:
-                        if now - last_home_warning > 1.0:
-                            print(
-                                f"\n[device] waiting for handle at home: "
-                                f"{home_distance * 1000.0:.0f}mm away "
-                                f"(need <= {args.home_tolerance * 1000.0:.0f}mm), "
-                                f"giving up in {max(0.0, args.home_timeout - (now - home_wait_start)):.0f}s "
-                                "-- arm will not move until then",
-                                end="",
-                            )
-                            last_home_warning = now
-                desired = (
-                    reset_target + pos_map @ (scale * (device_xyz - home_xyz))
-                    if device_armed
-                    else target.copy()
-                )
+                # Always computed directly from the device -- NOT frozen
+                # while unarmed. If the device's actual rest position
+                # doesn't match --home (e.g. a failed auto-home), this is
+                # just a larger-than-usual initial offset; --max-speed below
+                # already slew-limits how fast target can approach it, so
+                # it becomes a gradual, visible catch-up, not an instant jump.
+                desired = reset_target + pos_map @ (scale * (device_xyz - home_xyz))
                 if state["long_press_count"] > 0:
                     if collection["state"] == "recording":
                         stop_episode("operator_reset")
@@ -852,33 +834,37 @@ def main():
                     elif collection["state"] == "recording":
                         stop_episode("operator_stop")
 
-            # Ease in right after arming/reset instead of snapping to full
-            # speed/force immediately: caps target speed much lower for
-            # --takeover-hold-ms, and ramps reflected handle force 0->full
-            # over --takeover-ramp-ms. Protects against exactly what broke
-            # the panel on arming previously -- any mismatch between the
-            # (possibly just-adopted) home reference and the operator's
-            # actual hand position gets walked into gradually, not applied
-            # at full authority on the very first tick.
-            since_armed_ms = (now - armed_at) * 1000.0 if armed_at is not None else float("inf")
-            effective_max_step = (
-                min(max_step, max_step * 0.1) if since_armed_ms < args.takeover_hold_ms else max_step
-            )
-            force_ramp = (
-                np.clip(since_armed_ms / max(args.takeover_ramp_ms, 1e-9), 0.0, 1.0)
-                if args.takeover_ramp_ms > 0.0
-                else 1.0
-            )
-
             delta = desired - target
             step_norm = np.linalg.norm(delta)
-            if step_norm > effective_max_step:
-                delta *= effective_max_step / step_norm
+            if step_norm > max_step:
+                delta *= max_step / step_norm
             target = target + delta
 
             with render_model_lock:
                 env.step(target)
             step_index += 1
+
+            # Matches teleop_flipup.py's "armed" check exactly: the sim tool
+            # tracking to within --arm-tolerance of its own commanded target
+            # (not any physical-device-position requirement) is what allows
+            # force feedback to turn on. Reset convergence isn't interaction
+            # force -- while catching up to a fresh/mismatched target,
+            # reflect silence instead of whatever transient contact force
+            # that catch-up motion happens to produce.
+            if not device_armed:
+                if np.linalg.norm(env.tool_pos - target) < args.arm_tolerance:
+                    device_armed = True
+                    armed_at = now
+                    print("\n[device] tool reached target -- haptic feedback engaged")
+
+            force_ramp = 0.0
+            if device_armed:
+                since_armed_ms = (now - armed_at) * 1000.0
+                force_ramp = (
+                    np.clip(since_armed_ms / max(args.takeover_ramp_ms, 1e-9), 0.0, 1.0)
+                    if args.takeover_ramp_ms > 0.0
+                    else 1.0
+                )
 
             force, _ = env.pad_contact_force()
             reflected = force_ramp * np.clip(

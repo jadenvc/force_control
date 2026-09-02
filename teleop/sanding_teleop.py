@@ -50,15 +50,40 @@ DEFAULT_TOOL_ROT_KP = 3000.0
 DEFAULT_TOOL_ROT_KD = 90.0
 DEFAULT_JOINT_KD = np.array([64.0, 64.0, 64.0, 16.0, 16.0, 16.0])
 DEFAULT_ARM_DAMPING = 2.5
-DEFAULT_HAPTIC_STIFFNESS = 1500.0
+DEFAULT_HAPTIC_STIFFNESS = 3000.0
 
 # Ported from floating_flipup_teleop.py's SOFT_TIP_SOLREF/SOFT_TIP_SOLIMP_WIDTH,
-# slightly softer since a sanding pad should feel more compliant by default
-# than FlipUp's rigid-by-default fingertip pad.
+# then re-derived from scratch: the soft endpoint used to be (0.025, 2.0),
+# but empirically that's nowhere near soft enough. The contact's own natural
+# frequency (~1/(time_constant*damping_ratio), in Hz once divided by 2*pi)
+# needs to sit well BELOW the arm's closed-loop frequency
+# (~sqrt(tool_kp/apparent_mass)/2pi, a few Hz at the tool_kp values this task
+# uses) for the two to decouple instead of resonating -- a fast/stiff
+# contact competes with the arm's own control loop on a similar timescale
+# and the two trade energy back and forth.
+#
+# Measured directly: softening solref's time_constant/damping_ratio all
+# the way to (0.150, 3.0) (contact frequency ~0.35 Hz) eliminated contact
+# dropouts entirely during a fast sanding sweep that dropped to literal
+# zero force over 1000+ of 3500 steps at the old (0.025, 2.0) endpoint --
+# BUT increasing solref's time constant doesn't just slow the transient,
+# it measurably softens the STEADY-STATE stiffness too (MuJoCo's soft
+# constraint settles at a real, reduced restoring force, not just a
+# delayed-but-equal one): at (0.150, 3.0) the same commanded penetration
+# that used to produce ~18N settled at ~0.7N, a ~25x drop, needing
+# impractically deep (multi-cm) penetration to reach the force band this
+# task actually operates in. (0.060, 2.0) (contact frequency ~1.3 Hz) is
+# the compromise: still an 86% dropout reduction (1271 -> 180 of 3499
+# sweep-test steps) with only a ~2.6x stiffness drop, not 25x -- a real,
+# survivable recalibration rather than an impractical one. Widening
+# solimp's width too (tried 0.010) is a different knob entirely (how much
+# penetration before full stiffness ramps in, a static compliance profile,
+# not the resonant-frequency issue above) and made things worse; left near
+# the compiled default instead.
 COMPILED_PAD_SOLREF = (0.010, 1.0)
 COMPILED_PAD_SOLIMP_WIDTH = 0.003
-SOFT_PAD_SOLREF = (0.025, 2.0)
-SOFT_PAD_SOLIMP_WIDTH = 0.006
+SOFT_PAD_SOLREF = (0.060, 2.0)
+SOFT_PAD_SOLIMP_WIDTH = 0.004
 
 PANEL_TRANSFORM = np.eye(4, dtype=np.float64)
 PANEL_TRANSFORM[:3, 3] = (0.30, 0.0, 0.25)
@@ -107,11 +132,15 @@ class SandingProperties:
     # results for "10N for 1s" and "5N for 10s" -- i.e. it really is a
     # force/time trade-off, not just a force threshold: less force still
     # sands the same amount, it just needs proportionally longer dwell.
-    # Solving (10 - Fmin)*1 = (5 - Fmin)*10 gives Fmin = 40/9 ~= 4.44.
-    force_min_n: float = 4.44  # below this, no material removal at all
-    force_target_n: float = 12.0  # the desired/nominal sanding force
-    force_cap_n: float = 20.0  # dose-rate saturates at/above this
-    force_break_n: float = 30.0  # sustained force above this breaks the panel
+    # Solving (10 - Fmin)*1 = (5 - Fmin)*10 gives Fmin = 40/9 ~= 4.44; every
+    # force constant below is that base calibration scaled uniformly by 1.5x
+    # (dose_target_time_s stays fixed), so the same *time* now needs 50% more
+    # force throughout -- e.g. 15N for ~1s or 7.5N for ~10s reach dose 1.0,
+    # and the break ceiling is 50% higher too (30 -> 45N).
+    force_min_n: float = 6.66  # below this, no material removal at all
+    force_target_n: float = 18.0  # the desired/nominal sanding force
+    force_cap_n: float = 30.0  # dose-rate saturates at/above this
+    force_break_n: float = 45.0  # sustained force above this breaks the panel
     break_debounce_steps: int = 3
     # Break-detection reads a short low-pass of the contact force, not the raw
     # per-step value -- MuJoCo's solver produces genuine few-ms impact spikes
@@ -127,27 +156,60 @@ class SandingProperties:
     # above: 0.735s here makes 10N reach dose 1.0 in ~1s and 5N in ~10s,
     # both via the same underlying rate law -- see force_min_n's comment.
     dose_target_time_s: float = 0.735
-    dose_low: float = 0.7  # below this: under-sanded
-    dose_high: float = 1.3  # above this: over-sanded
+    # Widened from the original 0.7/1.3 (+-30% around dose=1.0) -- that band
+    # was too tight to reliably land in given normal dwell-time/force
+    # variation while hand-teleoperating; +-50% gives real margin either
+    # side of the ideal dose without changing the underlying force/time
+    # trade-off law (dose_target_time_s, force_min_n) at all.
+    dose_low: float = 0.5  # below this: under-sanded
+    dose_high: float = 1.5  # above this: over-sanded
     dose_max: float = 2.0  # accumulator clip ceiling
 
-    grid_resolution_m: float = 0.01  # dose-accumulation grid cell size
-    vis_cell_m: float = 0.02  # visual gradient grid cell size (coarser, ok)
+    # Halved from the original 0.01/0.02 -- region_radius_m shrank (below) to
+    # let up to num_regions_max=15 squares fit in a less-than-full-length
+    # line on a 0.34m panel, so the grids need matching resolution or a 2cm
+    # square would only cover ~2x2 dose cells / be blocky in the render.
+    grid_resolution_m: float = 0.005  # dose-accumulation grid cell size
+    vis_cell_m: float = 0.01  # visual gradient grid cell size (coarser, ok)
 
-    pad_softness: float = 0.6  # [0, 1], see _configure_pad_contact
+    # Defaults to the softest available (1.0, not the old inert 0.6): every
+    # softer test point measured strictly improved contact stability with
+    # no reversal across the tested range, up to zero contact dropouts
+    # during a fast sweep at this endpoint. See _configure_pad_contact and
+    # SOFT_PAD_SOLREF's comment for the frequency-separation reasoning.
+    pad_softness: float = 1.0  # [0, 1]
+    # (sliding, torsional, rolling). MuJoCo resolves a contact's friction
+    # from whichever geom has the HIGHER `priority` (panel_surface's
+    # priority=10 beats the pad's priority=8), so this is the value that
+    # actually governs pad-vs-panel sliding -- the pad's own compiled
+    # friction is inert for this contact. See _configure_pad_contact.
+    friction: tuple = (0.6, 0.01, 0.0002)
     success_threshold: float = 0.90  # fraction of area in the just-right band
 
     # A handful of discrete SQUARE target regions, not the whole panel --
     # coverage_fraction/success only look at cells within these; the rest of
     # the panel can still physically be sanded (dose still accumulates there
-    # too) but doesn't count. Centers are spaced along the panel's long axis
-    # (see _sample_target_regions); the actual rendered/counted square size
-    # is clamped by _region_half_size to guarantee a visible gap between
-    # adjacent squares, so region_radius_m here is a maximum, not a
-    # guarantee -- with 7-10 regions on a typical panel it usually ends up
-    # smaller than this.
-    num_regions: int = 7  # [5, 10]
-    region_radius_m: float = 0.025  # square half-side-length, see above
+    # too) but doesn't count. Centers form a contiguous line along the
+    # panel's long axis (see _sample_target_regions) at a FIXED pitch (see
+    # _region_pitch_m) -- unlike the old version, the square size/spacing no
+    # longer changes with region count, so a shorter line is just a shorter
+    # line, not bigger squares. Both the count and the line's start position
+    # are randomized fresh every reset() (num_regions=None is "randomize
+    # within [num_regions_min, num_regions_max]"; set num_regions to pin an
+    # exact count, e.g. for a reproducible eval episode -- position still
+    # randomizes even then).
+    num_regions: "int | None" = None  # None = randomize per episode
+    # Lowered from the original 8/15 -- even the shorter end of that range
+    # (8 squares, ~0.13m) read as too long a wipe. 5/9 keeps lines to
+    # roughly 0.07-0.14m (~20-40% of the 0.34m panel length).
+    num_regions_min: int = 5
+    num_regions_max: int = 9
+    # At the original region_radius_m=0.025, num_regions_max squares at
+    # _region_pitch_m's 1.8x spacing would need far more line length than
+    # the 0.34m panel allows (e.g. 15 squares needed 0.63m). 0.010 keeps
+    # even the top of the num_regions range well short of the panel length,
+    # with real slack left over for a randomized start position.
+    region_radius_m: float = 0.010  # square half-side-length, see above
 
     def __post_init__(self):
         if self.panel_length_m <= 0.0 or self.panel_width_m <= 0.0:
@@ -173,10 +235,17 @@ class SandingProperties:
             raise ValueError("pad_softness must be in [0, 1]")
         if not 0.0 < self.success_threshold <= 1.0:
             raise ValueError("success_threshold must be in (0, 1]")
-        if not 5 <= self.num_regions <= 10:
-            raise ValueError("num_regions must be in [5, 10]")
+        if self.num_regions is not None and not 5 <= self.num_regions <= 20:
+            raise ValueError("num_regions must be in [5, 20]")
+        if not 1 <= self.num_regions_min <= self.num_regions_max <= 20:
+            raise ValueError(
+                "num_regions_min/max must satisfy 1 <= min <= max <= 20"
+            )
         if self.region_radius_m <= 0.0:
             raise ValueError("region_radius_m must be positive")
+        if len(self.friction) != 3 or any(v < 0.0 for v in self.friction):
+            raise ValueError("friction must have exactly 3 non-negative values "
+                             "(sliding, torsional, rolling)")
 
 
 DEFAULT_SANDING_PROPERTIES = SandingProperties()
@@ -409,10 +478,21 @@ class SandingEnv(FlipUpEnv):
 
     def _configure_pad_contact(self):
         """Interpolate the sander pad's solref/solimp between the compiled
-        (rigid) values and a soft endpoint, by pad_softness in [0, 1].
+        (rigid) values and a soft endpoint, by pad_softness in [0, 1], and
+        set the friction that actually governs pad-vs-panel sliding.
 
         Ported directly from floating_flipup_teleop.py's
         _configure_tip_contact -- same interpolation, different geom.
+
+        MuJoCo picks a contact's friction/solref/solimp ENTIRELY from
+        whichever of the two geoms has the higher `priority` (compiled
+        priority=10 on panel_surface vs. 8 on the pad) -- it does not
+        combine them. Friction was already written onto panel_surface for
+        this reason; solref/solimp were NOT, which meant --pad-softness was
+        silently inert the whole time (the pad's own solref/solimp were
+        computed correctly but never actually used for this contact). Both
+        are now written onto panel_surface too, alongside the pad's own
+        values (kept for documentation/if priority is ever changed).
         """
         s = float(self.properties.pad_softness)
         time_constant = (
@@ -427,40 +507,67 @@ class SandingEnv(FlipUpEnv):
         )
         self.model.geom_solref[self.pad_geom_id] = (time_constant, damping_ratio)
         self.model.geom_solimp[self.pad_geom_id, 2] = width
+        self.model.geom_solref[self.panel_surface_geom_id] = (time_constant, damping_ratio)
+        self.model.geom_solimp[self.panel_surface_geom_id, 2] = width
+        self.model.geom_friction[self.panel_surface_geom_id] = self.properties.friction
 
     # ------------------------------------------------------------- dose grid
-    def _sample_target_regions(self):
-        """num_regions square region centers (panel-local xy), spaced out
-        along the panel's long axis (evenly spaced, with a small random
-        jitter so it doesn't look robotically exact), deterministic from
-        self._rng (seeded in __init__, so a given seed always gets the same
-        layout). Positioned along a line for a legible, deliberate layout,
-        but each square is a separate, gapped patch -- not one continuous
-        sanded stripe -- see _region_half_size for the gap-guaranteeing size."""
+    def _region_pitch_m(self):
+        """Fixed center-to-center spacing between adjacent target squares.
+
+        Decoupled from region count on purpose (unlike the old version,
+        where more regions meant smaller squares packed to fill the whole
+        panel): a fixed pitch means an 8-square line and a 15-square line
+        look the same up close, one is just longer. 1.8x region_radius_m
+        gives adjacent squares ~10% overlap (2*radius vs 1.8*pitch), which
+        is what keeps the line contiguous -- one connected strip, not a row
+        of separate dots.
+        """
+        return self.properties.region_radius_m * 1.8
+
+    def _sample_num_regions(self):
+        """How many squares are in this episode's line. None (the default)
+        means randomize within [num_regions_min, num_regions_max] using
+        self._rng, fresh every reset(); a pinned value always uses exactly
+        that many (still with a randomized start position, see
+        _sample_target_regions)."""
         p = self.properties
+        if p.num_regions is not None:
+            return int(p.num_regions)
+        return int(self._rng.integers(p.num_regions_min, p.num_regions_max + 1))
+
+    def _sample_target_regions(self):
+        """A contiguous line of self._num_regions square region centers
+        (panel-local xy) at a fixed pitch (_region_pitch_m), starting at a
+        random position along the panel's long axis -- NOT spanning the
+        whole panel edge-to-edge like the old always-evenly-spaced version.
+        Re-sampled (count AND position) fresh every reset() via self._rng,
+        so back-to-back episodes land in different spots. Zero perpendicular
+        jitter (constant y) keeps the line straight/contiguous."""
+        p = self.properties
+        self._num_regions = self._sample_num_regions()
+        pitch = self._region_pitch_m()
         half_x = p.panel_length_m / 2.0
         margin = p.region_radius_m * 1.2
-        xs = np.linspace(-half_x + margin, half_x - margin, p.num_regions)
-        spacing = (xs[1] - xs[0]) if p.num_regions > 1 else p.panel_length_m
-        jitter = min(p.region_radius_m * 0.4, spacing * 0.1)
-        offsets = self._rng.uniform(-jitter, jitter, size=(p.num_regions, 2))
-        centers = np.stack([xs, np.zeros_like(xs)], axis=1) + offsets
-        return centers
+        line_length_m = (self._num_regions - 1) * pitch
+        lo = -half_x + margin
+        hi = half_x - margin - line_length_m
+        if hi < lo:
+            # Line longer than the panel allows at this pitch/margin --
+            # center it instead of raising, matching the old code's graceful
+            # handling of the num_regions==1 edge case.
+            start_x = -line_length_m / 2.0
+        else:
+            start_x = float(self._rng.uniform(lo, hi))
+        xs = start_x + np.arange(self._num_regions) * pitch
+        return np.stack([xs, np.zeros_like(xs)], axis=1)
 
     def _region_half_size(self):
-        """Half-side-length of each square target region. Clamped to well
-        under half the spacing between adjacent region centers so squares
-        stay visibly separate, discrete patches -- --region-radius alone
-        (e.g. sized for a sparse layout) could otherwise make adjacent
-        squares touch or overlap into one continuous sanded strip once
-        packed along the line in _sample_target_regions."""
-        p = self.properties
-        if p.num_regions > 1:
-            half_x = p.panel_length_m / 2.0
-            margin = p.region_radius_m * 1.2
-            spacing = (2.0 * (half_x - margin)) / (p.num_regions - 1)
-            return min(p.region_radius_m, spacing * 0.35)
-        return p.region_radius_m
+        """Half-side-length of each square target region -- fixed at
+        region_radius_m now that pitch is decoupled from region count (see
+        _region_pitch_m); the ~10% overlap with neighbors comes from the
+        1.8x pitch multiplier, not from shrinking this."""
+        return self.properties.region_radius_m
 
     def _build_dose_grid(self):
         p = self.properties
@@ -568,7 +675,23 @@ class SandingEnv(FlipUpEnv):
     def step_task_space(self, target_pose):
         """Same Jacobian-transpose task-space controller as
         FlipUpEnv.step_task_space, minus the WSG50-specific gripper-actuator
-        line (this end effector has no finger actuator)."""
+        line (this end effector has no finger actuator).
+
+        An operational-space decoupling term (pre-multiplying the wrench by
+        the trace-normalized Cartesian inertia matrix Lambda(q) =
+        (J M(q)^-1 J^T)^-1, per Khatib) was tried here and empirically
+        REJECTED: it was dimensionally sound and theoretically motivated by
+        a real diagnosis (a fast lateral sweep repeatedly bounced the pad
+        off the panel, contact dropping to exactly 0 -- consistent with
+        Lambda(q)'s anisotropy leaking X-direction command into Z), but
+        measured head-to-head it made the bounce WORSE, not better (std
+        30N -> 69N at full decoupling; even a 10% blend only marginally
+        helped before returns went negative past that). Diagnosis was
+        dimensionally correct in general but is evidently not the dominant
+        contributor to this specific bounce -- reverted rather than ship a
+        measured regression. See the conversation this was tested in for
+        the actual numbers if revisiting.
+        """
         target_pose = np.asarray(target_pose, dtype=np.float64)
         if target_pose.shape != (7,):
             raise ValueError(f"target_pose must have shape (7,), got {target_pose.shape}")
@@ -704,7 +827,10 @@ class SandingEnv(FlipUpEnv):
         self.data.time = 0.0
         self.data.qpos[self.joint_qpos_ids] = self._HOME_JOINTS
         self.physics.forward()
-        self._dose[:] = 0.0
+        # Re-sample the target line's length and position fresh every
+        # episode (rebuilds _dose/_target_mask/_vis_is_target etc. from
+        # scratch, so this also handles the dose-zeroing below).
+        self._build_dose_grid()
         self._broken = False
         self._break_streak = 0
         self._break_force_filtered = 0.0
@@ -716,6 +842,14 @@ class SandingEnv(FlipUpEnv):
     @property
     def episode_max_force_n(self):
         return float(self._episode_max_force_n)
+
+    @property
+    def num_regions(self):
+        """This episode's actual sampled region count -- varies episode to
+        episode when properties.num_regions is None (randomized); use this,
+        not properties.num_regions, for anything episode-specific (HUD text,
+        recorded metadata)."""
+        return int(self._num_regions)
 
     def get_tool_pose(self):
         site_data = self.data.site(self.tool_site_id)
@@ -735,13 +869,19 @@ class SandingTeleop(SandingEnv):
     task_kind = "sanding"
     default_tool_kp = DEFAULT_TOOL_KP
     default_haptic_stiffness = DEFAULT_HAPTIC_STIFFNESS
-    # A side-on view: azimuth=90 puts the camera off to the side (along y)
-    # rather than above or in front, elevation is only a slight downward tilt
-    # (mostly horizontal) so the arm's whole profile and the panel are both
-    # visible side-by-side, not one occluding the other from overhead.
+    # A close, steep-overhead view of the panel, kept at the ORIGINAL
+    # azimuth=90 viewing direction -- azimuth=180 was tried and rejected: it
+    # cropped the arm out nicely, but it mirrors the view relative to
+    # whatever hand-axis mapping (--axes) was tuned against the original
+    # side-on framing, so the operator's left/right hand motion no longer
+    # matched left/right screen motion. azimuth is the one parameter that
+    # must stay fixed for the visual-to-control mapping to stay intuitive;
+    # elevation/distance are free to change. elevation=-75 (steep but not
+    # fully -90, so the pad still reads as 3D) and distance=0.55 crop out
+    # the shoulder while keeping the forearm partially visible -- some arm
+    # in frame is the accepted tradeoff for not breaking the control axes.
     default_cam_azimuth = 90.0
-    default_cam_elevation = -15.0
-    default_cam_distance = 0.75  # closer than the original 0.95 while still framing the
-    # whole arm base-to-pad and the panel together (0.65 starts clipping the base)
-    default_cam_lookat = (0.15, 0.0, 0.25)  # between the base and the panel
+    default_cam_elevation = -75.0
+    default_cam_distance = 0.55
+    default_cam_lookat = PANEL_TRANSFORM[:3, 3].tolist()  # panel center: (0.30, 0.0, 0.25)
     default_cam_name = None

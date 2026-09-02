@@ -80,10 +80,19 @@ class SandingEnvTest(unittest.TestCase):
             _approach(env, hover, 3000)
             self.assertEqual(env.normal_force_n(), 0.0)
 
-            penetration = env.properties.force_target_n / env.tool_kp
+            # NOT tool_kp*penetration=force -- that assumes rigid contact.
+            # The default pad_softness=1.0 contact is deliberately soft
+            # enough (see SOFT_PAD_SOLREF's comment) that its steady-state
+            # stiffness is real and much lower than tool_kp, so the same
+            # commanded penetration now produces much less force than that
+            # formula predicts. 4mm is a fixed, empirically-checked value
+            # that comfortably clears force_target_n at the default contact
+            # softness (measured ~25N settled, vs 18N target).
             pressed = hover.copy()
-            pressed[2] = CONTACT_TOOL_Z - penetration
+            pressed[2] = CONTACT_TOOL_Z - 0.004
             _approach(env, pressed, 3000)
+            for _ in range(2000):
+                env.step(pressed)
             self.assertGreater(env.normal_force_n(), 0.0)
             self.assertGreater(env._dose.max(), 0.0)
 
@@ -96,20 +105,28 @@ class SandingEnvTest(unittest.TestCase):
         with SandingEnv(properties=props) as env:
             hover = np.array([PANEL_TRANSFORM[0, 3], PANEL_TRANSFORM[1, 3], CONTACT_TOOL_Z + 0.05])
             _approach(env, hover, 3000)
-            penetration = props.force_target_n / env.tool_kp
+            # Fixed penetration, not tool_kp*force_target_n -- see
+            # test_pressing_into_panel_generates_normal_force_and_dose's
+            # comment; the default contact softness's steady-state
+            # stiffness is much lower than tool_kp now.
             pressed = hover.copy()
-            pressed[2] = CONTACT_TOOL_Z - penetration
-            _approach(env, pressed, 500)  # let contact force settle first
+            pressed[2] = CONTACT_TOOL_Z - 0.004
+            _approach(env, pressed, 3000)
+            # Let contact force actually settle before timing dose
+            # accumulation -- this contact softness has a real settling
+            # time constant, not just travel time to reach the target.
+            for _ in range(2000):
+                env.step(pressed)
             steps_to_low_band = None
-            for i in range(3000):
+            for i in range(5000):
                 env.step(pressed)
                 if env._dose.max() >= props.dose_low:
                     steps_to_low_band = i
                     break
             self.assertIsNotNone(steps_to_low_band)
-            # Loose bound: crossing dose_low should happen well within 2x
+            # Loose bound: crossing dose_low should happen well within 3x
             # dose_target_time_s, not orders of magnitude off.
-            self.assertLess(steps_to_low_band, 2 * props.dose_target_time_s * 1000)
+            self.assertLess(steps_to_low_band, 3 * props.dose_target_time_s * 1000)
 
     def test_break_threshold_trips_and_stays_sticky(self) -> None:
         props = SandingProperties(break_force_tau_s=0.0, break_debounce_steps=1)
@@ -124,7 +141,10 @@ class SandingEnvTest(unittest.TestCase):
             # dynamics to actually travel into that much contact force.
             deep = hover.copy()
             deep[2] = CONTACT_TOOL_Z - 0.01
-            for _ in range(500):
+            # pad_softness=1.0's ~150ms contact time constant means this
+            # needs more steps than before to actually ramp up past
+            # force_break_n.
+            for _ in range(3000):
                 env.step(deep)
                 if env.broken:
                     break

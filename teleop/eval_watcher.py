@@ -157,7 +157,23 @@ def _report_horizon_to_wandb(
             log_dict[f"{prefix}/peak_force_max_N"]  = max(peak_forces)
             log_dict[f"{prefix}/peak_force_mean_N"] = sum(peak_forces) / len(peak_forces)
 
-        run = wandb.init(id=run_id, resume="must", reinit=True)
+        # resume="allow", not "must": training writes wandb_run_id.txt locally
+        # before/independently of the run being registered server-side, so a
+        # perfectly valid-looking id can refer to a run wandb has never seen.
+        # "must" then refuses outright ("not a valid option for resuming the run
+        # (<id>) that has not been initialized") and every eval metric is
+        # silently dropped -- which is why eval/success_rate was absent from
+        # wandb for every sanding run despite the id files being present and
+        # readable. "allow" attaches if the run exists and creates it if not, so
+        # the metrics land either way.
+        #
+        # init_timeout is raised from the 90 s default because these nodes
+        # regularly exceed it and the resulting failure is also silent.
+        run = wandb.init(
+            id=run_id, resume="allow", reinit=True,
+            project=os.environ.get("WANDB_PROJECT", "pyrite-force-control"),
+            settings=wandb.Settings(init_timeout=300),
+        )
         # Log exec_horizon as a config field for table-view sortability
         run.config.update({
             f"eval_exec{exec_hz}_milestone": milestone,

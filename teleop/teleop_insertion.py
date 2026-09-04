@@ -106,6 +106,54 @@ def build_pos_map(spec):
     return m
 
 
+def map_wrist_orientation(
+    device_rotation,
+    device_home_rotation,
+    rotation_map,
+    tool_home_rotvec,
+    *,
+    frame="world",
+    scale=1.0,
+    deadzone=0.0,
+):
+    """Map an omega wrist frame to an absolute simulated-peg rotation.
+
+    Duplicated verbatim from teleop_flipup.py's function of the same name
+    (this script stays standalone, same convention as build_pos_map/
+    DEFAULT_AXES above) -- see that copy's docstring/comments for the
+    frame-composition-order rationale (world = pre-multiplied spatial
+    delta, tool = post-multiplied body delta). Returns
+    ``(tool_rotvec, wrist_delta_rotvec)``.
+    """
+    from scipy.spatial.transform import Rotation
+
+    R_dev = np.asarray(device_rotation, dtype=float).reshape(3, 3)
+    R_home = np.asarray(device_home_rotation, dtype=float).reshape(3, 3)
+    P = np.asarray(rotation_map, dtype=float).reshape(3, 3)
+    if frame == "world":
+        device_delta = R_dev @ R_home.T
+    elif frame == "tool":
+        device_delta = R_home.T @ R_dev
+    else:
+        raise ValueError(f"unknown rotation frame {frame!r}")
+    sim_delta = P @ device_delta @ P.T
+    delta_rotvec = Rotation.from_matrix(sim_delta).as_rotvec()
+    delta_angle = np.linalg.norm(delta_rotvec)
+    if delta_angle <= float(deadzone):
+        delta_rotvec = np.zeros(3)
+    else:
+        delta_rotvec = (
+            delta_rotvec
+            * ((delta_angle - float(deadzone)) / delta_angle)
+            * float(scale)
+        )
+
+    home = Rotation.from_rotvec(np.asarray(tool_home_rotvec, dtype=float))
+    delta = Rotation.from_rotvec(delta_rotvec)
+    command = delta * home if frame == "world" else home * delta
+    return command.as_rotvec(), delta_rotvec
+
+
 def build_arg_parser():
     parser = argparse.ArgumentParser(
         description="Haptic teleoperation for the peg-in-hole insertion task.",
@@ -168,6 +216,12 @@ def build_arg_parser():
                              "flipup_teleop.py's --noslip-iterations; try 10-25 if force readings "
                              "show high-frequency noise with contact_count staying >1 -- see "
                              "FLIPUP_LOW_STIFFNESS_CONTROLLER.md #6")
+    parser.add_argument("--peg-tilt-randomization-deg", type=float,
+                        default=DEFAULT_INSERTION_PROPERTIES.peg_tilt_randomization_deg,
+                        help="max magnitude (degrees) of a random per-episode roll/pitch tilt "
+                             "applied to the peg's nominal orientation on reset (see "
+                             "InsertionEnv.reset()). 0 (default) = always exactly "
+                             "straight-down, a true no-op. Independent of --enable-rotation")
     parser.add_argument("--seed", type=int, default=0)
 
     # ---- controller -----------------------------------------------------------
@@ -209,6 +263,27 @@ def build_arg_parser():
                         help="physical handle position (device m) mapped to the hole-hover target")
     parser.add_argument("--axes", type=str, default=DEFAULT_AXES,
                         help="which device axis (optionally negated) drives sim x, y, z")
+    parser.add_argument("--enable-rotation", action="store_true",
+                        help="6-DoF: the omega's wrist drives the peg's roll/pitch/yaw as well "
+                             "as xyz, on top of this episode's home_rotvec (which "
+                             "--peg-tilt-randomization-deg may have already tilted). Off by "
+                             "default -- the peg stays at home_rotvec, straight down unless "
+                             "tilted at reset. NOTE there is no torque feedback: the omega.6/.7 "
+                             "wrist is passive, so rotation is open-loop while translation is "
+                             "not. Requires a device with a wrist (raises at open otherwise)")
+    parser.add_argument("--rot-scale", type=float, default=1.0,
+                        help="wrist rotation amplification -- scales the ANGLE and keeps the "
+                             "axis, like --scale does for position")
+    parser.add_argument("--rot-axes", type=str, default=None,
+                        help="signed permutation for ROTATION only, same syntax as --axes; "
+                             "defaults to --axes")
+    parser.add_argument("--rot-frame", type=str, default="world", choices=["world", "tool"],
+                        help="world = turning the handle turns the peg about WORLD axes "
+                             "(spatial delta, pre-multiplied); tool = about the peg's own axes "
+                             "(body delta, post-multiplied)")
+    parser.add_argument("--rot-deadzone", type=float, default=0.0,
+                        help="radians of wrist rotation ignored before any peg rotation is "
+                             "commanded (radial soft deadzone, not a hard jump at the boundary)")
     parser.add_argument("--auto-init", action="store_true",
                         help="auto-calibrate the omega on open (it will move)")
     parser.add_argument("--arm-tolerance", type=float, default=0.02,
@@ -298,6 +373,7 @@ def main():
     if args.tool_kp <= 0.0:
         parser.error("--tool-kp must be positive")
     pos_map = build_pos_map(args.axes)
+    rot_map = build_pos_map(args.rot_axes) if args.rot_axes is not None else pos_map
 
     properties = InsertionProperties(
         insert_depth_target_m=args.insert_depth_target,
@@ -314,6 +390,7 @@ def main():
         ft_filter_type=args.ft_filter_type,
         ft_filter_alpha=args.ft_filter_alpha,
         noslip_iterations=args.noslip_iterations,
+        peg_tilt_randomization_deg=args.peg_tilt_randomization_deg,
     )
     env = InsertionTeleop(
         seed=args.seed,
@@ -509,7 +586,7 @@ def main():
 
         device = FDOmega(
             auto_init=args.auto_init,
-            read_orientation=False,
+            read_orientation=args.enable_rotation,
             spring_k=0.0,
             reflected_tau_s=args.force_tau / 1000.0,
             reflected_rate=args.force_rate,
@@ -552,6 +629,28 @@ def main():
     dt = 1.0 / float(args.control_freq)
     max_step = args.max_speed * dt if args.max_speed > 0.0 else float("inf")
 
+    # Wrist rotation home, captured lazily from the first device sample
+    # after each reset (mirrors teleop_flipup.py's rot_home) -- re-armed in
+    # do_reset() so the operator's CURRENT wrist orientation always maps to
+    # this episode's home_rotvec (which --peg-tilt-randomization-deg may
+    # have just changed), not whatever it happened to be a reset or two ago.
+    rot_home = [None]
+
+    def orientation_command(state):
+        R_dev = np.asarray(state["rot"], dtype=float).reshape(3, 3)
+        if rot_home[0] is None:
+            rot_home[0] = R_dev.copy()
+        command, _delta = map_wrist_orientation(
+            R_dev,
+            rot_home[0],
+            rot_map,
+            env.home_rotvec,
+            frame=args.rot_frame,
+            scale=args.rot_scale,
+            deadzone=args.rot_deadzone,
+        )
+        return command
+
     def do_reset(advance_episode=False):
         nonlocal target, reset_target, device_armed
         with render_model_lock:
@@ -560,6 +659,7 @@ def main():
             episode_attempt[0] += 1
         reset_target = sample_reset_target(episode_attempt[0])
         target = env.tool_pos.copy()
+        rot_home[0] = None
         device_armed = bool(args.dry_run)
 
     def start_episode():
@@ -760,6 +860,7 @@ def main():
                 break
 
             reflected = np.zeros(3)
+            target_rotvec = None
             if args.dry_run:
                 # demo_gen commands env.step itself (it needs its own
                 # feed-forward wrench, which plain xyz-target teleop below
@@ -793,8 +894,11 @@ def main():
                     delta *= max_step / step_norm
                 target = target + delta
 
+                if args.enable_rotation:
+                    target_rotvec = orientation_command(state)
+
                 with render_model_lock:
-                    env.step(target)
+                    env.step(target, target_rotvec=target_rotvec)
             step_index += 1
 
             if not device_armed:
@@ -845,7 +949,7 @@ def main():
                     env,
                     timestamp_ms=step_index * 1000.0 / args.control_freq,
                     target_pos=target,
-                    target_rotvec=None,
+                    target_rotvec=target_rotvec,
                     device_state=device_state,
                     sent_force=reflected,
                     image_rgb=shot["frame"],

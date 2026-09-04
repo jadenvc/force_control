@@ -407,6 +407,43 @@ under GLFW. `setdefault` leaves an already-exported `MUJOCO_GL` (e.g.
 `osmesa` on a box with no GPU at all) alone. This is a repo-wide latent
 issue, not fixed in `teleop_sanding.py`/`teleop_flipup.py` themselves.
 
+## Orientation control & tilt randomization
+
+Two independent knobs, both off by default (peg always exactly
+straight-down, byte-identical to the original behavior):
+
+- **`--enable-rotation`**: the omega's wrist (omega.6/.7 only -- raises at
+  device-open on an omega.3 with no wrist) drives the peg's roll/pitch/yaw
+  live, on top of whatever this episode's `home_rotvec` is. Open-loop (no
+  torque feedback; the wrist is passive), same convention and
+  `map_wrist_orientation` mapping as `teleop_flipup.py`'s
+  `--enable-rotation` (duplicated into `teleop_insertion.py` rather than
+  imported, same "stays standalone" convention as `build_pos_map`/
+  `DEFAULT_AXES`). `--rot-scale`, `--rot-frame` (`world`/`tool`),
+  `--rot-deadzone`, `--rot-axes` all mean what they do there.
+- **`--peg-tilt-randomization-deg DEG`**: on each `reset()`, samples an
+  independent roll and pitch (about the peg's own axes, each uniform in
+  `[-DEG, DEG]`) and composes it onto `NOMINAL_HOME_ROTVEC`
+  (peg-straight-down) to get that episode's `InsertionEnv.home_rotvec` --
+  the orientation `target_pose7`/the scripted demo/live rotation control
+  (as the base wrist-rotation-command is layered onto) all fall back to
+  when no explicit `target_rotvec` is given. `0` (default) makes the
+  sampled range collapse to a single point, so `home_rotvec` is always
+  exactly `NOMINAL_HOME_ROTVEC` -- a true no-op, not an approximation of
+  one (verified: `InsertionEnv(peg_tilt_randomization_deg=0.0)` after
+  `reset()` is bit-identical to the pre-existing hardcoded
+  straight-down rotation, and all 22 tests still pass with the default).
+  No yaw term: the peg is an axisymmetric capsule, so yaw alone doesn't
+  change the effective contact geometry.
+
+  **Caveat**: `insertion_scripted_demo.py`'s phase state machine was not
+  adapted for a tilted peg (its min-jerk descent + lateral spiral search
+  assume straight-down) -- a nonzero `--peg-tilt-randomization-deg` measurably
+  hurts *scripted*-demo success (a quick check at 8 degrees failed on
+  `insert_timeout` where the same seed succeeds at 0). This knob is aimed at
+  teleop data collection, where a human operator can see and correct for
+  the tilt; it isn't meant to make the scripted demo itself tilt-robust.
+
 ## Files
 
 - `insertion_teleop.py` -- the environment (`InsertionEnv`,

@@ -158,6 +158,15 @@ COMPILED_PEG_SOLIMP_WIDTH = 0.002
 SOFT_PEG_SOLREF = (0.020, 1.8)
 SOFT_PEG_SOLIMP_WIDTH = 0.004
 
+# The zero-tilt peg orientation (peg pointing straight down, pi rotation
+# about world x) -- same convention as sanding_teleop.py's target_pose7.
+# InsertionEnv.reset() perturbs this by up to peg_tilt_randomization_deg to
+# produce each episode's self.home_rotvec; target_pose7 falls back to
+# self.home_rotvec (not this constant directly) whenever no explicit
+# target_rotvec is given, so peg_tilt_randomization_deg=0 (default)
+# reproduces this exactly every episode.
+NOMINAL_HOME_ROTVEC = np.array([np.pi, 0.0, 0.0], dtype=np.float64)
+
 HOLE_TRANSFORM = np.eye(4, dtype=np.float64)
 # z chosen empirically so InsertionEnv._HOME_JOINTS (reused from sanding's
 # home config, since it happens to also produce a comfortable, non-singular
@@ -461,6 +470,18 @@ class InsertionProperties:
     peg_softness_max_solref: "tuple | None" = None
     peg_softness_max_solimp_width: "float | None" = None
 
+    # Max magnitude (degrees) of a random per-episode tilt applied to the
+    # peg's nominal ("home") orientation on reset -- see
+    # InsertionEnv.reset()'s "randomize home orientation" block. 0 (default)
+    # reproduces the original always-straight-down behavior exactly (the
+    # sampled tilt range collapses to a point at 0 degrees, so this is a
+    # true no-op, not an approximation of one). Independent of
+    # --enable-rotation's live wrist control: this randomizes the FIXED
+    # per-episode target the peg is driven toward when no rotation command
+    # is given (or is the baseline live rotation is layered on top of when
+    # it is), it does not add any per-step operator control by itself.
+    peg_tilt_randomization_deg: float = 0.0
+
     # MuJoCo's dedicated post-pass for refining the friction-force split
     # across several simultaneous near-redundant contacts -- ported from
     # FLIPUP_LOW_STIFFNESS_CONTROLLER.md #6: the peg touching 2+ socket
@@ -517,6 +538,8 @@ class InsertionProperties:
             raise ValueError("peg_softness_max_solref must have exactly 2 values (time_constant, damping_ratio)")
         if self.peg_softness_max_solimp_width is not None and not (0.0 < self.peg_softness_max_solimp_width < 1.0):
             raise ValueError("peg_softness_max_solimp_width must be in (0, 1)")
+        if self.peg_tilt_randomization_deg < 0.0:
+            raise ValueError("peg_tilt_randomization_deg cannot be negative")
 
 
 DEFAULT_INSERTION_PROPERTIES = InsertionProperties()
@@ -918,11 +941,13 @@ class InsertionEnv(FlipUpEnv):
     def target_pose7(self, target_pos, target_rotvec=None):
         """xyz + wxyz pose for a commanded peg position.
 
-        Orientation defaults to peg-pointing-straight-down (pi rotation
-        about world x), same convention as sanding_teleop.py's
-        target_pose7."""
+        Orientation defaults to this episode's ``home_rotvec`` (peg pointing
+        straight down, i.e. exactly ``NOMINAL_HOME_ROTVEC`` unless
+        ``peg_tilt_randomization_deg`` perturbed it at reset -- see
+        ``reset()``), same convention as sanding_teleop.py's target_pose7
+        had before orientation control existed here."""
         if target_rotvec is None:
-            rot = Rotation.from_euler("xyz", (np.pi, 0.0, 0.0)).as_matrix()
+            rot = Rotation.from_rotvec(self.home_rotvec).as_matrix()
         else:
             rot = Rotation.from_rotvec(np.asarray(target_rotvec, dtype=float)).as_matrix()
         return np.concatenate([np.asarray(target_pos, dtype=float), _wxyz_from_matrix(rot)])
@@ -983,6 +1008,26 @@ class InsertionEnv(FlipUpEnv):
         self._dynamic_filter.reset()
         self._ft_filter.reset()
         self._contact_force_filter.reset()
+
+        # Randomize this episode's nominal peg orientation by up to
+        # peg_tilt_randomization_deg (0 = always exactly NOMINAL_HOME_ROTVEC,
+        # a true no-op). Small roll/pitch about the peg's OWN axes (applied
+        # by post-multiplying, i.e. in the tool frame, not world), each
+        # independently uniform in [-max, max] degrees, composed onto the
+        # straight-down nominal -- not a uniform-on-a-cone sample, but simple
+        # and symmetric, and fine at the few-degrees scale this knob is meant
+        # for. No yaw term: the peg is axisymmetric (a capsule), so a yaw-only
+        # tilt would not change the effective geometry at all.
+        max_deg = float(self.properties.peg_tilt_randomization_deg)
+        if max_deg > 0.0:
+            roll, pitch = self._rng.uniform(-max_deg, max_deg, size=2)
+            tilt = Rotation.from_euler("xy", (roll, pitch), degrees=True)
+            self.home_rotvec = (
+                Rotation.from_rotvec(NOMINAL_HOME_ROTVEC) * tilt
+            ).as_rotvec()
+        else:
+            self.home_rotvec = NOMINAL_HOME_ROTVEC.copy()
+
         if self.viewer is not None:
             self.viewer.sync()
 

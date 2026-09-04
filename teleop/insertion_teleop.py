@@ -174,6 +174,17 @@ HOLE_TRANSFORM[:3, 3] = (0.30, 0.0, 0.21)
 # half-extents.
 SOCKET_DEPTH_M = 0.05
 SOCKET_LIP_HEIGHT_M = 0.015
+# Radius of insertion_peg.xml's peg_shaft_collision capsule -- must match
+# that file's geom size.
+PEG_RADIUS_M = 0.010
+# planner_tip_site height (world z) when the peg's rounded tip is just
+# touching the fixture's top surface with zero penetration -- the same
+# quantity sanding_teleop.py's CONTACT_TOOL_Z is for the sander pad, reused
+# by both teleop_insertion.py (for a safe hover offset) and
+# insertion_scripted_demo.py (as the APPROACH/CONTACT/SEARCH reference
+# height). See insertion_hole.xml's geometry comment for why this is
+# entrance + lip height + peg radius, not just entrance height.
+CONTACT_CONTROL_Z = HOLE_TRANSFORM[2, 3] + SOCKET_LIP_HEIGHT_M + PEG_RADIUS_M
 
 DEVICE_WORKSPACE_HALF_M = np.array([0.045, 0.040, 0.048])
 

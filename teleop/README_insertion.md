@@ -342,11 +342,28 @@ Same on-disk dataset shape and CLI conventions as flipup/sanding, via
 ```bash
 python teleop_insertion.py \
     --collect-dataset ~/data/insertion_v1.zarr \
-    --tool-kp 2500 --cartesian-damping-scale 1.0 \
+    --tool-kp 1200 --cartesian-damping-scale 1.0 \
+    --peg-softness 1.0 --peg-softness-max-solref 0.06 2.0 --peg-softness-max-solimp-width 0.006 \
     --noslip-iterations 15 \
     --max-speed 0.1 --force-tau 6 --force-rate 80 \
     --auto-finish
 ```
+
+**Note on `--tool-kp`/`--peg-softness-max-solref`**: the first version of
+this command shipped here used `--tool-kp 2500` and the shipped
+`peg_softness=1` ceiling `(0.020, 1.8)`. Real teleop with a human operator
+(rather than the scripted demo's clean, precisely-aimed single-axis
+approach) exposed a genuinely stiff/elastic "always pushes back" feel on
+contact with the fixture's flat top/frame -- pushing sideways into the
+frame is not a scenario the scripted-demo tuning ever exercised. Measured
+(synthetic sustained-push test, 3cm virtual penetration into the frame):
+105.6N mean at the compiled default, 76.2N at the old `peg_softness=1`
+ceiling, 43.7N at `--tool-kp 1200` + the widened `(0.06, 2.0)` ceiling.
+`--tool-kp` is the bigger lever of the two (it directly multiplies
+commanded position error into force); `--cartesian-damping-scale` has
+essentially no effect on this *sustained*-push number (it only damps
+transients, not steady-state error force) so raising it alone won't fix
+this symptom.
 
 - `--collect-dataset PATH.zarr` turns on recording; `S` (keyboard) or a
   short press of the handle button starts/stops an episode, `K`/`D` keep or

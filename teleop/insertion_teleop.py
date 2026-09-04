@@ -439,6 +439,28 @@ class InsertionProperties:
     peg_softness: float = 0.5  # [0, 1]
     friction: tuple = (0.3, 0.005, 0.0001)
 
+    # Override the endpoint peg_softness=1 interpolates toward (None keeps
+    # the module-level SOFT_PEG_SOLREF/SOFT_PEG_SOLIMP_WIDTH, tuned only
+    # against the scripted demo's slow/precisely-aimed descent). A human
+    # operator pushing sideways into the fixture's flat top/frame (rather
+    # than the scripted demo's clean single-axis approach) exposes solref's
+    # DC stiffness, not just its onset transient, at a scale the scripted
+    # demo never did. Measured mean sustained force pushing 3cm into the
+    # frame at tool_kp=2500: 105.6N at the compiled default (peg_softness=0,
+    # COMPILED_PEG_SOLREF), 76.2N at peg_softness=1.0's shipped ceiling
+    # (SOFT_PEG_SOLREF=(0.020, 1.8)). Raising the ceiling itself to
+    # (0.06, 2.0)/width 0.006 -- the same values
+    # SANDING_JITTER_FIX_SUMMARY.md and FLIPUP_LOW_STIFFNESS_CONTROLLER.md
+    # #1 converged on for this identical "fast/off-axis contact needs a
+    # longer time constant than a precisely-aimed touch does" problem --
+    # only gets to the same 76.2N in isolation (the shipped ceiling was
+    # already close to this endpoint's floor); the real second lever is
+    # --tool-kp itself, see README_insertion.md's "Data collection" section
+    # for the full sweep. Exposed here mainly so this ceiling isn't
+    # hardcoded below what's already proven safe elsewhere in this repo.
+    peg_softness_max_solref: "tuple | None" = None
+    peg_softness_max_solimp_width: "float | None" = None
+
     # MuJoCo's dedicated post-pass for refining the friction-force split
     # across several simultaneous near-redundant contacts -- ported from
     # FLIPUP_LOW_STIFFNESS_CONTROLLER.md #6: the peg touching 2+ socket
@@ -491,6 +513,10 @@ class InsertionProperties:
             raise ValueError("friction must have exactly 3 non-negative values")
         if self.noslip_iterations < 0:
             raise ValueError("noslip_iterations cannot be negative")
+        if self.peg_softness_max_solref is not None and len(self.peg_softness_max_solref) != 2:
+            raise ValueError("peg_softness_max_solref must have exactly 2 values (time_constant, damping_ratio)")
+        if self.peg_softness_max_solimp_width is not None and not (0.0 < self.peg_softness_max_solimp_width < 1.0):
+            raise ValueError("peg_softness_max_solimp_width must be in (0, 1)")
 
 
 DEFAULT_INSERTION_PROPERTIES = InsertionProperties()
@@ -681,9 +707,15 @@ class InsertionEnv(FlipUpEnv):
         changed, same defensive habit sanding's fix established.
         """
         s = float(self.properties.peg_softness)
-        time_constant = COMPILED_PEG_SOLREF[0] + s * (SOFT_PEG_SOLREF[0] - COMPILED_PEG_SOLREF[0])
-        damping_ratio = COMPILED_PEG_SOLREF[1] + s * (SOFT_PEG_SOLREF[1] - COMPILED_PEG_SOLREF[1])
-        width = COMPILED_PEG_SOLIMP_WIDTH + s * (SOFT_PEG_SOLIMP_WIDTH - COMPILED_PEG_SOLIMP_WIDTH)
+        soft_solref = self.properties.peg_softness_max_solref
+        if soft_solref is None:
+            soft_solref = SOFT_PEG_SOLREF
+        soft_width = self.properties.peg_softness_max_solimp_width
+        if soft_width is None:
+            soft_width = SOFT_PEG_SOLIMP_WIDTH
+        time_constant = COMPILED_PEG_SOLREF[0] + s * (soft_solref[0] - COMPILED_PEG_SOLREF[0])
+        damping_ratio = COMPILED_PEG_SOLREF[1] + s * (soft_solref[1] - COMPILED_PEG_SOLREF[1])
+        width = COMPILED_PEG_SOLIMP_WIDTH + s * (soft_width - COMPILED_PEG_SOLIMP_WIDTH)
 
         self.model.geom_solref[self.peg_geom_id] = (time_constant, damping_ratio)
         self.model.geom_solimp[self.peg_geom_id, 2] = width

@@ -121,6 +121,19 @@ def build_arg_parser():
     parser.add_argument("--peg-softness", type=float, default=DEFAULT_INSERTION_PROPERTIES.peg_softness,
                         help="[0,1] peg contact compliance -- higher = softer/more gradual "
                              "contact onset. See InsertionEnv._configure_peg_contact")
+    parser.add_argument("--peg-softness-max-solref", type=float, nargs=2, default=None,
+                        metavar=("TIME_CONSTANT_S", "DAMPING_RATIO"),
+                        help="override the endpoint --peg-softness=1 interpolates toward "
+                             "(default (0.020, 1.8)). A human pushing sideways into the "
+                             "fixture's flat top/frame exposes solref's DC stiffness at a scale "
+                             "the scripted demo's clean single-axis approach never did -- try "
+                             "0.06 2.0, the same values SANDING_JITTER_FIX_SUMMARY.md and "
+                             "FLIPUP_LOW_STIFFNESS_CONTROLLER.md converged on for the identical "
+                             "problem. Combine with a lower --tool-kp, which matters more (see "
+                             "README_insertion.md's 'Data collection' section for the sweep)")
+    parser.add_argument("--peg-softness-max-solimp-width", type=float, default=None,
+                        help="override the solimp width --peg-softness=1 interpolates toward "
+                             "(default 0.004); try 0.006 alongside --peg-softness-max-solref")
     parser.add_argument("--friction", type=float, nargs=3,
                         default=DEFAULT_INSERTION_PROPERTIES.friction,
                         metavar=("SLIDING", "TORSIONAL", "ROLLING"),
@@ -286,6 +299,9 @@ def main():
         force_contact_threshold_n=args.contact_force_threshold,
         force_break_n=args.break_force,
         peg_softness=args.peg_softness,
+        peg_softness_max_solref=(tuple(args.peg_softness_max_solref)
+                                  if args.peg_softness_max_solref is not None else None),
+        peg_softness_max_solimp_width=args.peg_softness_max_solimp_width,
         friction=tuple(args.friction),
         cartesian_damping_scale=args.cartesian_damping_scale,
         dynamic_filter_alpha=args.dynamic_filter_alpha,

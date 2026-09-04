@@ -334,6 +334,62 @@ updating, rather than interleaving tick-by-tick -- a cosmetic gap in the
 preview, not a physics one, and it doesn't affect the real (non-dry-run)
 teleoperation path at all.
 
+## Data collection & live monitoring
+
+Same on-disk dataset shape and CLI conventions as flipup/sanding, via
+`insertion_recorder.py`'s `InsertionEpisodeRecorder`:
+
+```bash
+python teleop_insertion.py \
+    --collect-dataset ~/data/insertion_v1.zarr \
+    --tool-kp 2500 --cartesian-damping-scale 1.0 \
+    --noslip-iterations 15 \
+    --max-speed 0.1 --force-tau 6 --force-rate 80 \
+    --auto-finish
+```
+
+- `--collect-dataset PATH.zarr` turns on recording; `S` (keyboard) or a
+  short press of the handle button starts/stops an episode, `K`/`D` keep or
+  delete it, matching flipup/sanding exactly. `--dataset-hz`,
+  `--dataset-image-size`, `--dataset-no-rgb`, `--dataset-min-samples` all
+  mean the same thing they do for sanding.
+- **Live force plot**: on by default (drawn into the same cv2 HUD window as
+  a scrolling strip chart, not a separate matplotlib window -- see
+  `draw_plot`/`plot_lock` in `teleop_insertion.py`). `--plot-span` sets the
+  trailing time window (default 6s), `--plot-fixed-scale` pins the y-axis
+  to `[0, --break-force]` instead of autoscaling (steadier to watch during
+  a long session), `--no-plot` disables it.
+- `--noslip-iterations N` (default 0, try 10-25): MuJoCo's post-pass for
+  refining the friction-force split across simultaneous contacts, ported
+  from `FLIPUP_LOW_STIFFNESS_CONTROLLER.md` #6 -- the peg touching 2+
+  socket walls at once during CONTACT/SEARCH is the same multi-contact
+  friction-allocation-noise situation diagnosed there. Not validated
+  against real recorded insertion episodes yet (that doc's version was
+  validated against real flipup data); exposed here on the same reasoning,
+  worth trying if force readings show high-frequency noise while
+  `env.data.ncon` stays >1 through a contact window.
+
+### Known environment issue, now fixed: SIGSEGV at exit under GLFW
+
+`teleop_insertion.py`'s `render_loop` (mirroring sanding/flipup) builds and
+uses a `MovableCamera` from a background thread so the live HUD/dataset RGB
+capture don't block the control loop. dm_control's GLFW backend is
+documented as main-thread-only
+(`dm_control/_render/glfw_renderer.py`: "GLFWContext always uses
+PassthroughRenderExecutor rather than offloading rendering calls to a
+separate thread because GLFW can only be safely used from the main
+thread"). In practice this reproduced as a real SIGSEGV at process exit
+whenever the render thread had touched GL -- confirmed identical in
+`teleop_sanding.py` too (not specific to this task), and independent of
+`--collect-dataset`/`--no-view` (reproduces with either on or off, e.g. a
+plain `--dry-run --auto-finish` run). `teleop_insertion.py` now sets
+`os.environ.setdefault("MUJOCO_GL", "egl")` before any mujoco/dm_control
+import, which is thread-safe for this exact pattern and was verified to
+exit cleanly (code 0, no core dump) under the same test that segfaulted
+under GLFW. `setdefault` leaves an already-exported `MUJOCO_GL` (e.g.
+`osmesa` on a box with no GPU at all) alone. This is a repo-wide latent
+issue, not fixed in `teleop_sanding.py`/`teleop_flipup.py` themselves.
+
 ## Files
 
 - `insertion_teleop.py` -- the environment (`InsertionEnv`,

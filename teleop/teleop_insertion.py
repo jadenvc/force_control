@@ -26,6 +26,26 @@ for BC dataset recording.
 
 from __future__ import annotations
 
+import os
+
+# Must run before any mujoco/dm_control import below (line ~38's
+# `from insertion_teleop import ...` pulls in dm_control transitively).
+# dm_control's GLFW backend is documented as main-thread-only
+# (dm_control/_render/glfw_renderer.py: "GLFWContext always uses
+# PassthroughRenderExecutor rather than offloading rendering calls to a
+# separate thread because GLFW can only be safely used from the main
+# thread"), but this script's render_loop (below) deliberately builds and
+# uses a MovableCamera from a background thread so the live HUD/dataset RGB
+# capture don't block the control loop. Under GLFW that produced a real,
+# reproducible SIGSEGV at process exit (confirmed: the identical crash
+# reproduces in teleop_sanding.py too -- not specific to this task, and not
+# just a benign console warning; `timeout`/the shell reports it as a
+# dumped core, exit code 139). EGL is thread-safe for exactly this
+# pattern and was verified to exit cleanly (code 0) under the same test.
+# `setdefault` so an operator/CI setup that already exports MUJOCO_GL
+# (e.g. osmesa on a truly headless box with no GPU) is left alone.
+os.environ.setdefault("MUJOCO_GL", "egl")
+
 import argparse
 import threading
 import time
@@ -122,6 +142,14 @@ def build_arg_parser():
     parser.add_argument("--ft-filter-alpha", type=float,
                         default=DEFAULT_INSERTION_PROPERTIES.ft_filter_alpha,
                         help="EMA smoothing factor (only used when --ft-filter-type=ema)")
+    parser.add_argument("--noslip-iterations", type=int,
+                        default=DEFAULT_INSERTION_PROPERTIES.noslip_iterations,
+                        help="MuJoCo's post-pass (model.opt.noslip_iterations) for refining the "
+                             "friction-force split across simultaneous contacts (peg touching 2+ "
+                             "socket walls at once). Off (0) by compiled default, matching "
+                             "flipup_teleop.py's --noslip-iterations; try 10-25 if force readings "
+                             "show high-frequency noise with contact_count staying >1 -- see "
+                             "FLIPUP_LOW_STIFFNESS_CONTROLLER.md #6")
     parser.add_argument("--seed", type=int, default=0)
 
     # ---- controller -----------------------------------------------------------
@@ -264,6 +292,7 @@ def main():
         dynamic_filter_beta=args.dynamic_filter_beta,
         ft_filter_type=args.ft_filter_type,
         ft_filter_alpha=args.ft_filter_alpha,
+        noslip_iterations=args.noslip_iterations,
     )
     env = InsertionTeleop(
         seed=args.seed,

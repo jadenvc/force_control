@@ -439,6 +439,17 @@ class InsertionProperties:
     peg_softness: float = 0.5  # [0, 1]
     friction: tuple = (0.3, 0.005, 0.0001)
 
+    # MuJoCo's dedicated post-pass for refining the friction-force split
+    # across several simultaneous near-redundant contacts -- ported from
+    # FLIPUP_LOW_STIFFNESS_CONTROLLER.md #6: the peg touching 2+ socket
+    # walls at once during CONTACT/SEARCH is the same "multiple
+    # simultaneous contacts, main solver doesn't uniquely determine the
+    # per-contact friction split" situation diagnosed there for the
+    # fingertip-pads-plus-bookend-surfaces case, so it's exposed here too
+    # rather than only on flipup. Off (0) at the compiled default, matching
+    # flipup_teleop.py's --noslip-iterations; try 10-25.
+    noslip_iterations: int = 0
+
     def __post_init__(self):
         if self.insert_depth_target_m <= 0.0:
             raise ValueError("insert_depth_target_m must be positive")
@@ -478,6 +489,8 @@ class InsertionProperties:
             raise ValueError("peg_softness must be in [0, 1]")
         if len(self.friction) != 3 or any(v < 0.0 for v in self.friction):
             raise ValueError("friction must have exactly 3 non-negative values")
+        if self.noslip_iterations < 0:
+            raise ValueError("noslip_iterations cannot be negative")
 
 
 DEFAULT_INSERTION_PROPERTIES = InsertionProperties()
@@ -564,6 +577,7 @@ class InsertionEnv(FlipUpEnv):
         self.error_quaternion = np.zeros(4, dtype=np.float64)
 
         self._configure_peg_contact()
+        self.model.opt.noslip_iterations = int(self.properties.noslip_iterations)
 
         self._dynamic_filter = DynamicFilter(
             alpha=self.properties.dynamic_filter_alpha,

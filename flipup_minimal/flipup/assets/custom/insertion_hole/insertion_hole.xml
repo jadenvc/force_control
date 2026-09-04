@@ -1,0 +1,100 @@
+<mujoco model="insertion_hole">
+    <compiler angle="radian" autolimits="true" />
+    <default>
+        <default class="visual">
+            <geom type="box" contype="0" conaffinity="0" group="2" />
+        </default>
+        <!-- Fixture walls/floor deliberately keep MuJoCo's default priority=0,
+             strictly LOWER than insertion_peg.xml's peg_collision priority=1,
+             so every peg-vs-fixture contact takes its solref/solimp/friction
+             entirely from the peg geom (see that file's long comment on the
+             priority-wins-outright rule). The friction set here is still
+             written explicitly for documentation/if priority is ever
+             flipped, exactly the same "inert but self-documenting" pattern
+             sanding_teleop.py's sander_pad_collision class follows. -->
+        <default class="collision">
+            <geom type="box" group="3" condim="4"
+                friction="0.3 0.005 0.0001" solref="0.010 1.2"
+                solimp="0.9 0.95 0.002" margin="0.001" priority="0" />
+        </default>
+    </default>
+
+    <asset>
+        <material name="fixture_body" rgba="0.55 0.55 0.58 1" reflectance="0.05" />
+        <material name="fixture_opening" rgba="0.15 0.15 0.15 1" reflectance="0.0" />
+    </asset>
+
+    <worldbody>
+        <!-- Non-colliding base plate purely so the fixture reads visually as
+             sitting on/attached to something, same convention as
+             sanding_panel.xml's "stand" body. -->
+        <body name="stand">
+            <geom class="visual" pos="0 0 -0.075" size="0.09 0.09 0.015"
+                material="fixture_body" />
+        </body>
+
+        <!-- The socket is built from 4 rectangular wall geoms forming a
+             square tunnel, rather than a real cylindrical bore, because
+             MuJoCo has no boolean/CSG subtraction of primitives and the
+             reference sim's round holes are pre-built meshes (see
+             /home/yifan/git/force-insertion-sim/models/mujoco/props/holes/hole_cyl_s_medium/fixture.xml,
+             which uses a 39-piece convex-decomposition mesh). A square
+             tunnel needs only 4 boxes and pairs naturally with the peg's
+             round capsule tip: the peg only ever meets flat wall faces
+             (never a matching square corner-to-corner condition), which
+             keeps contact normals well-behaved.
+
+             Geometry (all relative to the "socket" body origin, which sits
+             at the world height of the entrance/top-of-fixture plane, i.e.
+             the reference z=0 for insertion-depth bookkeeping):
+               a  = inner half-width of the square opening = 0.012 m
+                    (24 mm opening) vs. the peg's 20 mm (2x0.010) diameter,
+                    i.e. ~2 mm of radial clearance on each side - tighter
+                    than sanding-style "loose" contact but well short of the
+                    reference sim's tight 0.2mm-clearance fixtures (task
+                    instructions explicitly call for something in between
+                    for this first port).
+               t  = wall thickness = 0.015 m
+               cap = 0.015 m: how far the walls extend ABOVE the entrance
+                    plane. This is what gives the CONTACT/SEARCH phases
+                    something to press against and slide along before the
+                    peg finds the opening and drops through - the top faces
+                    of these 4 walls together form a flat "picture frame"
+                    surface around the hole (there is no separate top-plate
+                    geom; extending the walls upward serves double duty).
+               depth = 0.05 m: how far the peg can travel down inside the
+                    tunnel before hitting the floor geom below. Bigger than
+                    insertion_scripted_demo.py's insert_depth_target (0.03 m
+                    default) so a successful insertion never needs to bottom
+                    out, matching the reference sim's insert_depth (0.06 m)
+                    being smaller than its ~0.1 m hole depth.
+        -->
+        <body name="socket" pos="0 0 0">
+            <geom name="socket_wall_visual" class="visual" material="fixture_opening"
+                size="0.027 0.027 0.0325" pos="0 0 -0.0175" />
+            <!-- +x wall -->
+            <geom name="socket_wall_px" class="collision" size="0.015 0.027 0.0325"
+                pos="0.027 0 -0.0175" />
+            <!-- -x wall -->
+            <geom name="socket_wall_nx" class="collision" size="0.015 0.027 0.0325"
+                pos="-0.027 0 -0.0175" />
+            <!-- +y wall -->
+            <geom name="socket_wall_py" class="collision" size="0.027 0.015 0.0325"
+                pos="0 0.027 -0.0175" />
+            <!-- -y wall -->
+            <geom name="socket_wall_ny" class="collision" size="0.027 0.015 0.0325"
+                pos="0 -0.027 -0.0175" />
+            <!-- Floor: stops the peg at depth=0.05 m below the entrance. -->
+            <geom name="socket_floor" class="collision" size="0.027 0.027 0.005"
+                pos="0 0 -0.055" />
+
+            <!-- Reference sites, matching the reference sim's hole_entrance /
+                 hole_bottom sites
+                 (models/mujoco/props/holes/hole_cyl_s_medium/fixture.xml:246-247),
+                 used by insertion_scripted_demo.py to compute approach
+                 targets and insertion-depth success. -->
+            <site name="hole_entrance" pos="0 0 0" group="3" />
+            <site name="hole_bottom" pos="0 0 -0.05" group="3" />
+        </body>
+    </worldbody>
+</mujoco>

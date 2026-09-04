@@ -1,0 +1,99 @@
+<mujoco model="insertion_peg">
+    <compiler angle="radian" autolimits="true" />
+    <default>
+        <default class="visual">
+            <geom contype="0" conaffinity="0" group="2" />
+        </default>
+        <!-- The peg's collision geom is a CAPSULE, not a flat-ended cylinder,
+             for the same reason sander.xml uses capsules/ellipsoids: a
+             flat-to-round rim is a real geometric corner and MuJoCo's contact
+             normal is discontinuous there, which produces torque
+             spikes/chatter exactly during the delicate search/insert phases
+             where we need the opposite (smooth, low-noise contact). The
+             rounded (hemispherical) tip also behaves like a mildly chamfered
+             real peg, which physically helps it find/enter the hole instead
+             of catching square on the rim.
+
+             priority=1 (> the hole fixture's default priority=0, see
+             insertion_hole.xml) means MuJoCo takes solref/solimp/friction for
+             every peg-vs-fixture contact ENTIRELY from this geom (MuJoCo
+             does not blend when priorities differ - see
+             teleop/SANDING_JITTER_FIX_SUMMARY.md and
+             teleop/flipup_teleop.py's _configure_bookend_contact comments).
+             That is deliberate here: unlike sanding (where the softness knob
+             had to be written onto the higher-priority PANEL geom or it was
+             silently inert), here the peg is intentionally the
+             higher-priority side so insertion_teleop.py's peg_softness knob
+             (which only touches this geom, see
+             InsertionEnv._configure_peg_contact) actually governs the
+             contact.
+
+             Starting numbers ported from
+             /home/yifan/git/force-insertion-sim/models/mujoco/franka_fr3/fr3_torque_peg.xml:154-161
+             (condim=4, friction="0.3 0.005 0.0001", solref="0.005 1",
+             solimp="0.95 0.999 0.002") and then softened during the
+             scripted-demo tuning pass in insertion_scripted_demo.py - see
+             README_insertion.md's "Contact tuning" section for the final
+             values and why (this repo's UR5e task-space Kp is far stiffer
+             than the Franka impedance controller in the reference sim, so a
+             stiffer peg contact than the reference's rings/oscillates here). -->
+        <default class="peg_collision">
+            <geom condim="4" friction="0.4 0.01 0.0002" solref="0.010 1.2"
+                solimp="0.9 0.95 0.002" margin="0.001" group="3" priority="1" />
+        </default>
+    </default>
+
+    <asset>
+        <material name="peg_housing" rgba="0.30 0.35 0.55 1" reflectance="0.1" />
+        <material name="peg_shaft" rgba="0.75 0.75 0.80 1" reflectance="0.2" />
+    </asset>
+
+    <worldbody>
+        <body name="base">
+            <site name="mount" group="3" />
+            <site name="ft_sensor_site" group="3" />
+
+            <!-- Housing stub between the UR5e flange and the peg shaft -
+                 visual only (contype/conaffinity 0), same convention as
+                 sander.xml's housing capsule. -->
+            <geom name="peg_housing_visual" class="visual" type="capsule"
+                material="peg_housing" size="0.020" fromto="0 0 0.0 0 0 0.02" />
+
+            <!-- Peg shaft: capsule from just below the housing to the tip.
+                 Radius 0.010 m (20 mm diameter) matches the reference sim's
+                 peg_cyl_s / peg_rect_s cross-section order of magnitude
+                 (see /home/yifan/git/force-insertion-sim/models/mujoco/props/stl_name_to_dim_mapping.csv,
+                 peg_cyl_s: diameter 20mm). fromto endpoints give a straight
+                 shaft length of 0.05 m plus two 0.010 m hemispherical caps,
+                 for a total reach of ~0.07 m below the housing - enough to
+                 clear the insertion_hole.xml fixture's 0.015 m entrance lip
+                 before the tip needs to reach the bottom of its 0.05 m deep
+                 socket (see that file's comments). -->
+            <geom name="peg_shaft_visual" class="visual" type="capsule"
+                material="peg_shaft" size="0.010" fromto="0 0 0.02 0 0 0.07" />
+            <geom name="peg_shaft_collision" type="capsule" class="peg_collision"
+                size="0.010" fromto="0 0 0.02 0 0 0.07" />
+
+            <inertial pos="0 0 0.045" mass="0.30" diaginertia="0.0003 0.0003 0.00006" />
+
+            <!-- Tool-control site placed at the capsule's distal endpoint
+                 (not including the hemispherical cap radius - close enough
+                 for task-space control purposes, and keeps the control point
+                 a fixed, simple offset from the mount). insertion_teleop.py
+                 and insertion_scripted_demo.py both treat this as "the peg
+                 tip" for approach/insertion-depth bookkeeping. Matches
+                 sander.xml's planner_tip_site / wsg50.xml convention so nothing
+                 in the shared task-space controller needs to special-case
+                 this tool. -->
+            <site name="planner_tip_site" group="3" pos="0 0 0.07" />
+            <site name="end_effector" group="3" pos="0 0 0.07" />
+
+            <camera name="wrist_cam" pos="0 0.08 0.0" xyaxes="1 0 0 0 -0.5 -0.87" />
+        </body>
+    </worldbody>
+
+    <sensor>
+        <force name="wrist_force_sensor" site="ft_sensor_site" />
+        <torque name="wrist_torque_sensor" site="ft_sensor_site" />
+    </sensor>
+</mujoco>

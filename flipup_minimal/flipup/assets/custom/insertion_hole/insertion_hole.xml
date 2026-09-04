@@ -70,21 +70,47 @@
                     being smaller than its ~0.1 m hole depth.
         -->
         <body name="socket" pos="0 0 0">
-            <geom name="socket_wall_visual" class="visual" material="fixture_opening"
-                size="0.027 0.027 0.0325" pos="0 0 -0.0175" />
+            <!-- Visual walls/floor, one-for-one with the collision geoms
+                 below (same size/pos, class="visual" instead of
+                 "collision"). There is deliberately no single solid block
+                 standing in for the socket the way the old
+                 "socket_wall_visual" placeholder did: that geom's box
+                 exactly spanned the tunnel's full outer footprint
+                 (0.027x0.027, matching a=0.012 opening plus t=0.015 wall on
+                 one side), so it rendered as one solid dark cube with the
+                 actual square bore completely hidden inside it; there was
+                 no way to see the hole at all, only a block. Giving each
+                 wall its own visual geom (fixture_body, the same
+                 light-grey material as the base "stand") leaves the true
+                 0.024x0.024 square opening empty/visible from above, and
+                 the dark "fixture_opening" floor visual at the bottom of
+                 the bore is what actually reads as a hole once you can see
+                 down into it. -->
             <!-- +x wall -->
+            <geom name="socket_wall_px_visual" class="visual" material="fixture_body"
+                size="0.015 0.027 0.0325" pos="0.027 0 -0.0175" />
             <geom name="socket_wall_px" class="collision" size="0.015 0.027 0.0325"
                 pos="0.027 0 -0.0175" />
             <!-- -x wall -->
+            <geom name="socket_wall_nx_visual" class="visual" material="fixture_body"
+                size="0.015 0.027 0.0325" pos="-0.027 0 -0.0175" />
             <geom name="socket_wall_nx" class="collision" size="0.015 0.027 0.0325"
                 pos="-0.027 0 -0.0175" />
             <!-- +y wall -->
+            <geom name="socket_wall_py_visual" class="visual" material="fixture_body"
+                size="0.027 0.015 0.0325" pos="0 0.027 -0.0175" />
             <geom name="socket_wall_py" class="collision" size="0.027 0.015 0.0325"
                 pos="0 0.027 -0.0175" />
             <!-- -y wall -->
+            <geom name="socket_wall_ny_visual" class="visual" material="fixture_body"
+                size="0.027 0.015 0.0325" pos="0 -0.027 -0.0175" />
             <geom name="socket_wall_ny" class="collision" size="0.027 0.015 0.0325"
                 pos="0 -0.027 -0.0175" />
-            <!-- Floor: stops the peg at depth=0.05 m below the entrance. -->
+            <!-- Floor: stops the peg at depth=0.05 m below the entrance.
+                 Dark "fixture_opening" visual so the bottom of the bore
+                 reads as a hole once you can see down into it. -->
+            <geom name="socket_floor_visual" class="visual" material="fixture_opening"
+                size="0.027 0.027 0.005" pos="0 0 -0.055" />
             <geom name="socket_floor" class="collision" size="0.027 0.027 0.005"
                 pos="0 0 -0.055" />
 

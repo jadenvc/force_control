@@ -2,9 +2,14 @@
 
 Moves a Force Dimension omega handle to drive a UR5e holding a rigid peg
 above a square socket fixture. The operator feels the peg/fixture contact
-force reflected at the handle (the FILTERED simulated F/T reading, see
-insertion_teleop.py's FTSensorFilter -- unlike sanding/flipup, which reflect
-the raw exact solver force), watches a live cv2 HUD (a force-over-time strip
+force reflected at the handle (InsertionEnv.contact_force_filtered(): the
+exact, zero-in-free-space solver contact force -- same ground truth
+sanding/flipup reflect -- smoothed through insertion_teleop.py's
+FTSensorFilter; NOT wrist_wrench_filtered(), whose raw simulated F/T sensor
+carries an uncompensated ~static peg-weight bias even in free space, found
+from a real recorded episode where it dominated the felt force and made
+contact feel disconnected from gravity/elastic-push-back-y even though the
+underlying exact contact force rose smoothly), watches a live cv2 HUD (a force-over-time strip
 chart with the contact-detection/break reference lines, current insertion
 depth, and a SUCCESS/BROKEN flag), and sees the wrist camera looking down at
 the fixture. Episode saving/deleting works both from the handle button and
@@ -807,11 +812,19 @@ def main():
                     else 1.0
                 )
 
-            # Reflect the FILTERED simulated F/T reading, not the exact
-            # solver force sanding/flipup reflect -- this is the "report the
-            # filtered force to both the haptic device and the recorder"
-            # piece of the task brief.
-            force = env.wrist_wrench_filtered()[:3]
+            # Reflect the FILTERED exact contact force (InsertionEnv's
+            # contact_force_filtered(), zero-mean in free space by
+            # construction), not wrist_wrench_filtered() -- a recorded real
+            # teleop episode showed wrist_wrench_filtered() carries a
+            # persistent ~-3N free-space bias (the raw simulated F/T sensor
+            # reads the peg's own held weight, uncompensated -- see
+            # contact_force_filtered()'s docstring), which the operator
+            # correctly perceived as "no gravity comp" and an "always
+            # pushes back" elastic feel that was actually mostly
+            # disconnected from the real (and, on inspection, smooth)
+            # contact force. Still smoothed through the same
+            # EMA/Butterworth machinery, just against the correct signal.
+            force = env.contact_force_filtered()[:3]
             reflected = force_ramp * np.clip(
                 force * force_gain, -args.force_clip * force_gain, args.force_clip * force_gain
             )
@@ -822,7 +835,7 @@ def main():
                 while next_plot_step[0] <= step_index:
                     next_plot_step[0] += plot_every
                 with plot_lock:
-                    trace_force.append(float(np.linalg.norm(env.wrist_wrench_filtered()[:3])))
+                    trace_force.append(float(np.linalg.norm(env.contact_force_filtered()[:3])))
 
             if args.auto_finish and collection["state"] == "recording" and (env.success() or env.broken):
                 stop_episode("auto_success" if env.success() else "auto_broken")
@@ -841,7 +854,7 @@ def main():
                 )
 
             if not args.no_readout and now - last_print >= args.print_interval_s:
-                fn = float(np.linalg.norm(env.wrist_wrench_filtered()[:3]))
+                fn = float(np.linalg.norm(env.contact_force_filtered()[:3]))
                 depth_mm = env.peg_tip_depth_m() * 1000.0
                 flag = "   BROKEN" if env.broken else ("   SUCCESS" if env.success() else "")
                 rec_flag = f"  [{collection['state'].upper()}]" if recorder is not None else ""

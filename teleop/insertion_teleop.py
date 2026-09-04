@@ -615,6 +615,16 @@ class InsertionEnv(FlipUpEnv):
             alpha=self.properties.ft_filter_alpha,
             fs_hz=1.0 / self.timestep,
         )
+        # Separate filter INSTANCE (same type/alpha) for contact_force_filtered
+        # -- it must not share _ft_filter's state: that one's fed
+        # wrist_wrench_raw() every step regardless of which reporting method
+        # gets called, so reusing it here would filter two different input
+        # signals through one running EMA/Butterworth state and corrupt both.
+        self._contact_force_filter = FTSensorFilter(
+            filter_type=self.properties.ft_filter_type,
+            alpha=self.properties.ft_filter_alpha,
+            fs_hz=1.0 / self.timestep,
+        )
 
         self._contact_buf = np.zeros(6, dtype=float)
         self._break_streak = 0
@@ -789,6 +799,33 @@ class InsertionEnv(FlipUpEnv):
         """
         return self._ft_filter(self.wrist_wrench_raw())
 
+    def contact_force_filtered(self):
+        """Filtered EXACT contact force (see ``peg_contact_force``), zero
+        torque padding to match ``wrist_wrench_filtered``'s 6-vector shape.
+
+        Added after real teleop testing showed ``wrist_wrench_filtered()``
+        carries a persistent ~-3N z bias in FREE SPACE (confirmed in a
+        recorded episode: constant regardless of how long ago contact
+        ended, so not a filter-settling transient) -- the raw simulated
+        wrist F/T sensor reads the peg's own held weight, uncompensated
+        (see ``FTSensorFilter``'s docstring / README_insertion.md's gap
+        list: gravity compensation on the sensor was deliberately not
+        ported because this env "already exposes an exact,
+        zero-in-free-space ground truth as an alternative" -- true, but
+        that alternative was never actually wired into the haptic/HUD
+        reporting path in ``teleop_insertion.py``, which called
+        ``wrist_wrench_filtered()`` instead). The recorded episode's
+        ``normal_force_n`` rose smoothly 0->5N over ~30ms on real contact
+        with no spike -- ``wrist_wrench_filtered()`` over that same window
+        was dominated by the free-space bias and barely tracked it. This
+        method reuses the SAME ``_ft_filter`` (so still smoothed against
+        genuine solver noise, not raw/jittery) applied to the correct,
+        zero-mean-in-free-space input instead.
+        """
+        force, _ = self.peg_contact_force()
+        wrench = np.concatenate([force, np.zeros(3)])
+        return self._contact_force_filter(wrench)
+
     def peg_tip_depth_m(self):
         """How far the peg tip is below the hole_entrance plane, in the
         fixture's local +z-down sense (positive means inserted; negative
@@ -945,6 +982,7 @@ class InsertionEnv(FlipUpEnv):
         self._depth_hold_steps = 0
         self._dynamic_filter.reset()
         self._ft_filter.reset()
+        self._contact_force_filter.reset()
         if self.viewer is not None:
             self.viewer.sync()
 

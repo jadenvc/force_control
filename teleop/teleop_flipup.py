@@ -63,6 +63,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from flipup_teleop import (  # noqa: E402
     BOOK_COLOR_PALETTE,
     DEFAULT_ARM_DAMPING,
+    DEFAULT_BOOK_FIXTURE_FRICTION,
+    DEFAULT_BOOK_FIXTURE_SOLIMP,
+    DEFAULT_BOOK_FIXTURE_SOLREF,
     DEFAULT_FORCE_CLIP,
     DEFAULT_JOINT_KD,
     DEFAULT_SURFACE_FORCE_LIMIT,
@@ -464,6 +467,55 @@ def main(env_class=None):
             "the simulated controller; --stiffness separately controls handle feel."
         ),
     )
+    parser.add_argument(
+        "--tool-kp-axes",
+        type=float,
+        nargs=3,
+        default=(1.0, 1.0, 1.0),
+        metavar=("X", "Y", "Z"),
+        help=(
+            "full-arm only: per-WORLD-axis multipliers on --tool-kp, applied "
+            "only to the arm's task-space translational stiffness -- (1,1,1) "
+            "is the original isotropic behavior. --tool-kp itself still "
+            "governs surface_force_limit/book_normal_force_limit deflection "
+            "caps and the tool-force-limit squash unmodified (an "
+            "approximation once this is anisotropic; see FlipUpTeleop's "
+            "tool_kp_axes comment). Lets you soften the lateral axis "
+            "implicated in sliding-contact chatter while keeping the "
+            "book-edge-precision axis near the full 16000 default."
+        ),
+    )
+    parser.add_argument(
+        "--noslip-iterations",
+        type=int,
+        default=0,
+        help=(
+            "full-arm only: MuJoCo's post-solve friction-refinement pass "
+            "(model.opt.noslip_iterations), off (0) by compiled default. "
+            "Targets force noise from splitting friction across multiple "
+            "simultaneous near-redundant contacts (fingertip + 1-2 bookend "
+            "surfaces at once during a real flip) rather than dropout/jam "
+            "chatter -- try 10-25 if the force reading looks noisy/wobbly "
+            "even while contact_count never drops to 0."
+        ),
+    )
+    parser.add_argument(
+        "--tool-cartesian-kd",
+        type=float,
+        nargs=3,
+        default=(0.0, 0.0, 0.0),
+        metavar=("X", "Y", "Z"),
+        help=(
+            "full-arm only: WORLD-frame Cartesian translational damping "
+            "(N/(m/s)) in the task_wrench = Kp*e - Kd*xdot law -- (0,0,0) "
+            "is the original behavior, where translation damping came only "
+            "from the fixed joint-space term (independent of --tool-kp). "
+            "force-insertion-sim pairs its low K_cart (450-700) with "
+            "D_cart=55-200; try nonzero values here alongside a softened "
+            "--tool-kp or --tool-kp-axes to directly damp Cartesian "
+            "velocity rather than relying on joint-space damping alone."
+        ),
+    )
     parser.add_argument("--tool-rot-kp", type=float,
                         default=(300.0 if floating else DEFAULT_TOOL_ROT_KP),
                         help="task-space rotational stiffness (N m/rad). Arm default "
@@ -502,10 +554,57 @@ def main(env_class=None):
         "--tip-softness",
         type=float,
         default=float(getattr(env_class, "default_tip_softness", 0.0)),
-        help="floating gripper only: interpolate fingertip contact from the "
-             "unchanged model at 0 (10 ms, damping ratio 1, 3 mm impedance "
-             "width) to a softer pad at 1 (20 ms, ratio 2, 5 mm). Try 0.5; "
-             "default 0 preserves current behavior",
+        help="interpolate fingertip contact from the unchanged model at 0 "
+             "(10 ms, damping ratio 1, 3 mm impedance width) to a softer pad "
+             "at 1 (20 ms, ratio 2, 5 mm). Try 0.5; default 0 preserves "
+             "current behavior. Works on both the full arm and the floating "
+             "gripper",
+    )
+    parser.add_argument(
+        "--tip-softness-max-solref",
+        type=float,
+        nargs=2,
+        default=None,
+        metavar=("TIME_CONSTANT_S", "DAMPING_RATIO"),
+        help="override the endpoint --tip-softness=1 interpolates toward, "
+             "replacing the originally-tested (0.02, 2.0). Per the sanding "
+             "teleop task's contact-jitter investigation "
+             "(SANDING_JITTER_FIX_SUMMARY.md): solref's time constant lowers "
+             "the contact's effective bandwidth at DC, not just the onset "
+             "transient, so pushing this past 0.02s (e.g. 0.04-0.06) can "
+             "reduce SUSTAINED wedging force, not only impact sharpness -- "
+             "at the cost of some genuine steady-state force sensitivity. "
+             "Works on both the full arm and the floating gripper. Leave "
+             "unset to keep the current (0.02, 2.0) ceiling",
+    )
+    parser.add_argument(
+        "--tip-softness-max-width",
+        type=float,
+        default=None,
+        metavar="WIDTH_M",
+        help="override the solimp impedance-width endpoint --tip-softness=1 "
+             "interpolates toward, replacing the originally-tested 0.005 m. "
+             "Leave unset to keep the current 5mm ceiling",
+    )
+    parser.add_argument(
+        "--tip-friction",
+        type=float,
+        nargs=3,
+        default=None,
+        metavar=("SLIDING", "TORSIONAL", "ROLLING"),
+        help="override the fingertip pads' raw MuJoCo friction [sliding, "
+             "torsional, rolling], replacing their compiled (1.2, 0.01, "
+             "0.0005) -- notably high, and unlike --book-friction, this IS "
+             "the flag that actually reaches fingertip-vs-book contact: "
+             "the tip pads' priority (8) already wins over the book's "
+             "(unset/0), so their own friction governs that pairing "
+             "directly, no priority workaround needed. --tip-softness "
+             "never touches this (it only interpolates solref/solimp). No "
+             "known load-bearing safety floor like --book-fixture-friction "
+             "has -- the fingertip is always actively driven, never "
+             "passively resting under gravity. Try something in the "
+             "0.2-0.5 range for noticeably less drag while sliding along "
+             "the book. Leave unset to keep the compiled value",
     )
     parser.add_argument(
         "--table-solref",
@@ -531,6 +630,147 @@ def main(env_class=None):
              "table.xml's compiled (0.85, 0.95, 0.004, 0.5, 2.0). Increasing "
              "width spreads the impedance transition over more penetration for "
              "a more gradual onset. Leave unset to keep the compiled value",
+    )
+    parser.add_argument(
+        "--table-friction",
+        type=float,
+        nargs=3,
+        default=None,
+        metavar=("SLIDING", "TORSIONAL", "ROLLING"),
+        help="override the visible table surface's raw MuJoCo friction "
+             "[sliding, torsional, rolling], replacing table.xml's compiled "
+             "(0.15, 0.003, 0.0001). NOTE: the table geom has priority=20, "
+             "higher than the book's (unset/0), so MuJoCo uses the "
+             "higher-priority geom's friction verbatim for book-table "
+             "contact -- --book-friction alone will NOT reduce book-table "
+             "sliding friction; this is the flag that actually does. Works "
+             "on both the full arm and the floating gripper. Leave unset to "
+             "keep the compiled value",
+    )
+    parser.add_argument(
+        "--bookend-solref",
+        type=float,
+        nargs=2,
+        default=None,
+        metavar=("TIME_CONSTANT_S", "DAMPING_RATIO"),
+        help="override the three bookend fixture surfaces' (wall/pivot/floor) "
+             "raw MuJoCo solref [time_constant, damping_ratio]. NOTE: these "
+             "surfaces compile at priority 10 or 20, both higher than the "
+             "fingertip pads' priority 8, so --tip-softness has NO effect on "
+             "fingertip-vs-bookend contact -- this is the flag that actually "
+             "reaches it. Works on both the full arm and the floating "
+             "gripper. Leave unset to keep the compiled per-surface value",
+    )
+    parser.add_argument(
+        "--bookend-solimp",
+        type=float,
+        nargs=5,
+        default=None,
+        metavar=("D0", "D_WIDTH", "WIDTH", "MIDPOINT", "POWER"),
+        help="override the three bookend fixture surfaces' raw MuJoCo solimp "
+             "[d0, d_width, width, midpoint, power]. See --bookend-solref for "
+             "why --tip-softness can't reach this contact. Leave unset to "
+             "keep the compiled per-surface value",
+    )
+    parser.add_argument(
+        "--bookend-friction",
+        type=float,
+        nargs=3,
+        default=None,
+        metavar=("SLIDING", "TORSIONAL", "ROLLING"),
+        help="override the three bookend fixture ROBOT-facing surfaces' "
+             "raw MuJoCo friction [sliding, torsional, rolling], replacing "
+             "their compiled (0.15, 0.003, 0.0001) -- already fairly low, "
+             "but safe to lower further: the fingertip is always actively "
+             "driven here, never passively resting under gravity the way "
+             "the book rests on book_floor, so there's no load-bearing "
+             "floor to worry about (unlike --book-fixture-friction). See "
+             "--bookend-solref for why --tip-softness can't reach this "
+             "contact. Leave unset to keep the compiled per-surface value",
+    )
+    parser.add_argument(
+        "--book-fixture-solref",
+        type=float,
+        nargs=2,
+        default=list(DEFAULT_BOOK_FIXTURE_SOLREF),
+        metavar=("TIME_CONSTANT_S", "DAMPING_RATIO"),
+        help="override the bookend fixture's BOOK-facing surfaces' (book_wall/"
+             "book_pivot/book_floor) raw MuJoCo solref [time_constant, "
+             "damping_ratio]. Defaults to the compiled (0.01, 1.0) -- i.e. "
+             "no override -- because every softer value tested has a "
+             "failure mode, and the failure gets WORSE the more carefully "
+             "you check for a safe middle ground, not better: (0.06, 2.0) "
+             "collapses gravity support outright at rest (~20m "
+             "underground, no velocity needed); (0.02, 2.0) holds at rest "
+             "but tunnels clean through book_floor at 1.0+ m/s impact "
+             "(vs. 3.0 m/s compiled) -- tempting to accept, since that "
+             "only bites an already-dropped book; but below that "
+             "threshold it doesn't fail cleanly, it WEDGES -- between 0.6 "
+             "and 0.9 m/s (an ordinary jostle/release speed, reached "
+             "easily via --scale amplifying normal hand motion, nowhere "
+             "near 'already dropped it') the book sinks 1-4m into the "
+             "floor and gets stuck there, unable to proceed at all rather "
+             "than losing one episode cleanly. Net: there is no tested "
+             "value above 0.01 that's actually usable, so this stays "
+             "compiled despite the tempting jam-force win (mean 103N -> "
+             "25N at (0.02, 2.0) on a recorded jam replay) -- "
+             "--book-fixture-solimp's width is the lever that's actually "
+             "safe. Do not raise this without re-running a velocity sweep "
+             "well below any tunneling threshold you find, specifically "
+             "checking for wedging (getting stuck mid-penetration), not "
+             "just outright collapse or tunnel-through",
+    )
+    parser.add_argument(
+        "--book-fixture-solimp",
+        type=float,
+        nargs=5,
+        default=list(DEFAULT_BOOK_FIXTURE_SOLIMP),
+        metavar=("D0", "D_WIDTH", "WIDTH", "MIDPOINT", "POWER"),
+        help="override the bookend fixture's BOOK-facing surfaces' raw "
+             "MuJoCo solimp [d0, d_width, width, midpoint, power], replacing "
+             "their compiled (0.9, 0.95, 0.001, 0.5, 2.0) -- these surfaces "
+             "don't set solimp explicitly in the MJCF, so that's MuJoCo's "
+             "own built-in default, not a hand-tuned value. Defaults to a "
+             "widened (0.85, 0.95, 0.08, 0.5, 2.0) -- width, at the "
+             "compiled 0.01s solref (see --book-fixture-solref for why "
+             "solref itself stays compiled), passed BOTH the static "
+             "60-random-book-size settle check and a dynamic drop-velocity "
+             "test with no regression at all versus the fully-compiled "
+             "baseline (both hold to 2.0 m/s, both tunnel at 3.0 m/s -- "
+             "width isn't what causes tunneling, solref is). The gain from "
+             "width alone is real but modest -- roughly 7% off the "
+             "recorded jam's mean force (103N -> 95N) -- nowhere near what "
+             "loosening solref would buy, but it doesn't trade away any "
+             "safety margin to get there. See --book-fixture-solref for "
+             "why this is a different contact than --bookend-solimp/"
+             "--tip-softness reach. Pass the compiled 0.9 0.95 0.001 0.5 "
+             "2.0 to restore the original value if this ever needs to be "
+             "undone",
+    )
+    parser.add_argument(
+        "--book-fixture-friction",
+        type=float,
+        nargs=3,
+        default=DEFAULT_BOOK_FIXTURE_FRICTION,
+        metavar=("SLIDING", "TORSIONAL", "ROLLING"),
+        help="override the bookend fixture's BOOK-facing surfaces' raw "
+             "MuJoCo friction [sliding, torsional, rolling], replacing "
+             "their compiled (0.8/0.1, 0.02, 0.0). See --book-fixture-solref "
+             "for why this is a different contact than --book-friction/"
+             "--bookend-friction reach. Left at the compiled value by "
+             "default -- lowering it (tried 0.6, safe on its own against "
+             "gravity: below ~0.5 the book slides off its own support, "
+             "1.8m sideways drift in 3s doing nothing at 0.1) turned out "
+             "to depend on --book-fixture-solref also being softened to "
+             "help at all. Against the ACTUAL shipped (compiled) solref, "
+             "the same 0.6 made the recorded jam replay WORSE (mean 102.8N "
+             "unmodified -> 132.9N at friction=0.6 alone) -- friction was "
+             "providing tangential damping that stabilizes the "
+             "multi-contact chatter when normal contact is soft; with "
+             "normal contact back at compiled stiffness, removing that "
+             "damping just makes it worse. Not a safe, portable lever on "
+             "its own; don't set this without also re-verifying against "
+             "whatever --book-fixture-solref value is actually in effect",
     )
     parser.add_argument(
         "--force-sensor-cutoff",
@@ -685,12 +925,13 @@ def main(env_class=None):
         dest="book_normal_force_limit",
         type=float,
         default=float(getattr(env_class, "default_book_normal_force_limit", 0.0)),
-        help="EXPERIMENTAL, floating gripper only. Maximum steady Cartesian "
-             "spring force (N) pressing through the fingertip-book contact "
-             "normal once contact is detected -- caps sustained wedging "
-             "instead of impact. Tangential motion is unchanged; 0 (default) "
-             "disables it. Try book_force / tool_kp for a starting deflection "
-             "budget, e.g. 18/4000 ~= 4.5mm",
+        help="EXPERIMENTAL. Maximum steady Cartesian spring force (N) "
+             "pressing through the fingertip-book contact normal once "
+             "contact is detected -- caps sustained wedging instead of "
+             "impact. Works on both the full arm and the floating gripper. "
+             "Tangential motion is unchanged; 0 (default) disables it. Try "
+             "book_force / tool_kp for a starting deflection budget, e.g. "
+             "18/4000 ~= 4.5mm",
     )
     parser.add_argument(
         "--approach-compliance-distance",
@@ -698,14 +939,18 @@ def main(env_class=None):
         type=float,
         default=0.0,
         metavar="METRES",
-        help="floating gripper only: turn on variable compliance near the "
-             "table/bookend. Above this many metres from the nearest guarded "
-             "surface, --tool-kp is used unchanged; within it, kp (and its "
-             "matching critically-damped kd) ramp linearly down to "
+        help="turn on variable compliance near the table/bookend (works on "
+             "both the full arm and the floating gripper). Above this many "
+             "metres from the nearest guarded surface, --tool-kp is used "
+             "unchanged; within it, kp (and, on the floating gripper, its "
+             "matching critically-damped kd) ramps linearly down to "
              "--approach-compliance-min-kp-ratio times tool_kp at, or below, "
              "the surface. 0 (default) disables the ramp -- current "
-             "behavior. This targets the FIRST-CONTACT impact spike that the "
-             "surface anti-windup cannot prevent (it only bounds sustained "
+             "behavior. NOTE: scope is the table/bookend allowlist only, "
+             "same as --surface-force-limit -- it does NOT slow an approach "
+             "toward the book, so it won't soften a fingertip-book impact. "
+             "This targets the FIRST-CONTACT impact spike that the surface "
+             "anti-windup cannot prevent (it only bounds sustained "
              "penetration after contact is already detected); try 0.03",
     )
     parser.add_argument(
@@ -713,10 +958,10 @@ def main(env_class=None):
         dest="approach_compliance_min_kp_ratio",
         type=float,
         default=0.2,
-        help="floating gripper only: fraction of --tool-kp used once the "
-             "tool is at or below the guarded surface, when "
-             "--approach-compliance-distance > 0. Must be in (0, 1]; "
-             "default 0.2 (i.e. 5x softer right at the surface)",
+        help="fraction of --tool-kp used once the tool is at or below the "
+             "guarded surface, when --approach-compliance-distance > 0. Must "
+             "be in (0, 1]; default 0.2 (i.e. 5x softer right at the "
+             "surface)",
     )
     parser.add_argument(
         "--approach-compliance-max-speed",
@@ -724,17 +969,16 @@ def main(env_class=None):
         type=float,
         default=0.0,
         metavar="M_PER_S",
-        help="floating gripper only: the knob that actually limits impact "
-             "energy. Requires --approach-compliance-distance > 0. Once "
-             "within that distance of a guarded surface, clamps how fast "
-             "the incoming target may move INTO the surface to this many "
-             "m/s (tangential/outward motion is unaffected). 0 (default) "
-             "disables it. The kp/kd ramp alone does NOT slow the tool down "
-             "-- a critically damped spring tracking a constant-velocity "
-             "target settles into a bigger lag at the SAME tool velocity as "
-             "kp drops, so without this the tool still hits the surface at "
-             "full --max-speed and the impact is absorbed entirely by the "
-             "raw contact solver. Try 0.03-0.05",
+        help="the knob that actually limits impact energy. Requires "
+             "--approach-compliance-distance > 0. Once within that distance "
+             "of a guarded surface, clamps how fast the incoming target may "
+             "move INTO the surface to this many m/s (tangential/outward "
+             "motion is unaffected). 0 (default) disables it. The kp ramp "
+             "alone does NOT slow the tool down -- a spring tracking a "
+             "constant-velocity target settles into a bigger lag at the "
+             "SAME tool velocity as kp drops, so without this the tool "
+             "still hits the surface at full --max-speed and the impact is "
+             "absorbed entirely by the raw contact solver. Try 0.03-0.05",
     )
     parser.add_argument("--workspace-wall-stiffness", type=float,
                         default=float(getattr(env_class, "default_device_wall_stiffness", 0.0)),
@@ -773,6 +1017,22 @@ def main(env_class=None):
                              "4x passivity margin teleop_ball's settled tuning has "
                              "(measured: tau 2 -> 4.0x and 38 mN/step of felt ripple, "
                              "tau 4 -> 2.2x and 23 mN/step)")
+    parser.add_argument("--pos-tau", type=float, default=8.0,
+                        help="time constant of a smoothing filter on the RAW DEVICE "
+                             "POSITION before it becomes the sim target, in "
+                             "MILLISECONDS (0 = raw). Distinct from --force-tau, which "
+                             "only smooths the force reflected back TO the device -- "
+                             "nothing filters the position signal FROM the device "
+                             "otherwise. This matters because --scale multiplies "
+                             "whatever tremor/noise sits on the raw device position "
+                             "(e.g. 4x here on the flipup task's default reach scale), "
+                             "so a hand that's just resting on the handle can still "
+                             "visibly jitter the manipulated object through this path, "
+                             "even with the force-side filtering already tuned. 8ms "
+                             "keeps you within about 15% of raw at the 20ms latency "
+                             "most people can't distinguish from instant (1-exp(-20/8) "
+                             "= 92%) while damping physiological tremor's typical "
+                             "8-12 Hz band")
     parser.add_argument("--max-force", type=float, default=10.0,
                         help="clamp on the handle force vector magnitude (N)")
     parser.add_argument("--damping", type=float, default=30.0,
@@ -949,22 +1209,12 @@ def main(env_class=None):
         parser.error("--surface-force-limit cannot be negative")
     if args.book_normal_force_limit < 0.0:
         parser.error("--book-normal-force-limit cannot be negative")
-    if args.book_normal_force_limit > 0.0 and not floating:
-        parser.error("--book-normal-force-limit is only supported on the floating gripper")
     if args.approach_compliance_distance < 0.0:
         parser.error("--approach-compliance-distance cannot be negative")
     if not 0.0 < args.approach_compliance_min_kp_ratio <= 1.0:
         parser.error("--approach-compliance-min-kp-ratio must be in (0, 1]")
-    if args.approach_compliance_distance > 0.0 and not floating:
-        parser.error(
-            "--approach-compliance-distance is available only for the floating gripper"
-        )
     if args.approach_compliance_max_speed < 0.0:
         parser.error("--approach-compliance-max-speed cannot be negative")
-    if args.approach_compliance_max_speed > 0.0 and not floating:
-        parser.error(
-            "--approach-compliance-max-speed is available only for the floating gripper"
-        )
     if (
         args.approach_compliance_max_speed > 0.0
         and args.approach_compliance_distance <= 0.0
@@ -994,6 +1244,8 @@ def main(env_class=None):
         parser.error("--grip-force-gain cannot be negative")
     if args.grip_force_tau < 0.0 or args.grip_force_rate < 0.0:
         parser.error("grip force tau/rate cannot be negative")
+    if args.pos_tau < 0.0:
+        parser.error("--pos-tau cannot be negative")
     if args.max_grip_force < 0.0 or args.grip_damping < 0.0:
         parser.error("grip force/damping limits cannot be negative")
     if args.collection_grip_open_force < 0.0:
@@ -1016,8 +1268,6 @@ def main(env_class=None):
         parser.error("--arm-damping must be greater than zero")
     if not 0.0 <= args.tip_softness <= 1.0:
         parser.error("--tip-softness must be in [0, 1]")
-    if not floating and not np.isclose(args.tip_softness, 0.0):
-        parser.error("--tip-softness is available only for the floating gripper")
     if not floating and args.table_solref is not None:
         parser.error("--table-solref is available only for the floating gripper")
     if not floating and args.table_solimp is not None:
@@ -1140,18 +1390,30 @@ def main(env_class=None):
         "settle_s": args.settle,
         "offscreen": (max(W, 640), max(H, 480)),
         "collision_envelope_dimensions": collision_envelope_dimensions,
+        "tip_softness": args.tip_softness,
+        "tip_softness_max_solref": args.tip_softness_max_solref,
+        "tip_softness_max_width": args.tip_softness_max_width,
+        "table_friction": args.table_friction,
+        "bookend_solref": args.bookend_solref,
+        "bookend_solimp": args.bookend_solimp,
+        "bookend_friction": args.bookend_friction,
+        "book_fixture_solref": args.book_fixture_solref,
+        "book_fixture_solimp": args.book_fixture_solimp,
+        "book_fixture_friction": args.book_fixture_friction,
+        "tip_friction": args.tip_friction,
+        "approach_compliance_distance_m": args.approach_compliance_distance,
+        "approach_compliance_min_kp_ratio": args.approach_compliance_min_kp_ratio,
+        "approach_max_speed_mps": args.approach_compliance_max_speed,
+        "book_normal_force_limit": args.book_normal_force_limit,
     }
     if floating:
-        env_kwargs["tip_softness"] = args.tip_softness
         env_kwargs["force_sensor_cutoff_hz"] = args.force_sensor_cutoff
-        env_kwargs["book_normal_force_limit"] = args.book_normal_force_limit
         env_kwargs["table_solref"] = args.table_solref
         env_kwargs["table_solimp"] = args.table_solimp
-        env_kwargs["approach_compliance_distance_m"] = args.approach_compliance_distance
-        env_kwargs["approach_compliance_min_kp_ratio"] = (
-            args.approach_compliance_min_kp_ratio
-        )
-        env_kwargs["approach_max_speed_mps"] = args.approach_compliance_max_speed
+    else:
+        env_kwargs["tool_kp_axes"] = tuple(args.tool_kp_axes)
+        env_kwargs["tool_cartesian_kd"] = tuple(args.tool_cartesian_kd)
+        env_kwargs["noslip_iterations"] = args.noslip_iterations
     if cube_lift:
         env_kwargs.update(
             {
@@ -1357,11 +1619,16 @@ def main(env_class=None):
         "grasp_max_n": 0.0,
         "table_current_n": 0.0,
         "table_max_n": 0.0,
+        "contact_max_n": 0.0,
+        "sensor_max_n": 0.0,
+        "book_contact_max_n": 0.0,
+        "fingertip_max_n": 0.0,
+        "contact_breakdown_at_peak": {},
     }
 
     def reset_force_monitor():
         for key in force_monitor:
-            force_monitor[key] = 0.0
+            force_monitor[key] = {} if key == "contact_breakdown_at_peak" else 0.0
 
     review_action = [None]
     last_dataset_frame_id = [-1]
@@ -1389,13 +1656,6 @@ def main(env_class=None):
             f"rotation {env.tool_rot_kp:.0f}/{env.tool_rot_kd:.1f} N m/rad and "
             f"N m s/rad; physical moving mass {env.gripper_mass_kg:.2f} kg, "
             f"gravity compensation {'ON' if env.gravity_compensation else 'OFF'}"
-        )
-        tip = env.tip_contact_parameters
-        print(
-            f"[contact] fingertip softness {tip['softness']:.2f}: "
-            f"time constant {1000.0 * tip['solref_time_constant_s']:.1f} ms, "
-            f"damping ratio {tip['solref_damping_ratio']:.2f}, impedance width "
-            f"{1000.0 * tip['solimp_width_m']:.1f} mm"
         )
         sensor = env.force_sensor_parameters
         if sensor["enabled"]:
@@ -1440,6 +1700,14 @@ def main(env_class=None):
         if kd_mult > 4.0:
             print(f"[arm] WARNING: {kd_mult:.1f}x is very sluggish; at 6x the tool cannot "
                   f"follow the flip arc at all (contact duty fell to 2%, the flip failed).")
+    tip = getattr(env, "tip_contact_parameters", None)
+    if tip is not None:
+        print(
+            f"[contact] fingertip softness {tip['softness']:.2f}: "
+            f"time constant {1000.0 * tip['solref_time_constant_s']:.1f} ms, "
+            f"damping ratio {tip['solref_damping_ratio']:.2f}, impedance width "
+            f"{1000.0 * tip['solimp_width_m']:.1f} mm"
+        )
     if env.surface_force_limit > 0.0:
         print(
             f"[contact] {'table' if cube_lift else 'visible table + bookend surfaces'} "
@@ -2617,6 +2885,44 @@ def main(env_class=None):
                 f"{args.surface_force_limit:.2f} N "
                 f"({'EXCEEDED' if force_monitor['table_max_n'] > args.surface_force_limit + 1e-6 else 'OK'})"
             )
+        print(
+            f"[forces] episode max contact force {force_monitor['contact_max_n']:.2f} N"
+            + (
+                f" (sensor model max {force_monitor['sensor_max_n']:.2f} N)"
+                if sensor_model_enabled
+                else ""
+            )
+        )
+        if not cube_lift and "fingertip_max_n" in force_monitor:
+            fingertip_max = force_monitor["fingertip_max_n"]
+            book_max = force_monitor["book_contact_max_n"]
+            total_max = force_monitor["contact_max_n"]
+            # These are three independently-tracked maxima, not necessarily
+            # from the same instant, so this is a diagnostic comparison, not
+            # an exact attribution/percentage of one peak.
+            print(
+                f"[forces] peak fingertip contact (any partner): "
+                f"{fingertip_max:.2f} N, of which fingertip-vs-book specifically: "
+                f"{book_max:.2f} N (peak total robot contact force was "
+                f"{total_max:.2f} N)"
+                + (
+                    "  <-- most of the reported force is NOT at the "
+                    "fingertip at all; see the breakdown below"
+                    if total_max > 1e-6 and fingertip_max < 0.5 * total_max
+                    else ""
+                )
+            )
+            breakdown = force_monitor.get("contact_breakdown_at_peak") or {}
+            if breakdown:
+                ranked = sorted(breakdown.items(), key=lambda kv: -kv[1])
+                print(
+                    "[forces] contact breakdown at the total-force peak "
+                    f"(what was touching what, {total_max:.2f} N total):"
+                )
+                for key, magnitude in ranked:
+                    if magnitude < 0.05:
+                        continue
+                    print(f"[forces]   {magnitude:6.2f} N  {key}")
         print("[dataset] click KEEP or DELETE in the viewer (keyboard: K or D)")
         return True
 
@@ -2742,6 +3048,13 @@ def main(env_class=None):
     period = 1.0 / args.control_freq
     MAX_CATCHUP = 16
     state = {"pos": home.copy(), "gripper": args.device_grip_open}
+    # One-pole low-pass on the raw device position, applied BEFORE --scale
+    # amplifies whatever tremor/noise it carries (see --pos-tau's help).
+    # alpha=1.0 (args.pos_tau<=0) reduces this to filtered_pos == raw pos,
+    # i.e. today's unfiltered behavior.
+    pos_tau_s = args.pos_tau / 1000.0
+    pos_alpha = 1.0 if pos_tau_s <= 0.0 else 1.0 - np.exp(-period / pos_tau_s)
+    filtered_pos = state["pos"].copy()
     gripper_command = float(getattr(env, "gripper_open_command", 0.0))
     dry_gripper_command = [gripper_command]
 
@@ -2967,6 +3280,14 @@ def main(env_class=None):
 
             if device is not None:
                 state = device.get_state()
+                # Smooth the raw device position before --scale amplifies
+                # whatever tremor/noise it carries (see --pos-tau's help).
+                # Updated unconditionally, even while idle/held-at-home, so
+                # it doesn't go stale and produce a jump once active control
+                # resumes.
+                filtered_pos = filtered_pos + pos_alpha * (
+                    np.asarray(state["pos"], dtype=float) - filtered_pos
+                )
                 # This is the force the independent haptic servo actually sent,
                 # not merely the latest simulator request.
                 sent[0] = np.asarray(state["force_cmd"], dtype=float)
@@ -2990,7 +3311,7 @@ def main(env_class=None):
                         gripper_command = env.gripper_open_command
                 else:
                     # absolute, unclamped: handle offset from home -> tool world target
-                    commanded = env.tool_home + pos_map @ ((state["pos"] - home) * scale)
+                    commanded = env.tool_home + pos_map @ ((filtered_pos - home) * scale)
                     if cube_lift:
                         gripper_command = map_device_gripper(state["gripper"])
                 if args.enable_rotation and not (
@@ -3052,6 +3373,31 @@ def main(env_class=None):
                     else contact
                 )
                 publish_haptic_force(contact)
+                contact_norm = float(np.linalg.norm(contact))
+                if contact_norm > force_monitor["contact_max_n"]:
+                    force_monitor["contact_max_n"] = contact_norm
+                    # Snapshot what's actually touching what at the new peak,
+                    # not just the aggregate magnitude -- see contact_breakdown's
+                    # docstring. Cheap: only recomputed when a new peak occurs,
+                    # not every tick.
+                    if not cube_lift and hasattr(env, "contact_breakdown"):
+                        force_monitor["contact_breakdown_at_peak"] = {
+                            k: float(np.linalg.norm(v))
+                            for k, v in env.contact_breakdown().items()
+                        }
+                force_monitor["sensor_max_n"] = max(
+                    force_monitor["sensor_max_n"], float(np.linalg.norm(sensor_force))
+                )
+                if not cube_lift and hasattr(env, "book_contact_force"):
+                    force_monitor["book_contact_max_n"] = max(
+                        force_monitor["book_contact_max_n"],
+                        float(np.linalg.norm(env.book_contact_force())),
+                    )
+                if not cube_lift and hasattr(env, "fingertip_contact_force"):
+                    force_monitor["fingertip_max_n"] = max(
+                        force_monitor["fingertip_max_n"],
+                        float(np.linalg.norm(env.fingertip_contact_force())),
+                    )
                 grasp_force = env.grasp_force() if cube_lift else 0.0
                 table_force = env.table_contact_force() if cube_lift else 0.0
                 if cube_lift:

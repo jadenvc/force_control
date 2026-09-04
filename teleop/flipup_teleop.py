@@ -81,6 +81,60 @@ from flipup.physical_properties import (  # noqa: E402
 # softening it breaks the task (see the module docstring). Rotational impedance
 # is tuned separately for wrist teleoperation.
 DEFAULT_TOOL_KP = 16000.0
+# Calibrated against the recorded book-pivot/book-floor jam (see
+# _configure_book_fixture_contact's docstring). Softening solref's time
+# constant past the compiled 0.01s does cut the sustained jam force a lot
+# (mean 103N compiled -> 25N at (0.02, 2.0) stacked with the widened
+# solimp below, on the recorded jam replay) -- but every softer value
+# tested has an unacceptable failure mode, and the failure gets WORSE, not
+# better, the more carefully you look for a middle ground:
+#
+# - (0.06, 2.0) collapses gravity support outright at REST, no velocity
+#   needed -- sends the book ~20m underground during the settle window.
+# - (0.02, 2.0) holds at rest, but tunnels the book clean through
+#   book_floor at 1.0+ m/s of impact velocity (a hard drop/bounce).
+# - The real deal-breaker: below that full-tunnel threshold, (0.02, 2.0)
+#   doesn't fail cleanly -- it WEDGES. At 0.6-0.9 m/s (an ordinary
+#   jostle/release speed reached easily via --scale amplifying normal
+#   hand motion, nowhere near "already dropped it") the book sinks 1-4m
+#   into the floor and gets stuck there rather than tunneling through or
+#   bouncing back, leaving the task physically unable to proceed at all --
+#   not a lost episode, a stuck one. That's strictly worse than the
+#   original jam-force chatter this was meant to fix.
+#
+# Net: there's no tested value above 0.01 that's actually usable, so
+# solref stays at the compiled default -- the jam-force win isn't safely
+# reachable through this lever. book_fixture_solimp's width and
+# book_fixture_friction (below) are the two levers that ARE independently
+# safe and still worth using.
+DEFAULT_BOOK_FIXTURE_SOLREF = (0.01, 1.0)
+# Gravity-safe across 60 random book sizes stacked with this solref value
+# (see _configure_book_fixture_contact's docstring for the (0.03, 2.0)
+# combination that wasn't safe).
+DEFAULT_BOOK_FIXTURE_SOLIMP = (0.85, 0.95, 0.08, 0.5, 2.0)
+# Sliding friction on book_wall/pivot/floor was tried as a lever too, and
+# rejected for a subtler reason than the other two: it's not independently
+# safe/beneficial, its effect flips sign depending on book_fixture_solref.
+#
+# Measured at the (now-abandoned) softened solref=(0.02, 2.0): lowering
+# friction cut jam-force chatter cleanly, but going low enough to matter
+# (down toward 0.1) also let the book slide off its own support under
+# gravity -- these surfaces hold the book at an angle, so friction is
+# partly load-bearing, not just drag (0.1 drifted the book 1.8m sideways
+# in 3s of doing nothing; random-book-size settle failed 14/30). A safe
+# floor around 0.5-0.6 still looked like a real, if modest, win in that
+# context.
+#
+# But re-checked against the ACTUAL shipped solref (compiled 0.01, not
+# 0.02 -- see book_fixture_solref's comment for why that changed), the
+# same 0.6 friction value made the recorded jam replay WORSE, not better
+# (mean 102.8N unmodified -> 132.9N at friction=0.6 alone). Friction was
+# apparently providing tangential damping that helps stabilize the
+# multi-contact chatter specifically when the normal contact is already
+# soft; with the normal contact back at compiled stiffness, removing that
+# damping just makes the chatter worse. Net: not a safe, portable lever on
+# its own -- left at the compiled value.
+DEFAULT_BOOK_FIXTURE_FRICTION = None
 DEFAULT_TOOL_ROT_KP = 3000.0
 # Critical-ish Cartesian angular damping for the measured home-pose rotational
 # inertia (mean effective inertia 0.70 kg m^2 gives 2*sqrt(kp*I) ~= 91).
@@ -117,6 +171,20 @@ DEFAULT_FORCE_CLIP = 200.0
 DEFAULT_TOOL_FORCE_LIMIT = 0.0
 DEFAULT_SURFACE_FORCE_LIMIT = 80.0
 DEFAULT_PAD_TIME_CONSTANT = 0.010
+
+# Fingertip-pad geom names as compiled on the full arm: the WSG50 mjcf is
+# attached under the UR5e's own tree, so every gripper element (including the
+# tip pads) is double-prefixed relative to the floating gripper's unprefixed
+# "wsg50/..." names -- see FloatingFlipUpTeleop.TIP_CONTACT_GEOM_NAMES.
+ARM_TIP_CONTACT_GEOM_NAMES = (
+    "ur5e/wsg50/right_tip_pad",
+    "ur5e/wsg50/left_tip_pad",
+)
+# Same softened-contact endpoint used by the floating gripper's tip_softness
+# knob (see floating_flipup_teleop.py); duplicated here rather than imported
+# since FloatingFlipUpTeleop already imports from this module, not vice versa.
+SOFT_TIP_SOLREF = (0.020, 2.0)
+SOFT_TIP_SOLIMP_WIDTH = 0.005
 
 # Teleoperation keeps the fixture in the better-conditioned placement used by
 # the earlier Force Dimension setup.  The floating controller does not need the
@@ -347,6 +415,7 @@ class FlipUpTeleop(FlipUpEnv):
     """FlipUp with a Cartesian-position interface and contact-force readout."""
 
     controller_kind = "joint_arm"
+    default_tip_softness = 0.0
 
     def __init__(
         self,
@@ -366,7 +435,92 @@ class FlipUpTeleop(FlipUpEnv):
         settle_speed=0.25,
         offscreen=(1024, 768),
         collision_envelope_dimensions=None,
+        tip_softness=0.0,
+        table_friction=None,
+        approach_compliance_distance_m=0.0,
+        approach_compliance_min_kp_ratio=0.2,
+        approach_max_speed_mps=0.0,
+        book_normal_force_limit=0.0,
+        tip_softness_max_solref=None,
+        tip_softness_max_width=None,
+        bookend_solref=None,
+        bookend_solimp=None,
+        bookend_friction=None,
+        book_fixture_solref=None,
+        book_fixture_solimp=None,
+        book_fixture_friction=None,
+        tip_friction=None,
+        tool_kp_axes=(1.0, 1.0, 1.0),
+        tool_cartesian_kd=(0.0, 0.0, 0.0),
+        noslip_iterations=0,
     ):
+        if tip_softness_max_solref is not None and len(tip_softness_max_solref) != 2:
+            raise ValueError(
+                "tip_softness_max_solref must have exactly 2 values "
+                "(time_constant, damping_ratio)"
+            )
+        if bookend_solref is not None and len(bookend_solref) != 2:
+            raise ValueError(
+                "bookend_solref must have exactly 2 values (time_constant, "
+                "damping_ratio)"
+            )
+        if bookend_solimp is not None and len(bookend_solimp) != 5:
+            raise ValueError(
+                "bookend_solimp must have exactly 5 values (d0, d_width, "
+                "width, midpoint, power)"
+            )
+        if bookend_friction is not None and len(bookend_friction) != 3:
+            raise ValueError(
+                "bookend_friction must have exactly 3 values (sliding, "
+                "torsional, rolling)"
+            )
+        if book_fixture_solref is not None and len(book_fixture_solref) != 2:
+            raise ValueError(
+                "book_fixture_solref must have exactly 2 values "
+                "(time_constant, damping_ratio)"
+            )
+        if book_fixture_solimp is not None and len(book_fixture_solimp) != 5:
+            raise ValueError(
+                "book_fixture_solimp must have exactly 5 values (d0, "
+                "d_width, width, midpoint, power)"
+            )
+        if book_fixture_friction is not None and len(book_fixture_friction) != 3:
+            raise ValueError(
+                "book_fixture_friction must have exactly 3 values (sliding, "
+                "torsional, rolling)"
+            )
+        if tip_friction is not None and len(tip_friction) != 3:
+            raise ValueError(
+                "tip_friction must have exactly 3 values (sliding, "
+                "torsional, rolling)"
+            )
+        if len(tool_kp_axes) != 3:
+            raise ValueError(
+                "tool_kp_axes must have exactly 3 values -- per-axis "
+                "WORLD-frame multipliers on tool_kp, (1,1,1) is the "
+                "original isotropic behavior"
+            )
+        if any(float(v) <= 0.0 for v in tool_kp_axes):
+            raise ValueError("tool_kp_axes values must be positive")
+        if len(tool_cartesian_kd) != 3:
+            raise ValueError(
+                "tool_cartesian_kd must have exactly 3 values (WORLD xyz "
+                "translational Cartesian damping, N/(m/s)) -- (0,0,0) is "
+                "the original behavior (translation damping came only from "
+                "the fixed joint-space term, task_space_kd)"
+            )
+        if any(float(v) < 0.0 for v in tool_cartesian_kd):
+            raise ValueError("tool_cartesian_kd values cannot be negative")
+        if int(noslip_iterations) < 0:
+            raise ValueError("noslip_iterations cannot be negative")
+        if float(approach_compliance_distance_m) < 0.0:
+            raise ValueError("approach_compliance_distance_m cannot be negative")
+        if not 0.0 < float(approach_compliance_min_kp_ratio) <= 1.0:
+            raise ValueError("approach_compliance_min_kp_ratio must be in (0, 1]")
+        if float(approach_max_speed_mps) < 0.0:
+            raise ValueError("approach_max_speed_mps cannot be negative")
+        if float(book_normal_force_limit) < 0.0:
+            raise ValueError("book_normal_force_limit cannot be negative")
         if physical_properties is None:
             physical_properties = (
                 sample_physical_properties(seed)
@@ -380,6 +534,25 @@ class FlipUpTeleop(FlipUpEnv):
         self.physical_properties = physical_properties
         self.scene = flipup_scene(seed, physical_properties, standoff=standoff)
         self.tool_kp = float(tool_kp)
+        # Per-WORLD-axis multiplier on tool_kp, applied only to
+        # task_space_kp's Cartesian translational diagonal (see
+        # _compute_effective_translation_kp). Every OTHER formula that uses
+        # tool_kp -- surface_force_limit/book_normal_force_limit deflection
+        # caps, limited_target's force-squash, the "estimated" force source
+        # -- keeps using the plain scalar self.tool_kp unmodified. That is
+        # an approximation once tool_kp_axes is anisotropic (those formulas
+        # implicitly assume the isotropic tool_kp*err relationship), not a
+        # fully-general per-axis correction -- acceptable because those
+        # limits are fail-safes, not the primary control law, and this
+        # keeps the (default, isotropic) behavior of everything else in
+        # this class byte-identical to before this parameter existed.
+        self.tool_kp_axes = np.asarray(tool_kp_axes, dtype=float)
+        # WORLD-frame translational Cartesian damping (N/(m/s)), i.e. the
+        # missing D in task_space_cartesian_kd's F=K*e-D*xdot law -- see
+        # that attribute's construction below. (0,0,0) preserves the
+        # original behavior, where all translational damping came from the
+        # fixed joint-space task_space_kd term instead.
+        self.tool_cartesian_kd = np.asarray(tool_cartesian_kd, dtype=float)
         self.tool_rot_kp = float(tool_rot_kp)
         self.tool_rot_kd = float(tool_rot_kd)
         self.force_clip = float(force_clip)
@@ -411,6 +584,65 @@ class FlipUpTeleop(FlipUpEnv):
             collision_envelope_dimensions=collision_envelope_dimensions,
         )
         self.physical_properties = physical_properties
+
+        if not 0.0 <= float(tip_softness) <= 1.0:
+            raise ValueError("tip_softness must be in [0, 1]")
+        self.tip_softness = float(tip_softness)
+        self.tip_softness_max_solref = (
+            SOFT_TIP_SOLREF
+            if tip_softness_max_solref is None
+            else tuple(float(v) for v in tip_softness_max_solref)
+        )
+        self.tip_softness_max_width = (
+            SOFT_TIP_SOLIMP_WIDTH
+            if tip_softness_max_width is None
+            else float(tip_softness_max_width)
+        )
+        self.tip_contact_geom_ids = np.array(
+            [self.model.geom(name).id for name in ARM_TIP_CONTACT_GEOM_NAMES],
+            dtype=np.int32,
+        )
+        self.tip_friction = (
+            None if tip_friction is None else tuple(float(v) for v in tip_friction)
+        )
+        self._configure_tip_contact()
+        if table_friction is not None and len(table_friction) != 3:
+            raise ValueError(
+                "table_friction must have exactly 3 values (sliding, "
+                "torsional, rolling), matching MuJoCo's geom_friction convention"
+            )
+        self.table_friction = (
+            None if table_friction is None else tuple(float(v) for v in table_friction)
+        )
+        self._configure_table_friction()
+        self.bookend_solref = (
+            None if bookend_solref is None else tuple(float(v) for v in bookend_solref)
+        )
+        self.bookend_solimp = (
+            None if bookend_solimp is None else tuple(float(v) for v in bookend_solimp)
+        )
+        self.bookend_friction = (
+            None
+            if bookend_friction is None
+            else tuple(float(v) for v in bookend_friction)
+        )
+        self._configure_bookend_contact()
+        self.book_fixture_solref = (
+            None
+            if book_fixture_solref is None
+            else tuple(float(v) for v in book_fixture_solref)
+        )
+        self.book_fixture_solimp = (
+            None
+            if book_fixture_solimp is None
+            else tuple(float(v) for v in book_fixture_solimp)
+        )
+        self.book_fixture_friction = (
+            None
+            if book_fixture_friction is None
+            else tuple(float(v) for v in book_fixture_friction)
+        )
+        self._configure_book_fixture_contact()
 
         # Runtime book randomization keeps the compiled topology fixed, which
         # lets the camera/render thread and the recorder remain valid across
@@ -458,17 +690,31 @@ class FlipUpTeleop(FlipUpEnv):
         ).copy()
         self._compiled_bvh_aabb = np.asarray(self.model.bvh_aabb, dtype=float).copy()
 
+        # Off (0) by compiled default. MuJoCo's main constraint solver
+        # (iterations=100 here) converges the overall contact/friction
+        # problem, but with multiple simultaneous near-redundant contacts
+        # (compiled contact_count is 3-5 during a real flip: fingertip
+        # pads against the book plus 1-2 bookend surfaces at once) its
+        # friction-force split across them isn't uniquely determined and
+        # can still wobble step to step even though the TOTAL is converged
+        # -- this shows up as near-Nyquist-frequency noise in the summed
+        # contact wrench specifically, not in ncon/dropouts. noslip_iterations
+        # runs MuJoCo's separate post-pass aimed exactly at this: refining
+        # the friction split under the already-solved normal forces. Untested
+        # against a real flip in this repo as of writing -- exposed here so
+        # it can be tried live rather than guessed at.
+        self.model.opt.noslip_iterations = int(noslip_iterations)
+
         self.task_space_kp = np.diag(
-            [self.tool_kp] * 3 + [self.tool_rot_kp] * 3
+            list(self.tool_kp * self.tool_kp_axes) + [self.tool_rot_kp] * 3
         ).astype(float)
         self.task_space_kd = (
             DEFAULT_JOINT_KD * DEFAULT_ARM_DAMPING if joint_kd is None
             else np.broadcast_to(np.asarray(joint_kd, dtype=float), (6,)).copy()
         )
-        self.task_space_cartesian_kd = np.array(
-            [0.0, 0.0, 0.0] + [self.tool_rot_kd] * 3,
-            dtype=float,
-        )
+        self.task_space_cartesian_kd = np.concatenate(
+            [self.tool_cartesian_kd, [self.tool_rot_kd] * 3]
+        ).astype(float)
 
         # Bodies belonging to the robot (arm + gripper + wrist camera): every
         # body whose kinematic root is the UR5e's. Contacts with exactly one
@@ -480,6 +726,16 @@ class FlipUpTeleop(FlipUpEnv):
         )
         self._contact_buf = np.zeros(6, dtype=float)
         self._init_surface_safety()
+        self.book_force_limit = float(book_normal_force_limit)
+        self._init_book_safety()
+        self.approach_compliance_distance_m = float(approach_compliance_distance_m)
+        self.approach_compliance_min_kp_ratio = float(approach_compliance_min_kp_ratio)
+        self._approach_compliance_enabled = self.approach_compliance_distance_m > 0.0
+        self.approach_max_speed_mps = float(approach_max_speed_mps)
+        # Recomputed every step in step(); the pre-step defaults below only
+        # matter for code that reads them before the first step() call.
+        # A 3-vector (WORLD xyz) since tool_kp_axes.
+        self._effective_translation_kp = self.tool_kp * self.tool_kp_axes
 
         self.wrist_force_adr = None
         self.wrist_torque_adr = None
@@ -700,6 +956,111 @@ class FlipUpTeleop(FlipUpEnv):
             )
         raise ValueError(f"unknown wrench frame {frame!r}")
 
+    def book_contact_force(self):
+        """Net contact force between the fingertip pads and book, world axes (N).
+
+        Unlike ``contact_force``/``contact_wrench``, which sum over EVERY
+        contact where one side is a robot body -- an arm link, the gripper
+        base, or the wrist camera mount brushing the table/bookend/book all
+        count identically -- this isolates specifically the fingertip-pad vs.
+        book contact pair, using the same geom filter ``_active_book_normal``
+        uses for the anti-windup latch. Use this to check whether a reported
+        ``contact_force()``/``force_monitor["contact_max_n"]`` spike is
+        genuinely the fingertip touching the book, or an unrelated contact
+        elsewhere on the robot being summed into the same total: if this
+        number is much smaller than ``contact_force()`` at the same instant,
+        the reported force is not coming from the fingertip.
+        """
+        tip_ids = frozenset(int(g) for g in self.tip_contact_geom_ids)
+        book_id = int(self.book_collision_geom_id)
+        force = np.zeros(3)
+        for i in range(self.data.ncon):
+            contact = self.data.contact[i]
+            g1, g2 = int(contact.geom1), int(contact.geom2)
+            if g1 == book_id and g2 in tip_ids:
+                tip_is_geom2 = True
+            elif g2 == book_id and g1 in tip_ids:
+                tip_is_geom2 = False
+            else:
+                continue
+            mujoco.mj_contactForce(self.model.ptr, self.data.ptr, i, self._contact_buf)
+            contact_to_world = np.asarray(contact.frame).reshape(3, 3).T
+            contact_force_vec = contact_to_world @ self._contact_buf[:3]
+            # mj_contactForce reports the wrench acting on geom2's body; flip
+            # when the tip pad is geom1, matching contact_force's convention
+            # of "force the world applies to the robot" (see that docstring).
+            if not tip_is_geom2:
+                contact_force_vec = -contact_force_vec
+            force += contact_force_vec
+        return force
+
+    def fingertip_contact_force(self):
+        """Net contact force ON the fingertip pads, from ANY contact partner.
+
+        Broader than ``book_contact_force``: a fingertip pressed against the
+        table or a bookend surface (not just the book) is still force on the
+        fingertip, and this includes it. Use this instead of
+        ``book_contact_force`` when the question is "is this force actually
+        at the fingertip at all", not specifically "is it the book".
+        """
+        tip_ids = frozenset(int(g) for g in self.tip_contact_geom_ids)
+        force = np.zeros(3)
+        for i in range(self.data.ncon):
+            contact = self.data.contact[i]
+            g1, g2 = int(contact.geom1), int(contact.geom2)
+            if g1 in tip_ids:
+                tip_is_geom2 = False
+            elif g2 in tip_ids:
+                tip_is_geom2 = True
+            else:
+                continue
+            mujoco.mj_contactForce(self.model.ptr, self.data.ptr, i, self._contact_buf)
+            contact_to_world = np.asarray(contact.frame).reshape(3, 3).T
+            contact_force_vec = contact_to_world @ self._contact_buf[:3]
+            if not tip_is_geom2:
+                contact_force_vec = -contact_force_vec
+            force += contact_force_vec
+        return force
+
+    def contact_breakdown(self):
+        """Per-contact-pair decomposition of what ``contact_wrench`` sums.
+
+        Returns ``{"<robot geom> vs <other geom>": force_vector_N, ...}`` for
+        every currently active robot/non-robot contact, world-frame force,
+        signed so it's the force ON the robot side (matching
+        ``contact_force``'s convention). This is the tool for actually
+        answering "what is producing this number" instead of guessing: sum
+        the values whose key starts with a fingertip pad name to reproduce
+        ``fingertip_contact_force()``, and everything else is exactly what
+        else is loaded and by how much.
+        """
+        tip_ids = frozenset(int(g) for g in self.tip_contact_geom_ids)
+        breakdown = {}
+        for i in range(self.data.ncon):
+            contact = self.data.contact[i]
+            g1, g2 = int(contact.geom1), int(contact.geom2)
+            robot1 = int(self.model.geom_bodyid[g1]) in self._robot_bodies
+            robot2 = int(self.model.geom_bodyid[g2]) in self._robot_bodies
+            if robot1 == robot2:
+                continue
+            robot_geom, other_geom = (g2, g1) if robot2 else (g1, g2)
+            mujoco.mj_contactForce(self.model.ptr, self.data.ptr, i, self._contact_buf)
+            contact_to_world = np.asarray(contact.frame).reshape(3, 3).T
+            force = contact_to_world @ self._contact_buf[:3]
+            if not robot2:
+                force = -force
+            robot_name = (
+                mujoco.mj_id2name(self.model.ptr, mujoco.mjtObj.mjOBJ_GEOM, robot_geom)
+                or f"geom{robot_geom}"
+            )
+            other_name = (
+                mujoco.mj_id2name(self.model.ptr, mujoco.mjtObj.mjOBJ_GEOM, other_geom)
+                or f"geom{other_geom}"
+            )
+            key = f"{robot_name} vs {other_name}"
+            breakdown[key] = breakdown.get(key, np.zeros(3)) + force
+        return breakdown
+
     def wrist_wrench_raw(self):
         """Untared MuJoCo wrist F/T output in the sensor site's local frame."""
         if self.wrist_force_adr is None or self.wrist_torque_adr is None:
@@ -786,6 +1147,262 @@ class FlipUpTeleop(FlipUpEnv):
             force = force * (self.force_clip / magnitude)
         return force
 
+    # ------------------------------------------------------------ tip contact
+    def _configure_tip_contact(self):
+        """Interpolate only the two fingertip pads toward a softer contact.
+
+        A zero knob leaves the compiled XML values untouched. At one, the
+        original 10 ms / damping-ratio 1 / 3 mm contact becomes
+        ``tip_softness_max_solref``/``tip_softness_max_width`` (default
+        ``SOFT_TIP_SOLREF``/``SOFT_TIP_SOLIMP_WIDTH``, the originally-tested
+        20 ms / damping-ratio 2 / 5 mm endpoint). Intermediate values are
+        linear. Per the sanding teleop task's investigation
+        (SANDING_JITTER_FIX_SUMMARY.md): a longer solref time constant
+        lowers the contact's effective bandwidth at DC, not just at the
+        onset transient -- so pushing the ceiling past the originally-tested
+        endpoint via ``--tip-softness-max-solref`` can reduce *sustained*
+        wedging force too, not only impact sharpness, at the cost of some
+        genuine steady-state force-sensitivity (this tradeoff is the whole
+        point here, unlike sanding where it was an unwanted side effect).
+        Mirrors FloatingFlipUpTeleop._configure_tip_contact, duplicated
+        rather than shared since the two classes resolve different
+        (differently-prefixed) geom names and don't otherwise share a
+        constructor path.
+
+        ``tip_friction`` is a separate, independent override (like
+        ``bookend_friction`` is to ``bookend_solref``/``bookend_solimp``):
+        it replaces the tip pads' compiled friction ``(1.2, 0.01, 0.0005)``
+        -- notably high, and the ONE friction value that's actually
+        reachable for fingertip-vs-book contact without any priority
+        workaround, since the tip pads' priority (8) already wins over the
+        book's (unset/0). Unlike ``book_fixture_friction``, there's no
+        known load-bearing safety floor here: the fingertip is always
+        actively driven by the task-space controller, never passively
+        resting under gravity the way the book rests on book_floor, so
+        lowering this doesn't risk anything sliding off under its own
+        weight -- it only changes how much the fingertip grips/drags
+        against the book's surface while sliding.
+        """
+        base_solref = np.asarray(
+            self.model.geom_solref[self.tip_contact_geom_ids], dtype=float
+        ).copy()
+        base_width = np.asarray(
+            self.model.geom_solimp[self.tip_contact_geom_ids, 2], dtype=float
+        ).copy()
+        softness = self.tip_softness
+        if softness > 0.0:
+            target_solref = np.broadcast_to(
+                np.asarray(self.tip_softness_max_solref, dtype=float), base_solref.shape
+            )
+            self.model.geom_solref[self.tip_contact_geom_ids] = (
+                (1.0 - softness) * base_solref + softness * target_solref
+            )
+            self.model.geom_solimp[self.tip_contact_geom_ids, 2] = (
+                (1.0 - softness) * base_width
+                + softness * self.tip_softness_max_width
+            )
+        if self.tip_friction is not None:
+            self.model.geom_friction[self.tip_contact_geom_ids] = self.tip_friction
+
+        resolved_solref = np.asarray(
+            self.model.geom_solref[self.tip_contact_geom_ids], dtype=float
+        )
+        resolved_width = np.asarray(
+            self.model.geom_solimp[self.tip_contact_geom_ids, 2], dtype=float
+        )
+        resolved_friction = np.asarray(
+            self.model.geom_friction[self.tip_contact_geom_ids], dtype=float
+        )
+        self.tip_contact_parameters = {
+            "softness": softness,
+            "geom_names": list(ARM_TIP_CONTACT_GEOM_NAMES),
+            "solref_time_constant_s": float(resolved_solref[0, 0]),
+            "solref_damping_ratio": float(resolved_solref[0, 1]),
+            "solimp_width_m": float(resolved_width[0]),
+            "friction": resolved_friction[0].tolist(),
+        }
+
+    def _configure_bookend_contact(self):
+        """Optionally override the bookend fixture surfaces' raw contact.
+
+        The three bookend surfaces the robot can touch --
+        ``robot_wall_surface``/``robot_pivot_surface``/``robot_floor_surface``
+        -- compile at MuJoCo priority 10 or 20, both higher than the
+        fingertip pads' priority 8. Since MuJoCo takes contact parameters
+        from the higher-priority geom verbatim (not blended), this means
+        ``--tip-softness`` has NO effect on fingertip-vs-bookend contact --
+        same silent-scope gap the sanding task's ``--pad-softness`` bug
+        exposed (there it was an unintended no-op; here it's simply outside
+        ``--tip-softness``'s documented scope, which only ever covered the
+        book). This is the lever that actually reaches bookend contact.
+        Mirrors ``_configure_table_friction``/(floating's)
+        ``_configure_table_contact``. Any of the three params may be left
+        ``None`` to keep the compiled per-surface defaults.
+        """
+        names = (
+            "bookend2_blender/robot_wall_surface",
+            "bookend2_blender/robot_pivot_surface",
+            "bookend2_blender/robot_floor_surface",
+        )
+        geom_ids = [self.model.geom(name).id for name in names]
+        for geom_id in geom_ids:
+            if self.bookend_solref is not None:
+                self.model.geom_solref[geom_id] = self.bookend_solref
+            if self.bookend_solimp is not None:
+                self.model.geom_solimp[geom_id] = self.bookend_solimp
+            if self.bookend_friction is not None:
+                self.model.geom_friction[geom_id] = self.bookend_friction
+        self.bookend_contact_parameters = {
+            "geom_names": list(names),
+            "solref": [
+                np.asarray(self.model.geom_solref[g], dtype=float).tolist()
+                for g in geom_ids
+            ],
+            "solimp": [
+                np.asarray(self.model.geom_solimp[g], dtype=float).tolist()
+                for g in geom_ids
+            ],
+            "friction": [
+                np.asarray(self.model.geom_friction[g], dtype=float).tolist()
+                for g in geom_ids
+            ],
+        }
+
+    def _configure_book_fixture_contact(self):
+        """Optionally override the bookend fixture's BOOK-facing surfaces.
+
+        Distinct from ``_configure_bookend_contact``: that method softens
+        ``robot_wall_surface``/``robot_pivot_surface``/``robot_floor_surface``
+        (priority=20), the surfaces the *fingertip* touches. This method
+        targets ``book_wall``/``book_pivot``/``book_floor`` (priority=10),
+        the surfaces the *book itself* swings into as it approaches the
+        fixture -- e.g. near the top of a flip, when the book's edge nears
+        vertical and can contact multiple fixture surfaces within a few ms.
+
+        These compile stiff (``solref=(0.01, 1.0)``, i.e. a 10ms time
+        constant, the same order as the un-softened contact that caused the
+        original sanding-task oscillation) and were not reachable by any
+        prior flag: ``--book-friction`` writes onto the book geom itself,
+        which is priority 0/unset and so loses to these priority-10 surfaces
+        for book-vs-fixture contact, the same silent-scope gap
+        ``--bookend-solref`` was added to close for fingertip-vs-fixture
+        contact. A multi-contact impact here (several of these surfaces
+        engaging within 1-2 physics steps while the book still has real
+        angular velocity) produces a large transient spike that neither
+        ``--tip-softness`` nor ``--book-normal-force-limit`` can prevent --
+        the former doesn't reach this geom pair at all, and the latter only
+        throttles the *operator's target* for sustained wedging, acting too
+        slowly to catch a multi-contact impact that resolves within a
+        control tick.
+
+        DANGER, ``book_fixture_solref`` specifically: unlike the robot-facing
+        bookend surfaces (which the fingertip actively pushes on, so
+        softening them is always safe), ``book_pivot``/``book_floor``
+        passively hold the book's static weight up against gravity at rest
+        -- no active control compensates for it, and they also have to
+        arrest real dynamic impacts, not just hold a static load.
+        Lengthening solref's time constant looks like a good trade at
+        first, then gets worse the more carefully it's checked:
+
+        1. Steady-state stiffness (same mechanism as the sanding task's
+           contact tuning) -- push it far enough and the support can't
+           hold the book's weight at all; it sinks through and free-falls
+           for the rest of the settle window at REST, no velocity needed
+           ((0.06, 2.0) alone sends the book ~20m underground, matching
+           ``0.5 * g * settle_s**2``).
+        2. Tunneling under a hard impact -- (0.02, 2.0) holds at rest but
+           punches clean through book_floor at 1.0+ m/s (vs. 3.0 m/s
+           compiled). Tempting to accept, since that only bites on an
+           already-dropped book.
+        3. The actual deal-breaker, found by checking below the full-
+           tunnel threshold rather than stopping at #2: (0.02, 2.0)
+           doesn't fail cleanly at more moderate velocity, it WEDGES.
+           Between 0.6 and 0.9 m/s -- an ordinary jostle/release speed,
+           reached easily via --scale amplifying normal hand motion,
+           nowhere near "already dropped it" -- the book sinks 1-4m into
+           the floor and gets stuck there instead of tunneling through or
+           bouncing back. That doesn't cost one bad episode, it makes the
+           task physically unable to proceed at all until reset. Strictly
+           worse than the jam-force chatter this was meant to fix.
+
+        Net: there is no tested value above the compiled 0.01 that's
+        actually usable -- the jam-force win (mean 103N compiled -> 25N at
+        (0.02, 2.0) on the recorded jam replay, a real and large
+        reduction) isn't safely reachable through this lever, so solref
+        stays compiled. ``book_fixture_solimp``'s width is a smaller,
+        genuinely safe lever on its own (~7% jam-force cut, no tunneling
+        or wedging cost at all -- it matches the compiled solref's
+        behavior across every velocity tested).
+
+        ``book_fixture_friction`` was tried too and left at the compiled
+        value -- not because it lacks a safety floor of its own (it does:
+        these surfaces support the book at an angle, so sliding friction
+        is partly load-bearing, and cutting it enough to matter, ~0.1,
+        drifted the book 1.8m sideways in 3s of doing nothing and failed
+        the random-book-size settle check 14/30), but because even a
+        floor-respecting value (0.6) turned out to depend on
+        ``book_fixture_solref`` also being softened to help at all.
+        Checked against the solref value actually shipped above
+        (compiled), the same 0.6 made the recorded jam replay WORSE (mean
+        102.8N unmodified -> 132.9N at friction=0.6 alone) -- friction was
+        providing tangential damping that stabilizes the multi-contact
+        chatter specifically when normal contact is soft; with normal
+        contact back at compiled stiffness, removing that damping just
+        makes it worse. Not a safe, portable lever on its own.
+
+        Any of the three params may be left ``None`` to keep the compiled
+        per-surface defaults.
+        """
+        names = (
+            "bookend2_blender/book_wall",
+            "bookend2_blender/book_pivot",
+            "bookend2_blender/book_floor",
+        )
+        geom_ids = [self.model.geom(name).id for name in names]
+        for geom_id in geom_ids:
+            if self.book_fixture_solref is not None:
+                self.model.geom_solref[geom_id] = self.book_fixture_solref
+            if self.book_fixture_solimp is not None:
+                self.model.geom_solimp[geom_id] = self.book_fixture_solimp
+            if self.book_fixture_friction is not None:
+                self.model.geom_friction[geom_id] = self.book_fixture_friction
+        self.book_fixture_contact_parameters = {
+            "geom_names": list(names),
+            "solref": [
+                np.asarray(self.model.geom_solref[g], dtype=float).tolist()
+                for g in geom_ids
+            ],
+            "solimp": [
+                np.asarray(self.model.geom_solimp[g], dtype=float).tolist()
+                for g in geom_ids
+            ],
+            "friction": [
+                np.asarray(self.model.geom_friction[g], dtype=float).tolist()
+                for g in geom_ids
+            ],
+        }
+
+    def _configure_table_friction(self):
+        """Optionally override the visible table surface's raw friction.
+
+        MuJoCo combines two contacting geoms' friction by taking the
+        higher-priority geom's values verbatim, not an average, when
+        priorities differ. table.xml compiles the table surface at
+        priority=20; the book geom is unset (priority 0). That means the
+        TABLE's friction governs book-table sliding contact regardless of
+        --book-friction -- this is the knob that actually controls it. Left
+        at None (default), the compiled table.xml friction (0.15, 0.003,
+        0.0001) is unchanged.
+        """
+        table_geom_id = self.model.geom("table/table_surface").id
+        if self.table_friction is not None:
+            self.model.geom_friction[table_geom_id] = self.table_friction
+        self.table_friction_parameters = {
+            "friction": np.asarray(
+                self.model.geom_friction[table_geom_id], dtype=float
+            ).tolist(),
+        }
+
     # --------------------------------------------------------- surface safety
     def _init_surface_safety(self):
         names = (
@@ -796,6 +1413,29 @@ class FlipUpTeleop(FlipUpEnv):
         )
         self._surface_guard_geom_ids = frozenset(
             self.model.geom(name).id for name in names
+        )
+        # Approach-compliance (speed cap + kp ramp) additionally covers the
+        # book -- unlike _surface_guard_geom_ids, which the REACTIVE
+        # anti-windup (surface_safe_target, and on the floating gripper
+        # book_normal_safe_target) deliberately keeps book-free, since
+        # capping sustained book-normal force there would fight the task.
+        # This set only feeds the two approach-compliance geometry lookups
+        # (_nearest_guarded_surface / _nearest_guarded_surface_distance),
+        # used pre-contact to shape approach speed/stiffness, not to cap
+        # force after contact. book_collision_geom_id is resolved before
+        # this runs in both FlipUpTeleop and FloatingFlipUpTeleop.
+        #
+        # Caveat: the box-face math below assumes local +Z is the relevant
+        # outward contact normal, which is only true for the book while it's
+        # still resting near its start pose (confirmed against real data:
+        # the impact spike this targets occurs while book_angle is still
+        # ~89.5-90 deg, i.e. before any rotation). Once the flip is actually
+        # underway the book's rotating orientation means +Z no longer tracks
+        # the true contact face, so this approximation degrades through the
+        # rest of the flip -- it is deliberately scoped to the first-contact
+        # window, not a general per-instant book-normal admittance.
+        self._approach_guard_geom_ids = self._surface_guard_geom_ids | frozenset(
+            {int(self.book_collision_geom_id)}
         )
         self._surface_limit_normal = None
         self._surface_limit_boundary = None
@@ -878,6 +1518,254 @@ class FlipUpTeleop(FlipUpEnv):
             return target.copy()
         return target + (-max_deflection - normal_error) * normal
 
+    # ------------------------------------------------------ book-normal safety
+    def _init_book_safety(self):
+        """State for the opt-in fingertip-book normal anti-windup.
+
+        Separate from ``_init_surface_safety`` because the visible-surface
+        guard (table/bookend) deliberately excludes the book -- see
+        FLOATING_FLIPUP_COMPLIANCE_TELEOP.md section 10.1. Reuses
+        ``_surface_contact_grace_steps`` for the release debounce so both
+        latches release on the same ~20 ms miss window. Identical to
+        FloatingFlipUpTeleop's version of the same name; duplicated rather
+        than shared since the two classes don't otherwise share a
+        constructor path.
+        """
+        self._book_limit_normal = None
+        self._book_limit_boundary = None
+        self._book_contact_misses = 0
+
+    def _active_book_normal(self):
+        """Average outward normal of active fingertip-pad/book contacts.
+
+        Mirrors ``_active_surface_normal``'s geom-pair scan and sign
+        convention, but filters on ``tip_contact_geom_ids`` vs.
+        ``book_collision_geom_id`` instead of the table/bookend allowlist.
+        """
+        tip_ids = frozenset(int(g) for g in self.tip_contact_geom_ids)
+        book_id = int(self.book_collision_geom_id)
+        normals = []
+        for index in range(self.data.ncon):
+            contact = self.data.contact[index]
+            g1, g2 = int(contact.geom1), int(contact.geom2)
+            if g1 == book_id and g2 in tip_ids:
+                tip_is_geom2 = True
+            elif g2 == book_id and g1 in tip_ids:
+                tip_is_geom2 = False
+            else:
+                continue
+            normal = np.asarray(contact.frame, dtype=float).reshape(3, 3)[0]
+            normals.append(normal if tip_is_geom2 else -normal)
+        if not normals:
+            return None
+        normal = np.mean(normals, axis=0)
+        magnitude = np.linalg.norm(normal)
+        return None if magnitude < 1e-9 else normal / magnitude
+
+    def book_normal_safe_target(self, target_pos):
+        """Bound stored normal spring energy after fingertip-book contact.
+
+        Same latch/debounce/release state machine as ``surface_safe_target``
+        (see that docstring), applied to the book instead of the visible
+        table/bookend surfaces. Off by default: 0 disables it, matching the
+        ``surface_force_limit`` convention. Tangential motion, and any
+        table/bookend contact handled by ``surface_safe_target``, are
+        unaffected.
+        """
+        target = np.asarray(target_pos, dtype=float)
+        if self.book_force_limit <= 0.0:
+            return target.copy()
+
+        active_normal = self._active_book_normal()
+        if self._book_limit_normal is not None:
+            if active_normal is None:
+                self._book_contact_misses += 1
+                if self._book_contact_misses > self._surface_contact_grace_steps:
+                    self._book_limit_normal = None
+                    self._book_limit_boundary = None
+                    self._book_contact_misses = 0
+            else:
+                self._book_contact_misses = 0
+        if self._book_limit_normal is None and active_normal is not None:
+            if np.dot(target - self.tool_pos, active_normal) < 0.0:
+                self._book_limit_normal = active_normal
+                self._book_limit_boundary = float(
+                    np.dot(self.tool_pos, active_normal)
+                )
+                self._book_contact_misses = 0
+
+        normal = self._book_limit_normal
+        if normal is None:
+            return target.copy()
+        target_coordinate = float(np.dot(target, normal))
+        if target_coordinate >= self._book_limit_boundary:
+            self._book_limit_normal = None
+            self._book_limit_boundary = None
+            self._book_contact_misses = 0
+            return target.copy()
+
+        normal_error = float(np.dot(target - self.tool_pos, normal))
+        # Static tool_kp on purpose -- see the matching comment in
+        # surface_safe_target above.
+        max_deflection = self.book_force_limit / self.tool_kp
+        if normal_error >= -max_deflection:
+            return target.copy()
+        return target + (-max_deflection - normal_error) * normal
+
+    @property
+    def book_limit_active(self):
+        return self._book_limit_normal is not None
+
+    # ------------------------------------------------------ approach safety
+    def _nearest_guarded_surface(self, pos):
+        """(distance, outward_normal) to the closest guarded surface.
+
+        Guarded surfaces are the table/bookend/book box geoms tracked by
+        ``_approach_guard_geom_ids`` (see ``_init_surface_safety``) -- unlike
+        ``_surface_guard_geom_ids``, used by the REACTIVE anti-windup
+        (``surface_safe_target``), this set includes the book so approach
+        compliance can soften the first-contact impact. See
+        ``_init_surface_safety`` for the caveat on why the book's inclusion
+        here is only a good approximation near the book's start pose.
+        Each is assumed to be a box whose local +Z axis is its outward
+        contact normal -- true for the table and bookend fixtures modeled
+        here. Non-box guarded geoms are skipped. Returns ``(None, None)`` if
+        no guarded box geom exists yet or the allowlist contains no box
+        geoms. Distance is positive above the surface, negative if already
+        penetrating it. Identical to FloatingFlipUpTeleop's version of the
+        same name; duplicated rather than shared since the two classes don't
+        otherwise share a constructor path.
+        """
+        guard_ids = getattr(self, "_approach_guard_geom_ids", None)
+        if not guard_ids:
+            return None, None
+        pos = np.asarray(pos, dtype=float)
+        nearest_distance, nearest_normal = None, None
+        for geom_id in guard_ids:
+            if int(self.model.geom_type[geom_id]) != mujoco.mjtGeom.mjGEOM_BOX:
+                continue
+            distance, normal = self._box_face_distance(geom_id, pos)
+            if nearest_distance is None or distance < nearest_distance:
+                nearest_distance, nearest_normal = distance, normal
+        return nearest_distance, nearest_normal
+
+    def _box_face_distance(self, geom_id, pos):
+        """(distance, outward_normal) from ``pos`` to a box geom's nearest face.
+
+        Picks whichever of the box's 6 faces actually faces ``pos``, rather
+        than assuming local +Z. The table/bookend fixtures were authored so
+        local +Z is always their real exposed top face, which is why the
+        original version of this method (before the book was added to
+        ``_approach_guard_geom_ids``) hardcoded +Z. That assumption breaks
+        for the book: its orientation varies with episode randomization and
+        rotates through the flip, and was measured to have local +Z pointing
+        straight DOWN in world frame at one perfectly ordinary start pose --
+        hardcoding +Z there silently picked the book's underside as
+        "outward" and reported the tool as already penetrating it at rest.
+
+        The correct rule (standard point-to-box distance): transform ``pos``
+        into the box's local frame, and per axis compute how far the point's
+        |local coordinate| protrudes past that axis's half-extent. The axis
+        with the largest such protrusion is the face the point is furthest
+        outside of, and that protrusion IS the signed distance to that face
+        (positive outside, negative if the point is within that axis's span
+        but still outside another). An earlier version of this method picked
+        the face by raw alignment (dot of the center-to-point vector with
+        each candidate normal) instead -- that is NOT a valid nearest-face
+        rule for a point whose offset is dominated by an axis the box is
+        actually narrow along (exactly the book's case, small and off to the
+        side of the tool's home position): a large raw coordinate difference
+        along an axis can win the alignment comparison even when that axis
+        isn't the one the point is actually protruding past, producing
+        spuriously large negative "distances" unrelated to real proximity.
+        Normalizing by each axis's own half-extent (below) fixes that.
+        """
+        half_extents = np.asarray(self.model.geom_size[geom_id], dtype=float)
+        center = np.asarray(self.data.geom_xpos[geom_id], dtype=float)
+        rotation = np.asarray(self.data.geom_xmat[geom_id], dtype=float).reshape(3, 3)
+        local = rotation.T @ (pos - center)
+        excess = np.abs(local) - half_extents
+        axis = int(np.argmax(excess))
+        sign = 1.0 if local[axis] >= 0.0 else -1.0
+        normal = sign * rotation[:, axis]
+        return float(excess[axis]), normal
+
+    def _nearest_guarded_surface_distance(self, pos):
+        """Signed distance (m) from ``pos`` to the closest guarded surface.
+
+        See ``_nearest_guarded_surface`` for the sign convention and box
+        assumption.
+        """
+        distance, _ = self._nearest_guarded_surface(pos)
+        return distance
+
+    def _approach_speed_limited_target(self, target_pos):
+        """Cap how fast the incoming target may move THROUGH a guarded surface.
+
+        This is the mechanism that actually controls impact kinetic energy --
+        see FloatingFlipUpTeleop._approach_speed_limited_target's docstring
+        for why softening kp alone (below) does not. Off unless
+        ``approach_max_speed_mps > 0``. Only the component of the requested
+        step (relative to the previous drive target) pointing INTO the
+        nearest guarded surface is clamped, and only once within
+        ``approach_compliance_distance_m`` of it -- outward and tangential
+        motion, and everything outside the band, are unaffected. Scope is
+        the same table/bookend allowlist as ``surface_safe_target``: this
+        does NOT slow an approach toward the book.
+        """
+        target = np.asarray(target_pos, dtype=float)
+        if not self._approach_compliance_enabled or self.approach_max_speed_mps <= 0.0:
+            return target
+        distance, normal = self._nearest_guarded_surface(self.tool_pos)
+        if distance is None or distance > self.approach_compliance_distance_m:
+            return target
+        max_step = self.approach_max_speed_mps * float(self.model.opt.timestep)
+        delta = target - self._drive_target
+        inward = float(np.dot(delta, -normal))
+        if inward <= max_step:
+            return target
+        return self._drive_target + delta - (inward - max_step) * (-normal)
+
+    def _compute_effective_translation_kp(self, pos):
+        """Translational kp (WORLD xyz, a 3-vector), scheduled by approach
+        compliance and tool_kp_axes.
+
+        Base per-axis stiffness is ``tool_kp * tool_kp_axes`` -- (1,1,1) is
+        the original isotropic scalar behavior. Off by default
+        (``approach_compliance_distance_m == 0``), in which case this always
+        returns that base vector unchanged. When enabled, EVERY axis is
+        ramped by the same scalar ``ratio`` (distance-based only, not
+        force/axis-aware) from 1.0 at ``approach_compliance_distance_m`` (or
+        farther) above the nearest guarded surface down to
+        ``approach_compliance_min_kp_ratio`` at, or below (already
+        penetrating), the surface -- i.e. approach compliance scales
+        whatever anisotropic profile tool_kp_axes already set up, it does
+        not add its own axis-selectivity.
+
+        Unlike FloatingFlipUpTeleop's version, this does not also recompute a
+        matching kd: the arm's translational damping is a JOINT-space term
+        (``task_space_kd``, tuned against arm inertia/actuator saturation),
+        not a Cartesian velocity term derived in closed form from a moving
+        mass, so there is no equivalent closed-form kd to re-derive here.
+        Reducing kp while leaving joint damping fixed moves the system
+        toward more overdamped, not less -- this is the safe direction, so
+        leaving joint damping alone as kp ramps down does not introduce a new
+        stability risk.
+        """
+        base = self.tool_kp * self.tool_kp_axes
+        if not self._approach_compliance_enabled:
+            return base
+        distance = self._nearest_guarded_surface_distance(pos)
+        if distance is None:
+            ratio = 1.0
+        else:
+            clipped = float(np.clip(distance, 0.0, self.approach_compliance_distance_m))
+            min_ratio = self.approach_compliance_min_kp_ratio
+            ratio = min_ratio + (1.0 - min_ratio) * (
+                clipped / self.approach_compliance_distance_m
+            )
+        return ratio * base
+
     @property
     def requested_target(self):
         return self._requested_target.copy()
@@ -945,8 +1833,24 @@ class FlipUpTeleop(FlipUpEnv):
         """Advance ``n_substeps`` x 1 ms with the tool driven toward the target."""
         for _ in range(max(1, int(n_substeps))):
             self._requested_target = np.asarray(target_pos, dtype=float).copy()
+            # Schedule translational kp off the tool's CURRENT position; this
+            # only shapes tracking stiffness, not approach speed (see
+            # _approach_speed_limited_target's docstring for why that
+            # distinction matters). task_space_kp is read directly by
+            # step_task_space, so mutate it in place before calling that.
+            self._effective_translation_kp = self._compute_effective_translation_kp(
+                self.tool_pos
+            )
+            self.task_space_kp[0, 0], self.task_space_kp[1, 1], self.task_space_kp[2, 2] = (
+                self._effective_translation_kp
+            )
+            speed_limited_target = self._approach_speed_limited_target(
+                self._requested_target
+            )
             self._drive_target = self.limited_target(
-                self.surface_safe_target(self._requested_target)
+                self.book_normal_safe_target(
+                    self.surface_safe_target(speed_limited_target)
+                )
             )
             self.step_task_space(
                 self.target_pose7(self._drive_target, target_rotvec)
@@ -960,9 +1864,24 @@ class FlipUpTeleop(FlipUpEnv):
         self._surface_limit_normal = None
         self._surface_limit_boundary = None
         self._surface_contact_misses = 0
+        if hasattr(self, "_book_limit_normal"):
+            self._book_limit_normal = None
+            self._book_limit_boundary = None
+            self._book_contact_misses = 0
         self._requested_target = self.tool_home.copy()
         self._drive_target = self.tool_home.copy()
         self._wrist_tare = np.zeros(6)
+        # step() mutates task_space_kp's translational diagonal in place for
+        # the approach-compliance ramp (see _compute_effective_translation_kp)
+        # and never restores it -- without resetting it here, an episode that
+        # ends near a guarded surface (table/bookend/book) leaves the NEXT
+        # episode's settle loop below running at a softened kp, which
+        # converges weaker/slower and can inflate settle_error into spurious
+        # start-pose resample rejections.
+        self._effective_translation_kp = self.tool_kp * self.tool_kp_axes
+        self.task_space_kp[0, 0], self.task_space_kp[1, 1], self.task_space_kp[2, 2] = (
+            self._effective_translation_kp
+        )
         # Slew the target from the arm's joint home to the operator's start pose
         # instead of stepping it there: a 17 cm jump commands ~2.7 kN through a
         # 16 kN/m spring, which saturates the joints and leaves the arm 45 mm

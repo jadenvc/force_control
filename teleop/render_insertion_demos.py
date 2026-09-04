@@ -27,7 +27,9 @@ from pathlib import Path
 
 import cv2
 import imageio
+import mujoco
 import numpy as np
+from dm_control.mujoco.engine import MovableCamera
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -38,6 +40,23 @@ WIDTH = 480  # <= default MuJoCo offscreen framebuffer (600x480); see ground.xml
 SCENE_H = 360
 PANEL_H = 160
 FPS = 30
+
+# Real-time playback: control runs at 1kHz (dt=0.001s from InsertionEnv's
+# implicitfast timestep), so one video frame every 1/(FPS*dt) control steps
+# makes each captured frame span exactly one output-frame's worth of wall
+# time. The previous default (8) captured 8ms of sim time per frame but
+# displayed each at 1/30s (33.3ms) -- a ~4.2x slow-motion mismatch, which is
+# most of why the earlier videos "felt" slow (the episodes themselves run
+# faster than real time in simulation -- see render_one's timing note).
+REALTIME_RENDER_EVERY = round(1.0 / (FPS * 0.001))
+
+# Zoomed-in, hole-centered view instead of ground.xml's wide static scene
+# cameras -- lookat is set per-episode to the actual hole_entrance site
+# position (render_one), so this frames the peg/socket regardless of where
+# the fixture is mounted in the world.
+ZOOM_DISTANCE_M = 0.22
+ZOOM_AZIMUTH_DEG = -35.0
+ZOOM_ELEVATION_DEG = -25.0
 
 
 def _force_panel(force_trace: list, scale_n: float, width: int, height: int) -> np.ndarray:
@@ -79,13 +98,25 @@ def _force_panel(force_trace: list, scale_n: float, width: int, height: int) -> 
     return canvas
 
 
-def render_one(seed: int, out_path: Path, cfg: ScriptedDemoConfig, render_every: int, camera_id: int) -> dict:
+def render_one(seed: int, out_path: Path, cfg: ScriptedDemoConfig, render_every: int) -> dict:
     # Pass 1: force-only, no rendering, just to fix the force panel's scale.
     dry = run_scripted_demo(cfg=cfg, seed=seed)
     scale_n = max(5.0, float(dry.peak_force_n) * 1.15)
 
     # Pass 2: same seed, same cfg -> identical trajectory, this time capturing frames.
     env = InsertionEnv(seed=seed)
+
+    # One reused Camera object for the whole episode, not a fresh one per
+    # frame (env.physics.render() constructs+tears down a Camera every call,
+    # which measured ~30x slower than reusing a single MovableCamera --
+    # negligible at 480x360/8827 frames total either way, but free to fix).
+    # Zoom target = the actual hole_entrance site in world coordinates, read
+    # once after reset since the fixture doesn't move mid-episode.
+    hole_pos = np.asarray(env.data.site(env.hole_entrance_site_id).xpos, dtype=float).copy()
+    cam = MovableCamera(env.physics, height=SCENE_H, width=WIDTH)
+    cam.set_pose(hole_pos, ZOOM_DISTANCE_M, ZOOM_AZIMUTH_DEG, ZOOM_ELEVATION_DEG)
+    no_reflection = {mujoco.mjtRndFlag.mjRND_REFLECTION: False}
+
     running_force: list = []
     frames: list = []
     step_counter = {"i": 0}
@@ -94,7 +125,7 @@ def render_one(seed: int, out_path: Path, cfg: ScriptedDemoConfig, render_every:
         running_force.append(force_n)
         step_counter["i"] += 1
         if step_counter["i"] % render_every == 0:
-            scene = env_.physics.render(height=SCENE_H, width=WIDTH, camera_id=camera_id)
+            scene = cam.render(render_flag_overrides=no_reflection)
             panel = _force_panel(running_force, scale_n, WIDTH, PANEL_H)
             frame = np.vstack([scene, panel])
             cv2.putText(frame, f"seed={seed}  phase={phase}  t={env_.data.time:5.2f}s",
@@ -126,11 +157,10 @@ def main():
     parser.add_argument("--out-dir", default="teleop/insertion_demo_videos")
     parser.add_argument("--num-demos", type=int, default=5)
     parser.add_argument("--start-seed", type=int, default=0)
-    parser.add_argument("--render-every", type=int, default=8,
-                         help="capture 1 frame every this many control steps (control runs at 1kHz; "
-                              "8 -> 125Hz raw capture, still generous headroom over the 30fps output)")
-    parser.add_argument("--camera-id", type=int, default=0,
-                         help="fixed scene camera defined in ground.xml (0 or 1); -1 for the default free camera")
+    parser.add_argument("--render-every", type=int, default=REALTIME_RENDER_EVERY,
+                         help=f"capture 1 frame every this many control steps; default "
+                              f"{REALTIME_RENDER_EVERY} matches control-step-time*FPS so playback runs at "
+                              f"1x (episode) speed, not the ~4x slow motion the old default (8) produced")
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -142,7 +172,7 @@ def main():
         seed = args.start_seed + i
         out_path = out_dir / f"insertion_demo_seed{seed}.mp4"
         print(f"[{i + 1}/{args.num_demos}] rendering seed={seed} -> {out_path}")
-        summary = render_one(seed, out_path, cfg, args.render_every, args.camera_id)
+        summary = render_one(seed, out_path, cfg, args.render_every)
         print(f"    success={summary['success']} reason={summary['termination_reason']} "
               f"peak={summary['peak_force_n']:.1f}N mean={summary['mean_force_n']:.1f}N "
               f"std={summary['std_force_n']:.1f}N frames={summary['num_frames']}")

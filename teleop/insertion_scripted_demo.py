@@ -298,9 +298,16 @@ def run_scripted_demo(
     seed: int = 0,
     max_steps: int = 60000,
     record: bool = True,
+    frame_callback=None,
 ):
     """Run one scripted insertion episode against ``env`` (a fresh
     InsertionEnv is created if not supplied), returning a DemoResult.
+
+    ``frame_callback``, if given, is invoked as ``frame_callback(env,
+    force_n, phase)`` once per main-loop step (same cadence as the force
+    recording below) -- purely a video-rendering hook for
+    render_insertion_demos.py; it has no effect on the control/state-machine
+    logic above and is a no-op when ``record`` is False.
     """
     cfg = cfg or ScriptedDemoConfig()
     owns_env = env is None
@@ -490,6 +497,8 @@ def run_scripted_demo(
         if record:
             force_vec, _ = env.peg_contact_force()
             _record(force_vec, env.peg_tip_depth_m(), phase)
+            if frame_callback is not None:
+                frame_callback(env, float(np.linalg.norm(force_vec)), phase)
 
         if reason == "broken":
             break
@@ -502,6 +511,8 @@ def run_scripted_demo(
                 if record:
                     force_vec, _ = env.peg_contact_force()
                     _record(force_vec, env.peg_tip_depth_m(), phase)
+                    if frame_callback is not None:
+                        frame_callback(env, float(np.linalg.norm(force_vec)), phase)
             break
 
     if reason == "running":

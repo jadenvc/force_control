@@ -59,6 +59,7 @@ from collections import deque
 
 import cv2
 import numpy as np
+from scipy.spatial.transform import Rotation
 
 from insertion_teleop import (
     CONTACT_CONTROL_Z,
@@ -284,6 +285,25 @@ def build_arg_parser():
     parser.add_argument("--rot-deadzone", type=float, default=0.0,
                         help="radians of wrist rotation ignored before any peg rotation is "
                              "commanded (radial soft deadzone, not a hard jump at the boundary)")
+    parser.add_argument("--max-lead-m", type=float, default=0.010,
+                        help="admittance-style lead clamp: never let the commanded translation "
+                             "target run more than this many metres ahead of where the peg tip "
+                             "actually is, in ANY direction, at ANY time -- generalizes "
+                             "insertion_scripted_demo.py's INSERT-phase max_lead_m (there: "
+                             "0.006m, z-only, INSERT-phase-only) to the whole live teleop path. "
+                             "Bounds worst-case sustained force to roughly tool_kp*max_lead_m "
+                             "regardless of how long the peg stays jammed/wedged (e.g. wedged by "
+                             "an --enable-rotation/--peg-tilt-randomization-deg tilt in the "
+                             "fixture's tight 2mm clearance) -- found necessary from a real "
+                             "recorded episode where normal_force_n climbed 2N->48.5N in 233ms "
+                             "while the operator was pulling AWAY from a wedged peg, because "
+                             "nothing capped how far the target could drift from the stuck "
+                             "actual position. 0 disables it (unclamped, the original behavior)")
+    parser.add_argument("--max-rot-lead-deg", type=float, default=15.0,
+                        help="same idea as --max-lead-m but for orientation: caps the angle "
+                             "between the commanded target_rotvec and the peg's actual current "
+                             "orientation. Only matters with --enable-rotation/"
+                             "--peg-tilt-randomization-deg. 0 disables it")
     parser.add_argument("--auto-init", action="store_true",
                         help="auto-calibrate the omega on open (it will move)")
     parser.add_argument("--arm-tolerance", type=float, default=0.02,
@@ -894,8 +914,32 @@ def main():
                     delta *= max_step / step_norm
                 target = target + delta
 
+                # Admittance-style lead clamp (see --max-lead-m's help):
+                # never let the target sit more than max_lead_m from where
+                # the peg tip ACTUALLY is, regardless of how far the
+                # slew-rate-limited delta above has walked it. --max-speed
+                # only bounds target's SPEED, not its DISTANCE from the real
+                # (possibly stuck) tool position, so a sustained jam still
+                # let the position error -- and therefore commanded force
+                # -- grow without bound before this existed.
+                if args.max_lead_m > 0.0:
+                    lead = target - env.tool_pos
+                    lead_norm = np.linalg.norm(lead)
+                    if lead_norm > args.max_lead_m:
+                        target = env.tool_pos + lead * (args.max_lead_m / lead_norm)
+
                 if args.enable_rotation:
                     target_rotvec = orientation_command(state)
+                    if args.max_rot_lead_deg > 0.0:
+                        actual_rotvec = Rotation.from_quat(
+                            env.get_tool_pose()[[4, 5, 6, 3]]
+                        ).as_rotvec()
+                        rel = Rotation.from_rotvec(target_rotvec) * Rotation.from_rotvec(actual_rotvec).inv()
+                        rel_angle = np.linalg.norm(rel.as_rotvec())
+                        max_rad = np.radians(args.max_rot_lead_deg)
+                        if rel_angle > max_rad:
+                            clamped_rel = Rotation.from_rotvec(rel.as_rotvec() * (max_rad / rel_angle))
+                            target_rotvec = (clamped_rel * Rotation.from_rotvec(actual_rotvec)).as_rotvec()
 
                 with render_model_lock:
                     env.step(target, target_rotvec=target_rotvec)

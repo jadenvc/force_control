@@ -407,6 +407,48 @@ under GLFW. `setdefault` leaves an already-exported `MUJOCO_GL` (e.g.
 `osmesa` on a box with no GPU at all) alone. This is a repo-wide latent
 issue, not fixed in `teleop_sanding.py`/`teleop_flipup.py` themselves.
 
+## Safety: lead clamp (fixes unbounded jam force)
+
+Root-caused from a real recorded episode (`~/data/insertion_v2.zarr`,
+episode_1): the peg got tilted (~8 degrees, via `--peg-tilt-randomization-deg`/
+`--enable-rotation`) and physically wedged in the fixture's tight 2mm-clearance
+opening. While the operator was correctly trying to pull AWAY (`device_pos`/
+`ts_pose_command_0`'s z target moving outward), the ACTUAL tool position stayed
+frozen -- and `normal_force_n` climbed from 2.0N to 48.5N in 233ms anyway
+(`force_break_n`'s default is 45N), because nothing capped how far the
+commanded target could drift from the real, stuck tool position: `--max-speed`
+only bounds the target's *speed*, not its *distance* from the actual peg. A
+genuinely wedged peg (self-locking friction, the same class of failure as
+`flipup_teleop.py`'s documented book-wedging problem) can't be un-stuck by
+pulling harder, and the target just kept out-running the stuck actual position,
+so the position error -- and therefore commanded force -- grew without any
+built-in ceiling.
+
+Fix: `--max-lead-m` (default 0.010m) and `--max-rot-lead-deg` (default 15
+degrees), applied every control step in `teleop_insertion.py`'s main loop
+(not scripted-demo-only): clamp the commanded target's translation/rotation
+to never sit more than this far from the peg's ACTUAL current pose, in any
+direction. This generalizes `insertion_scripted_demo.py`'s existing
+`max_lead_m=0.006` (which only applied along z, INSERT-phase-only) to the
+whole live teleop path, all phases, all axes. Bounds worst-case sustained
+force to roughly `tool_kp * max_lead_m` by construction, regardless of how
+long the jam persists -- measured (synthetic sustained-wall-push test):
+
+| tool_kp | max_lead_m | peak | mean |
+|---|---|---|---|
+| 1200 | 0 (old, unclamped) | 43.7N | 42.3N |
+| 1200 | 0.010 | **8.2N** | **0.5N** |
+| 2500 | 0 (old, unclamped) | 78.8N | 76.2N |
+| 2500 | 0.010 | **20.7N** | **11.0N** |
+
+`0` disables it (reverts to the old unclamped behavior). Note this bounds
+*force*, not the underlying jam itself -- a hard clamp doesn't make a
+genuinely wedged peg become unstuck, it just guarantees pulling on it harder
+never ramps the force past a known, small ceiling instead of toward
+`force_break_n`. If wedging itself (not just the force spike) is the problem,
+reduce `--peg-tilt-randomization-deg`/turn off `--enable-rotation`, since the
+fixture's 2mm clearance was only ever validated for a straight peg.
+
 ## Orientation control & tilt randomization
 
 Two independent knobs, both off by default (peg always exactly

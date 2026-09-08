@@ -349,6 +349,27 @@ python teleop_insertion.py \
     --auto-finish
 ```
 
+### Finding what settings a past session/episode used
+
+Two things get saved automatically, both readable with
+`show_insertion_commands.py <dataset>`:
+
+- **Every KEPT episode** carries the full args it was recorded with, in its
+  own `metadata_json` attr (`InsertionEpisodeRecorder.start_episode`'s
+  `metadata={"command_line": vars(args)}`) -- so two episodes in the same
+  dataset can show different settings if you restarted with different
+  flags mid-session.
+- **Every session that used `--collect-dataset`** appends one line to a
+  sibling `<dataset>.sessions.jsonl` log at startup (`_log_session_command`
+  in `teleop_insertion.py`), regardless of whether any episode from that
+  session ever got kept -- closes the gap the per-episode metadata has
+  when everything gets discarded (or the script is closed before starting
+  an episode at all).
+
+```bash
+python show_insertion_commands.py ~/data/insertion_v2.zarr
+```
+
 **Note on `--tool-kp`/`--peg-softness-max-solref`**: the first version of
 this command shipped here used `--tool-kp 2500` and the shipped
 `peg_softness=1` ceiling `(0.020, 1.8)`. Real teleop with a human operator

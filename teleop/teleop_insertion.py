@@ -52,10 +52,14 @@ import os
 os.environ.setdefault("MUJOCO_GL", "egl")
 
 import argparse
+import json
+import sys
 import threading
 import time
 import traceback
 from collections import deque
+from datetime import datetime, timezone
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -420,6 +424,38 @@ def sample_start_offset(rng, prism_size, center_probability, force_center):
     return rng.uniform(-half, half)
 
 
+def _log_session_command(dataset_path: str, argv: list, args: argparse.Namespace) -> None:
+    """Append this invocation's full command line + parsed args to a
+    sibling JSONL log next to the dataset, one line per session.
+
+    Complements InsertionEpisodeRecorder.start_episode's existing
+    ``metadata={"command_line": vars(args)}`` (already saved with every
+    KEPT episode, in each episode's ``metadata_json`` attr) -- that's
+    per-episode and only persists if at least one episode from the session
+    is kept. A session where every episode gets discarded (or where the
+    operator quits before ever starting one) loses the command entirely --
+    this log doesn't have that gap, since it's written once at startup
+    regardless of what happens afterward. Sibling file, not inside the
+    zarr store itself, so a corrupted/interrupted write here can never
+    threaten the dataset.
+    """
+    log_path = Path(dataset_path).expanduser().resolve().with_suffix(
+        Path(dataset_path).suffix + ".sessions.jsonl"
+    )
+    entry = {
+        "started_utc": datetime.now(timezone.utc).isoformat(),
+        "command": "python " + " ".join(argv),
+        "args": vars(args),
+    }
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_path, "a") as f:
+            f.write(json.dumps(entry, sort_keys=True) + "\n")
+        print(f"[dataset] this session's command saved to {log_path}")
+    except OSError as exc:
+        print(f"[dataset] warning: could not write session log {log_path}: {exc}")
+
+
 def main():
     parser = build_arg_parser()
     args = parser.parse_args()
@@ -428,6 +464,8 @@ def main():
         parser.error("--control-freq must be positive")
     if args.tool_kp <= 0.0:
         parser.error("--tool-kp must be positive")
+    if args.collect_dataset:
+        _log_session_command(args.collect_dataset, sys.argv[1:], args)
     pos_map = build_pos_map(args.axes)
     rot_map = build_pos_map(args.rot_axes) if args.rot_axes is not None else pos_map
 

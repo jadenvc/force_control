@@ -728,7 +728,23 @@ def main():
     # do_reset() so the operator's CURRENT wrist orientation always maps to
     # this episode's home_rotvec (which --peg-tilt-randomization-deg may
     # have just changed), not whatever it happened to be a reset or two ago.
-    rot_home = [None]
+    # FIXED reference, identity -- deliberately NOT re-captured per episode
+    # (an earlier version set this lazily to "whatever the wrist happens to
+    # be" on the first sample after each reset). That made the mapping
+    # relative/floating: if the operator's physical wrist wasn't actually
+    # level at that instant, its (arbitrary) pose silently became the new
+    # "zero", so the peg could start an episode at home_rotvec (straight
+    # down) while the wrist was tilted 20 degrees, with no correction until
+    # the operator un-learns that offset. Identity makes the mapping
+    # absolute: the peg's rotation is always a direct function of the
+    # wrist's true orientation relative to the device's own physical
+    # neutral, so "wrist level" and "peg straight down" (home_rotvec) are
+    # the same fixed pose in every episode, not something recalibrated out
+    # from under the operator each reset. Trade-off: the operator now needs
+    # to actually return the wrist to level before/at the start of each
+    # episode for the peg to sit at home_rotvec -- see the reminder printed
+    # in start_episode().
+    ROT_HOME_FIXED = np.eye(3)
     # Persistent slew-rate-limited rotation target, mirroring `target`'s role
     # for translation (--max-speed) -- see --max-rot-speed's help. None until
     # the first sample after each reset, so the first command snaps straight
@@ -744,11 +760,9 @@ def main():
 
     def orientation_command(state):
         R_dev = np.asarray(state["rot"], dtype=float).reshape(3, 3)
-        if rot_home[0] is None:
-            rot_home[0] = R_dev.copy()
         requested, _delta = map_wrist_orientation(
             R_dev,
-            rot_home[0],
+            ROT_HOME_FIXED,
             rot_map,
             env.home_rotvec,
             frame=args.rot_frame,
@@ -775,7 +789,6 @@ def main():
             episode_attempt[0] += 1
         reset_target = sample_reset_target(episode_attempt[0])
         target = env.tool_pos.copy()
-        rot_home[0] = None
         rot_target_state[0] = None
         contact_rot_anchor[0] = None
         device_armed = bool(args.dry_run)
@@ -787,6 +800,10 @@ def main():
         collection["state"] = "recording"
         collection["started_monotonic"] = time.monotonic()
         print("\n[dataset] recording started")
+        if args.enable_rotation:
+            print("[device] rotation mapping is ABSOLUTE (ROT_HOME_FIXED=identity) -- "
+                  "hold the wrist level/neutral now so the peg actually starts at "
+                  "home_rotvec instead of wherever the wrist happens to be")
 
     def stop_episode(reason):
         if collection["state"] != "recording":

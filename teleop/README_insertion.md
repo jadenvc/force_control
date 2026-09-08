@@ -346,8 +346,19 @@ python teleop_insertion.py \
     --peg-softness 1.0 --peg-softness-max-solref 0.06 2.0 --peg-softness-max-solimp-width 0.006 \
     --noslip-iterations 15 \
     --max-speed 0.1 --force-tau 6 --force-rate 80 \
+    --scale 1.0 1.0 1.0 \
+    --enable-rotation --rot-scale 0.3 --max-rot-speed 10 --max-rot-lead-deg 5 \
+    --max-lead-m 0.010 --max-force 5 --stiffness 2000 \
     --auto-finish
 ```
+
+`--scale` at the shipped default (0.5, 0.5, 1.0) maps the device's
+comfortable reach to only +-22.5mm x / +-20mm y around the hole -- *less*
+than the fixture's own 27mm half-width, so the device physically can't
+reach the fixture's corners. `--scale 1.0 1.0 1.0` doubles that to
++-45mm/+-40mm, comfortably covering it. `--rot-scale` trades the other
+way: lower it (e.g. 0.3) to make the SAME wrist rotation move the peg's
+angle less, if `--enable-rotation` feels too twitchy at 1.0.
 
 ### Finding what settings a past session/episode used
 
@@ -548,8 +559,25 @@ straight-down, byte-identical to the original behavior):
   `map_wrist_orientation` mapping as `teleop_flipup.py`'s
   `--enable-rotation` (duplicated into `teleop_insertion.py` rather than
   imported, same "stays standalone" convention as `build_pos_map`/
-  `DEFAULT_AXES`). `--rot-scale`, `--rot-frame` (`world`/`tool`),
-  `--rot-deadzone`, `--rot-axes` all mean what they do there.
+  `DEFAULT_AXES`). `--rot-scale` (lower = harder to move the peg's angle
+  for the same wrist motion; try 0.3 if it feels too easy to tilt),
+  `--rot-frame` (`world`/`tool`), `--rot-deadzone`, `--rot-axes` all mean
+  what they do there.
+
+  **The rotation mapping is ABSOLUTE, not relative to wherever the wrist
+  happened to be at reset** (`ROT_HOME_FIXED = np.eye(3)` in
+  `teleop_insertion.py`, deliberately not re-captured per episode the way
+  an earlier version did). An earlier, relative version captured "wrist
+  home" lazily from whatever pose the wrist was actually in on the first
+  sample after each reset -- so if the wrist wasn't physically level at
+  that instant, that arbitrary tilt silently became the new zero, and the
+  peg could visually sit at `home_rotvec` (straight down) while the
+  operator's wrist was tilted 20 degrees with no correction. With the
+  fixed identity reference, "wrist level" and "peg straight down" are the
+  same pose in every episode -- but that means the operator now needs to
+  actually hold the wrist level at the start of each episode for the peg
+  to sit at `home_rotvec`; `start_episode()` prints a reminder to do so
+  when `--enable-rotation` is set.
 - **`--peg-tilt-randomization-deg DEG`**: on each `reset()`, samples an
   independent roll and pitch (about the peg's own axes, each uniform in
   `[-DEG, DEG]`) and composes it onto `NOMINAL_HOME_ROTVEC`

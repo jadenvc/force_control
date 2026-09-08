@@ -286,9 +286,10 @@ def build_arg_parser():
                         help="radians of wrist rotation ignored before any peg rotation is "
                              "commanded (radial soft deadzone, not a hard jump at the boundary)")
     parser.add_argument("--max-lead-m", type=float, default=0.010,
-                        help="admittance-style lead clamp: never let the commanded translation "
+                        help="admittance-style lead clamp, ACTIVE ONLY WHILE THE PEG IS IN "
+                             "CONTACT (env.data.ncon > 0): never let the commanded translation "
                              "target run more than this many metres ahead of where the peg tip "
-                             "actually is, in ANY direction, at ANY time -- generalizes "
+                             "actually is, in ANY direction. Generalizes "
                              "insertion_scripted_demo.py's INSERT-phase max_lead_m (there: "
                              "0.006m, z-only, INSERT-phase-only) to the whole live teleop path. "
                              "Bounds worst-case sustained force to roughly tool_kp*max_lead_m "
@@ -296,9 +297,12 @@ def build_arg_parser():
                              "an --enable-rotation/--peg-tilt-randomization-deg tilt in the "
                              "fixture's tight 2mm clearance) -- found necessary from a real "
                              "recorded episode where normal_force_n climbed 2N->48.5N in 233ms "
-                             "while the operator was pulling AWAY from a wedged peg, because "
-                             "nothing capped how far the target could drift from the stuck "
-                             "actual position. 0 disables it (unclamped, the original behavior)")
+                             "while the operator was pulling AWAY from a wedged peg. Gated on "
+                             "contact deliberately: an earlier ungated version stayed permanently "
+                             "saturated during any ordinary free-space move faster than "
+                             "--tool-kp's own settling speed, which is itself an oscillation "
+                             "source, not just a slowdown -- see the long comment at its one "
+                             "call site. 0 disables it (unclamped, the original behavior)")
     parser.add_argument("--max-rot-lead-deg", type=float, default=15.0,
                         help="same idea as --max-lead-m but for orientation: caps the angle "
                              "between the commanded target_rotvec and the peg's actual current "
@@ -915,14 +919,30 @@ def main():
                 target = target + delta
 
                 # Admittance-style lead clamp (see --max-lead-m's help):
-                # never let the target sit more than max_lead_m from where
-                # the peg tip ACTUALLY is, regardless of how far the
-                # slew-rate-limited delta above has walked it. --max-speed
-                # only bounds target's SPEED, not its DISTANCE from the real
-                # (possibly stuck) tool position, so a sustained jam still
-                # let the position error -- and therefore commanded force
-                # -- grow without bound before this existed.
-                if args.max_lead_m > 0.0:
+                # while the peg is in CONTACT, never let the target sit more
+                # than max_lead_m from where the peg tip actually is, so a
+                # sustained jam can't grow force without bound. GATED on
+                # env.data.ncon > 0 -- an earlier ungated version (always
+                # comparing the raw target to env.tool_pos, contact or not)
+                # was active on effectively every step even in free space,
+                # because --tool-kp's own closed-loop settling is slower
+                # than max_lead_m at low --tool-kp values: a large free-space
+                # move (e.g. the initial reach toward the hole) kept the
+                # clamp permanently saturated, turning it into a "carrot on
+                # a stick" the actual position could never quite catch,
+                # which is its own resonance/oscillation source, not just a
+                # slow-down. Measured directly: an ungated clamp stalled 2s
+                # into a transit that should take ~1s, AND turned a smooth,
+                # never-drops-out light single-wall contact into one that
+                # lost contact entirely 41% of the time (force std
+                # 0.21N->1.33N) -- i.e. exactly "bouncing/uncontrollable
+                # even at light contact". Gating on actual contact removes
+                # both: free-space motion is completely unclamped (back to
+                # the original, unaffected behavior), and the jam-force cap
+                # this was built for (see --max-lead-m's help) still holds,
+                # since a genuine jam is, by definition, in contact.
+                in_contact = env.data.ncon > 0
+                if args.max_lead_m > 0.0 and in_contact:
                     lead = target - env.tool_pos
                     lead_norm = np.linalg.norm(lead)
                     if lead_norm > args.max_lead_m:
@@ -930,7 +950,7 @@ def main():
 
                 if args.enable_rotation:
                     target_rotvec = orientation_command(state)
-                    if args.max_rot_lead_deg > 0.0:
+                    if args.max_rot_lead_deg > 0.0 and in_contact:
                         actual_rotvec = Rotation.from_quat(
                             env.get_tool_pose()[[4, 5, 6, 3]]
                         ).as_rotvec()

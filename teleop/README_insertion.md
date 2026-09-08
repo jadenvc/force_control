@@ -426,22 +426,38 @@ built-in ceiling.
 
 Fix: `--max-lead-m` (default 0.010m) and `--max-rot-lead-deg` (default 15
 degrees), applied every control step in `teleop_insertion.py`'s main loop
-(not scripted-demo-only): clamp the commanded target's translation/rotation
-to never sit more than this far from the peg's ACTUAL current pose, in any
-direction. This generalizes `insertion_scripted_demo.py`'s existing
-`max_lead_m=0.006` (which only applied along z, INSERT-phase-only) to the
-whole live teleop path, all phases, all axes. Bounds worst-case sustained
-force to roughly `tool_kp * max_lead_m` by construction, regardless of how
-long the jam persists -- measured (synthetic sustained-wall-push test):
+(not scripted-demo-only), **gated on `env.data.ncon > 0` (actually in
+contact)**: clamp the commanded target's translation/rotation to never sit
+more than this far from the peg's ACTUAL current pose, in any direction, but
+only while touching something. This generalizes `insertion_scripted_demo.py`'s
+existing `max_lead_m=0.006` (which only applied along z, INSERT-phase-only)
+to the whole live teleop path, all phases, all axes. Bounds worst-case
+sustained force to roughly `tool_kp * max_lead_m` by construction, regardless
+of how long the jam persists -- measured (synthetic sustained-wall-push
+test):
 
 | tool_kp | max_lead_m | peak | mean |
 |---|---|---|---|
-| 1200 | 0 (old, unclamped) | 43.7N | 42.3N |
-| 1200 | 0.010 | **8.2N** | **0.5N** |
-| 2500 | 0 (old, unclamped) | 78.8N | 76.2N |
-| 2500 | 0.010 | **20.7N** | **11.0N** |
+| 1200 | 0 (unclamped) | 43.7N | 42.3N |
+| 1200 | 0.010 (gated) | **10.1N** | **8.7N** |
+| 2500 | 0 (unclamped) | 78.8N | 76.2N |
 
-`0` disables it (reverts to the old unclamped behavior). Note this bounds
+**The gate matters, and its absence was a real regression I shipped and then
+had to fix**: an earlier version applied the clamp unconditionally (contact or
+not). At a low `--tool-kp`, the controller's own closed-loop settling is
+slower than `max_lead_m` -- so during any ordinary free-space move bigger than
+that (e.g. the initial reach toward the hole), the clamp stayed permanently
+saturated, chasing the actual position like a carrot that's always exactly
+`max_lead_m` ahead and never lets the error close. That's not just a
+slowdown, it's its own oscillation source: measured, it turned a smooth,
+never-drops-out **light** single-wall contact (force std 0.21N, `ncon` never
+0) into one that **lost contact entirely 41% of the time** (force std
+1.33N) -- i.e. exactly "the device bouncing all over, uncontrollable, even
+with light contact". Gating on actual contact fixes both: free-space motion
+is completely unaffected (back to the pre-clamp behavior), and the jam-force
+cap above still holds, since a genuine jam is by definition in contact.
+
+`0` disables the clamp entirely (reverts to fully unclamped). Note it bounds
 *force*, not the underlying jam itself -- a hard clamp doesn't make a
 genuinely wedged peg become unstuck, it just guarantees pulling on it harder
 never ramps the force past a known, small ceiling instead of toward

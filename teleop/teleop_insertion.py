@@ -285,6 +285,23 @@ def build_arg_parser():
     parser.add_argument("--rot-deadzone", type=float, default=0.0,
                         help="radians of wrist rotation ignored before any peg rotation is "
                              "commanded (radial soft deadzone, not a hard jump at the boundary)")
+    parser.add_argument("--max-rot-speed", type=float, default=10.0,
+                        help="degrees/second: slew-rate-limits target_rotvec the same way "
+                             "--max-speed already did for translation (mirrors "
+                             "teleop_flipup.py's --max-rot-speed/slew_rotation_target, which "
+                             "--enable-rotation never got an equivalent of here). Deliberately "
+                             "much tighter than flipup's 60deg/s default -- this fixture's 2mm "
+                             "clearance has far less room to work with. Without this, a fast "
+                             "real wrist flick reaches --max-rot-lead-deg's angle cap in a "
+                             "single control step, injecting a large transient torque/force "
+                             "(measured 166-177N peak, single-wall-contact test) even though the "
+                             "clamp itself is engaged the whole time -- the angle clamp bounds "
+                             "the STEADY-STATE error, not the RATE of approach. NOTE: rate-"
+                             "limiting alone is not sufficient either -- see --max-rot-lead-deg's "
+                             "'anchored at contact onset' explanation for why continuing to "
+                             "rotate a peg that's wedged against one wall has no natural force "
+                             "ceiling the way pushing harder into a wall does; both this AND the "
+                             "anchor below are needed. 0 disables rate limiting")
     parser.add_argument("--max-lead-m", type=float, default=0.010,
                         help="admittance-style lead clamp, ACTIVE ONLY WHILE THE PEG IS IN "
                              "CONTACT (env.data.ncon > 0): never let the commanded translation "
@@ -303,10 +320,25 @@ def build_arg_parser():
                              "--tool-kp's own settling speed, which is itself an oscillation "
                              "source, not just a slowdown -- see the long comment at its one "
                              "call site. 0 disables it (unclamped, the original behavior)")
-    parser.add_argument("--max-rot-lead-deg", type=float, default=15.0,
-                        help="same idea as --max-lead-m but for orientation: caps the angle "
-                             "between the commanded target_rotvec and the peg's actual current "
-                             "orientation. Only matters with --enable-rotation/"
+    parser.add_argument("--max-rot-lead-deg", type=float, default=5.0,
+                        help="caps the commanded target_rotvec's angle from an ANCHOR frozen "
+                             "the moment contact begins (env.data.ncon transitions 0->1+), NOT "
+                             "from the continuously-updated actual orientation. That distinction "
+                             "matters: capping relative to the (moving) actual lets the operator "
+                             "keep winding the peg further and further off its starting "
+                             "orientation while jammed against one wall -- the arm has enough "
+                             "torque to keep dragging 'actual' along, so the error relative to "
+                             "it never grows past the cap even as absolute rotation keeps "
+                             "climbing, and, unlike pushing straight into a wall (which has a "
+                             "stable equilibrium: push harder, penetrate a little more, contact "
+                             "pushes back proportionally harder), continuing to twist a peg "
+                             "wedged in a square hole has no such natural ceiling -- winding it "
+                             "further just keeps ratcheting the force up. Anchoring to the pose "
+                             "at contact onset instead gives the clamp an absolute reference that "
+                             "can't itself be dragged. Measured (synthetic test, with "
+                             "--max-rot-speed's rate limit also applied): 111.9N peak at "
+                             "10deg/5deg/s, 27.9N at 5deg/10deg/s (this default pairing). Reset "
+                             "whenever contact is lost. Only matters with --enable-rotation/"
                              "--peg-tilt-randomization-deg. 0 disables it")
     parser.add_argument("--auto-init", action="store_true",
                         help="auto-calibrate the omega on open (it will move)")
@@ -659,12 +691,24 @@ def main():
     # this episode's home_rotvec (which --peg-tilt-randomization-deg may
     # have just changed), not whatever it happened to be a reset or two ago.
     rot_home = [None]
+    # Persistent slew-rate-limited rotation target, mirroring `target`'s role
+    # for translation (--max-speed) -- see --max-rot-speed's help. None until
+    # the first sample after each reset, so the first command snaps straight
+    # to wherever the wrist actually is instead of slewing from some stale
+    # prior-episode value.
+    rot_target_state = [None]
+    # Rotation-lead-clamp anchor, frozen at contact onset -- see
+    # --max-rot-lead-deg's help for why this must NOT be the continuously-
+    # updated actual orientation. Cleared whenever contact is lost, so the
+    # next contact event gets a fresh anchor from wherever it actually
+    # starts, not a stale one from several episodes/contacts ago.
+    contact_rot_anchor = [None]
 
     def orientation_command(state):
         R_dev = np.asarray(state["rot"], dtype=float).reshape(3, 3)
         if rot_home[0] is None:
             rot_home[0] = R_dev.copy()
-        command, _delta = map_wrist_orientation(
+        requested, _delta = map_wrist_orientation(
             R_dev,
             rot_home[0],
             rot_map,
@@ -673,7 +717,17 @@ def main():
             scale=args.rot_scale,
             deadzone=args.rot_deadzone,
         )
-        return command
+        if rot_target_state[0] is None or args.max_rot_speed <= 0.0:
+            rot_target_state[0] = requested
+            return requested
+        step_rot = Rotation.from_rotvec(requested) * Rotation.from_rotvec(rot_target_state[0]).inv()
+        angle = np.linalg.norm(step_rot.as_rotvec())
+        cap = np.radians(args.max_rot_speed) * dt
+        if angle > cap:
+            axis = step_rot.as_rotvec() / max(angle, 1e-12)
+            requested = (Rotation.from_rotvec(axis * cap) * Rotation.from_rotvec(rot_target_state[0])).as_rotvec()
+        rot_target_state[0] = requested
+        return requested
 
     def do_reset(advance_episode=False):
         nonlocal target, reset_target, device_armed
@@ -684,6 +738,8 @@ def main():
         reset_target = sample_reset_target(episode_attempt[0])
         target = env.tool_pos.copy()
         rot_home[0] = None
+        rot_target_state[0] = None
+        contact_rot_anchor[0] = None
         device_armed = bool(args.dry_run)
 
     def start_episode():
@@ -948,18 +1004,23 @@ def main():
                     if lead_norm > args.max_lead_m:
                         target = env.tool_pos + lead * (args.max_lead_m / lead_norm)
 
+                if not in_contact:
+                    contact_rot_anchor[0] = None
+
                 if args.enable_rotation:
                     target_rotvec = orientation_command(state)
                     if args.max_rot_lead_deg > 0.0 and in_contact:
-                        actual_rotvec = Rotation.from_quat(
-                            env.get_tool_pose()[[4, 5, 6, 3]]
-                        ).as_rotvec()
-                        rel = Rotation.from_rotvec(target_rotvec) * Rotation.from_rotvec(actual_rotvec).inv()
+                        if contact_rot_anchor[0] is None:
+                            contact_rot_anchor[0] = Rotation.from_quat(
+                                env.get_tool_pose()[[4, 5, 6, 3]]
+                            ).as_rotvec()
+                        anchor_rotvec = contact_rot_anchor[0]
+                        rel = Rotation.from_rotvec(target_rotvec) * Rotation.from_rotvec(anchor_rotvec).inv()
                         rel_angle = np.linalg.norm(rel.as_rotvec())
                         max_rad = np.radians(args.max_rot_lead_deg)
                         if rel_angle > max_rad:
                             clamped_rel = Rotation.from_rotvec(rel.as_rotvec() * (max_rad / rel_angle))
-                            target_rotvec = (clamped_rel * Rotation.from_rotvec(actual_rotvec)).as_rotvec()
+                            target_rotvec = (clamped_rel * Rotation.from_rotvec(anchor_rotvec)).as_rotvec()
 
                 with render_model_lock:
                     env.step(target, target_rotvec=target_rotvec)

@@ -465,6 +465,56 @@ never ramps the force past a known, small ceiling instead of toward
 reduce `--peg-tilt-randomization-deg`/turn off `--enable-rotation`, since the
 fixture's 2mm clearance was only ever validated for a straight peg.
 
+## Safety: rotation rate limit + anchored rotation clamp (fixes device bouncing while inserted)
+
+Root-caused from the user's own recorded episode (`~/data/insertion_v2.zarr`,
+episode_2, command: `--tool-kp 1200 --enable-rotation --rot-scale 1.0
+--peg-tilt-randomization-deg 0 --noslip-iterations 15 ...`): "the haptic
+device is bouncing all over the place with major displacements... even with
+light contact." First test: is this sim or haptic? `haptic_force_sent`
+correctly tracked `normal_force_n` (ruling out a signal-routing bug --
+confirming the earlier gravity-comp fix still held) and
+`device_force_measured` stayed properly capped at `--max-force` -- so the
+device hardware itself was doing exactly what it was told. The bug was
+sim/control-side: `normal_force_n` climbed smoothly 2N->40N over 313ms
+during light single-wall contact, well above what the translation lead clamp
+alone should have allowed at that `lead_norm` (~9.5mm, right at its cap).
+
+Reproduced synthetically (single-wall contact + a wrist rotation, mirroring
+the recorded episode's target_rotvec growing several degrees over the same
+window): a rotation reaching the (old) 15-degree cap within ~1 control step
+peaked at 166-177N, because **`--max-rot-lead-deg` bounded the STEADY-STATE
+angle error, not the RATE of approach** -- the same class of gap
+`--max-lead-m` had for translation before it was gated on contact. But
+rate-limiting rotation alone (mirroring `--max-speed`) was NOT sufficient
+either, and this is the more interesting part: even a *slow*, properly
+rate-limited rotation still peaked at 112N before eventually decaying to a
+safe steady value, because **continuing to twist a peg wedged against one
+wall has no natural force ceiling the way pushing straight into a wall
+does** (pushing harder into a flat wall reaches a stable equilibrium: more
+penetration, proportionally more restoring force; twisting further just
+keeps ratcheting the wedge tighter). Capping the rotation error relative to
+the peg's *continuously-updated* actual orientation doesn't help, because
+the arm has enough torque to keep dragging "actual" along -- the error
+relative to it never grows past the cap even as the ABSOLUTE rotation keeps
+climbing.
+
+Fix, both required together:
+- **`--max-rot-speed`** (default 10 degrees/second, deliberately much
+  tighter than `teleop_flipup.py`'s 60 -- this fixture's 2mm clearance has
+  far less room): slew-rate-limits `target_rotvec` the same way `--max-speed`
+  already did for translation.
+- **`--max-rot-lead-deg`** (default 5 degrees): now caps the angle from an
+  **anchor frozen the moment contact begins** (`env.data.ncon` transitions
+  0->1+), not from the continuously-updated actual orientation. Cleared
+  whenever contact is lost, so the next contact gets a fresh anchor.
+
+Measured (synthetic single-wall-contact test, both fixes together): 10
+degrees/second + 5-degree cap -> **27.9N peak**, decaying to ~2N steady --
+comfortably under `force_break_n=45`. Both default to values that pair
+well together; loosening either one independently reproduces a large
+transient (e.g. 60 deg/s + 15deg cap alone -> 111.9N peak).
+
 ## Orientation control & tilt randomization
 
 Two independent knobs, both off by default (peg always exactly

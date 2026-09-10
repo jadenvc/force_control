@@ -738,6 +738,126 @@ comfortably under `force_break_n=45`. Both default to values that pair
 well together; loosening either one independently reproduces a large
 transient (e.g. 60 deg/s + 15deg cap alone -> 111.9N peak).
 
+## Live teleop interface tuning (force-filter/speed/damping/onset-clamp sweep)
+
+A follow-up pass looked past the env/asset itself at `teleop_insertion.py`'s
+own control-loop knobs, specifically for further smoothness/penetration
+wins on top of everything above. Four things were tried; one was kept.
+
+### Kept: expose the Butterworth cutoff, document a smoother `--ft-filter-alpha`
+
+`--ft-filter-type butterworth`'s cutoff was hardcoded at 20Hz with no CLI
+knob at all (`ButterworthFilter` took a `cutoff_hz` constructor arg, but
+nothing between it and `InsertionProperties` ever threaded a configurable
+value through) -- fixed by adding `--ft-filter-cutoff-hz` /
+`InsertionProperties.ft_filter_cutoff_hz` (default 20.0, unchanged
+behavior unless set).
+
+Measured (scripted demo, seeds 0-4, `contact_force_filtered()`'s reported
+force during a genuine chattery multi-contact transient -- the peg touching
+2+ walls at once during SEARCH, intermittently losing/regaining contact):
+the shipped default `--ft-filter-alpha 0.2` cuts the raw exact force's
+worst single-step jump from ~26N (unfiltered, `--ft-filter-type none`) to
+~5.3N. Lower alpha smooths further at a small lag cost, measured with a
+clean step-response test (settle in firm contact, then step the target 3mm
+deeper in one control step, measure delay to reach 90% of the new steady
+force):
+
+| `--ft-filter-alpha` | worst single-step chatter jump (mean over 5 seeds) | onset lag (90%-of-step) |
+|---|---|---|
+| 0.2 (shipped default) | 2.90N (max 5.26N) | 4ms |
+| 0.15 | 2.16N (max 3.95N) | ~6ms |
+| 0.1 | 1.42N (max 2.63N) | 8ms |
+| 0.07 | 0.99N (max 1.85N) | 11ms |
+
+All of these lags are negligible next to the ~100-300ms timescale
+`--max-lead-m`/`--max-rot-lead-deg` already tolerate for a genuine jam to
+grow (see the two Safety sections above) -- so `0.1` is a reasonable,
+lower-risk-than-it-looks recommendation if the wedge/edge chatter feels too
+sharp at the handle. **Not** changed as the shipped default: responsiveness
+vs. smoothness is a genuine, task-dependent tradeoff (same reasoning
+`--tool-kp`/`--peg-softness-max-solref` already document separately from
+their shipped, more conservative defaults, rather than silently changing
+them).
+
+### Tried, no measured benefit: `--max-speed` and `--cartesian-damping-scale` for penetration
+
+Both were tested against a synthetic "approach and stop" probe: slew a
+target down onto the fixture's flat top at a controlled speed (mirroring
+the real slew-limiting `--max-speed` already does), stop commanding
+further penetration at a fixed depth, and measure the peak *actual*
+penetration reached, both in absolute terms and relative to the eventual
+settled value (isolating transient overshoot from steady-state tracking
+error).
+
+- **`--max-speed`** swept 0.05/0.08/0.10 (shipped default)/0.15/0.20 m/s,
+  at both `tool_kp=1200` (the data-collection recommendation) and `2500`
+  (the shipped default): peak penetration past the commanded touch point
+  moved by under 0.5mm across the *entire* range, with no consistent
+  direction favoring lower speed (if anything, higher speed reached
+  *slightly* closer to the commanded depth in this window, not further
+  past it). At these speeds (all well under 1mm of target motion per 1ms
+  control step), the position error injected per step is tiny relative to
+  the fixture's 2mm clearance/contact region -- there just isn't enough
+  momentum being built up for speed to matter here.
+- **`--cartesian-damping-scale`** swept 1.0 (shipped default)/1.2/1.5/2.0/3.0,
+  and additionally 0.0/0.5/1.0/2.0 at `tool_kp=2500`: with a long enough
+  settling window (15s), EVERY value converges to *exactly* the same
+  steady penetration with **zero overshoot past that steady value**, for
+  any of these damping scales -- including **zero Cartesian damping at
+  all**. This system's existing joint-space damping (`task_space_kd`,
+  present regardless of `--cartesian-damping-scale`, which only affects the
+  Cartesian term on top of it) already fully overdamps the Z-axis contact
+  response for any speed-limited approach; there's no ringing/overshoot to
+  suppress in the first place, so raising the ratio can't reduce something
+  that doesn't happen -- it would only slow settling, a straightforward
+  regression with no offsetting benefit. Wrist-actuator saturation was also
+  re-checked at `cartesian_damping_scale=2.0`, `tool_kp=1200` per the task
+  brief's caution (the real, previously-hit failure mode was at
+  `tool_kp=16000` -- see `DEFAULT_TOOL_KP`'s section above): max wrist
+  torque measured 0.03 N*m against a +-28 N*m budget during a sustained
+  sideways push, nowhere near saturation, but moot since there's no benefit
+  to raising the scale here anyway.
+
+**Neither knob's shipped default was changed; neither is recommended to
+change** for penetration purposes specifically -- if anything is worth
+remembering here, it's the negative result: this particular overshoot
+concern doesn't actually exist in the current controller at these speeds,
+so effort chasing it further (e.g. an even more aggressive damping ramp)
+would be solving a problem this system doesn't have.
+
+### Tried, no measured benefit: contact-onset-specific lead clamp
+
+`teleop_flipup.py`'s `--approach-compliance-distance` (softening `kp` and
+capping approach speed specifically within a fixed distance of a *known,
+single, flat* guarded surface) was never ported here, and the task brief
+asked whether it's now worth porting given everything else fixed since.
+Full geometric porting (computing live distance-to-nearest-surface against
+4 walls + floor + frame-top, rather than one flat table) was judged too
+large for this pass; a cheaper, more targeted version was tried instead --
+a SECOND, TIGHTER `--max-lead-m`-style clamp active only for a fixed
+duration immediately after a NEW contact begins (`ncon` 0->1), reverting to
+the normal sustained clamp afterward.
+
+Measured (synthetic single-wall jam test, mirroring the existing lead-clamp
+section's methodology: a target racing toward/through a wall faster than
+the controller can track, so real lead has already built up by the moment
+contact begins): a 3mm/150ms onset clamp on top of the existing 10mm
+sustained clamp reduced peak onset force from 11.97N to 11.84N -- **under
+1.5%**, and a tighter 1mm/100ms onset clamp did no better (11.85N). The
+reason: the existing sustained clamp (gated on `env.data.ncon > 0`) already
+activates on the very same control step contact begins, with no built-in
+delay, so there's very little "onset-only" window left for a second clamp
+to act on differently. Separately, this fixture's genuine 2mm radial
+clearance is comparable to the peg+wall's combined contact `margin`
+(~2mm, see the fillet investigation above), so the peg is *already*
+marginally within soft/anticipatory contact almost everywhere inside the
+tunnel -- there is much less of a clean "free space -> sudden contact"
+transition to smooth here than `teleop_flipup.py`'s book (which approaches
+a genuinely open table from clearly outside any margin). **Not
+implemented**: no measured benefit over the existing sustained clamp for
+this fixture's geometry.
+
 ## Orientation control & tilt randomization
 
 Two independent knobs, both off by default (peg always exactly

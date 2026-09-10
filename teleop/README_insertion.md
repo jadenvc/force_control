@@ -300,6 +300,97 @@ trace is smooth and free of sharp spikes/ringing once past the initial
 contact transient (see the plot), with the SEARCH-phase spiral producing a
 bounded, gently oscillating force as it sweeps rather than sudden jumps.
 
+## Investigation: rounding the socket's inner-top edge (not shipped)
+
+A follow-up pass targeted one specific, confirmed remaining discontinuity:
+each of `insertion_hole.xml`'s 4 wall boxes has a real 90-degree corner
+where its inner vertical face meets its horizontal top "picture frame"
+face, and a peg sweeping across that corner sees the contact normal flip
+discontinuously between "top face" and "inner face" in a single 1ms step.
+Reproduction (sweep the peg across the +x wall's inner-top edge at a fixed
+shallow penetration, `peg_softness=1.0`, `--peg-softness-max-solref 0.06
+2.0`, `--peg-softness-max-solimp-width 0.006`, `noslip_iterations=15`,
+`tool_kp=1200`):
+
+| variant | max force | max single-step jump | 10-seed scripted-demo success |
+|---|---|---|---|
+| baseline (unmodified box corner) | 12.39 N | 3.40 N | 10/10 |
+
+**Contact-parameter knobs, confirmed to have zero effect on the jump**
+(consistent with this being a discontinuity in *which geom/normal is
+nearest*, not a softness/convergence problem a continuous-signal knob can
+reach): widening the peg's `solimp` width up to 0.05, sweeping `condim`
+3/4/6, sweeping `noslip_iterations` 0/5/10/15/25/40, and sweeping
+`model.opt.iterations` (50-300) and `model.opt.tolerance` (1e-8 to 1e-12)
+all left `max_force`/`max_jump` unchanged to 3+ significant figures.
+
+**Geometry variants tried, in order:**
+
+1. *Small capsule (r=0.0008m) inset tangent to both faces, box unchanged.*
+   No measurable effect on the jump (stayed 3.401N) - the box's own sharp
+   corner is still an independent, still-discontinuous contact; adding a
+   second, smoother contact alongside it doesn't remove the first one.
+2. *Same capsule, but placed protruding exactly at the corner point instead
+   of inset.* Peak force dropped (12.3N to 7.25N) but the worst single-step
+   jump got **worse** (3.4N to 5.1N, now an abrupt 0-to-5.07N step) -
+   contact turns on later but harder. Net: not a win.
+3. *Split each wall into an outer bulk box (pulled back by the fillet
+   radius `r`) + a thin recessed inner "strip" box (top lowered by `r`) +
+   a capsule tangent to both the inner face and the top face, so the box's
+   own corner is structurally removed and the capsule becomes the only
+   nearby surface.* This is the geometrically "correct" fix and it does
+   measurably shrink the jump (e.g. `r=0.001m`: 3.40N to 2.97N; `r=0.008m`:
+   3.40N to 2.19N, with diminishing returns beyond `r~0.003`) - **but every
+   variant of it that used the fixture's normal `margin=0.001` collapsed
+   the 10-seed scripted-demo success rate to 0-1/10** (`insert_timeout`,
+   not `broken`: the peg's descent measurably slows and stalls just short
+   of the depth target). Root-caused to `margin` creating simultaneous,
+   overlapping peg-vs-strip and peg-vs-capsule (and, in variants where the
+   strip ran the wall's full height, peg-vs-outer) contact registrations
+   near the boundary, effectively summing extra normal/friction force right
+   at the region the SEARCH/INSERT transition has to cross. This reproduced
+   identically whether the strip spanned the wall's full depth or was
+   confined to a small band near the top, and regardless of `r` - i.e. it
+   is `margin`, not the split's geometry or `r`, that breaks success.
+   Setting `margin="0"` on just the strip/capsule geoms (leaving the outer
+   box at the default 1mm margin) restored 10/10 success and kept a modest
+   jump improvement (`r=0.002m`: 3.40N to 3.09N) with all 22 existing tests
+   green - **but** it also produced a large, seed-dependent side effect in
+   the full scripted demo that wasn't root-caused in the time available:
+   several seeds (e.g. seed 0, seed 7) that show real double-digit-Newton
+   contact forces at baseline instead register **zero contact force for
+   the entire episode** with this change, i.e. the peg appears to glide
+   straight into the hole without ever registering a fixture contact for
+   those particular random search trajectories. That is too large and too
+   unexplained a behavior change to ship without understanding it, so this
+   variant is **not** merged - `insertion_hole.xml` and `insertion_teleop.py`
+   are unchanged from before this investigation.
+4. *Isolated check: does an inset, non-protruding capsule alone (no box
+   change at all) break success the same way?* Yes - even with the box
+   completely untouched, just adding one inert-looking capsule at the
+   corner with the fixture's normal margin drops the scripted-demo success
+   rate to 0/4. This was not caught by the original (jump-only) evaluation
+   of that variant, and is worth remembering: *any* additional geom placed
+   at this specific edge, even one intended to be a no-op improvement, can
+   silently break the SEARCH-to-INSERT transition unless its `margin` is
+   also addressed.
+
+**Corner geometry** (the 4 points where two walls meet) was not attempted
+given the above - fixing the straight-edge case first is a prerequisite,
+and it isn't fixed yet.
+
+**Net result:** the inner-top-edge discontinuity is real, well
+characterized, and demonstrably NOT fixable by any contact-parameter or
+solver-setting knob; a geometrically correct fix (box split + tangent
+fillet) exists and reduces the jump by ~10-35% depending on radius, but
+only survives the 10-seed success check with `margin=0` on the new geoms,
+which then introduces an unresolved, seed-dependent "silent contact skip"
+side effect. Given the ~25-30 iteration budget for this pass, the change
+was reverted rather than shipped with an unexplained regression risk; the
+next person picking this up should start from variant 3's `margin=0`
+version (reproducible via the `r`/`strip_margin` sweep described above) and
+root-cause the zero-contact seeds before merging it.
+
 ## Running
 
 ```bash

@@ -442,6 +442,15 @@ class InsertionProperties:
     dynamic_filter_beta: float = DEFAULT_DYNAMIC_FILTER_BETA
     ft_filter_type: str = "ema"
     ft_filter_alpha: float = DEFAULT_FT_FILTER_ALPHA
+    # Butterworth cutoff (Hz), only used when ft_filter_type="butterworth".
+    # Previously hardcoded at FTSensorFilter's own default (20.0) with no way
+    # to change it short of editing source -- ButterworthFilter's cutoff_hz
+    # constructor arg existed but nothing above InsertionEnv ever threaded a
+    # configurable value down to it. Exposed here (and via
+    # teleop_insertion.py's --ft-filter-cutoff-hz) so --ft-filter-type
+    # butterworth is actually tunable, the same way --ft-filter-alpha already
+    # tunes the EMA case.
+    ft_filter_cutoff_hz: float = 20.0
 
     # Peg contact softness, see COMPILED_PEG_SOLREF/SOFT_PEG_SOLREF and
     # _configure_peg_contact.
@@ -528,6 +537,8 @@ class InsertionProperties:
             raise ValueError("ft_filter_type must be one of 'ema', 'butterworth', 'none'")
         if not 0.0 < self.ft_filter_alpha <= 1.0:
             raise ValueError("ft_filter_alpha must be in (0, 1]")
+        if not 0.0 < self.ft_filter_cutoff_hz:
+            raise ValueError("ft_filter_cutoff_hz must be positive")
         if not 0.0 <= self.peg_softness <= 1.0:
             raise ValueError("peg_softness must be in [0, 1]")
         if len(self.friction) != 3 or any(v < 0.0 for v in self.friction):
@@ -636,6 +647,7 @@ class InsertionEnv(FlipUpEnv):
         self._ft_filter = FTSensorFilter(
             filter_type=self.properties.ft_filter_type,
             alpha=self.properties.ft_filter_alpha,
+            cutoff_hz=self.properties.ft_filter_cutoff_hz,
             fs_hz=1.0 / self.timestep,
         )
         # Separate filter INSTANCE (same type/alpha) for contact_force_filtered
@@ -646,6 +658,7 @@ class InsertionEnv(FlipUpEnv):
         self._contact_force_filter = FTSensorFilter(
             filter_type=self.properties.ft_filter_type,
             alpha=self.properties.ft_filter_alpha,
+            cutoff_hz=self.properties.ft_filter_cutoff_hz,
             fs_hz=1.0 / self.timestep,
         )
 

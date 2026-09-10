@@ -212,7 +212,23 @@ def build_arg_parser():
                              "reported/recorded/reflected to the haptic device")
     parser.add_argument("--ft-filter-alpha", type=float,
                         default=DEFAULT_INSERTION_PROPERTIES.ft_filter_alpha,
-                        help="EMA smoothing factor (only used when --ft-filter-type=ema)")
+                        help="EMA smoothing factor (only used when --ft-filter-type=ema). Lower = "
+                             "more smoothing/more lag. Measured (scripted-demo sweep, seeds 0-4): "
+                             "default 0.2 cuts a chattery multi-contact transient's worst single-"
+                             "step reported-force jump from ~26N (unfiltered) to ~5.3N at a cost of "
+                             "~4ms of onset lag on a genuine new sustained contact (0.2 -> 12N "
+                             "contact step); 0.1 cuts the jump further to ~2.6N for ~8ms lag, 0.07 "
+                             "to ~1.8N for ~11ms lag -- all still negligible next to the ~100-300ms "
+                             "timescale --max-lead-m/--max-rot-lead-deg already tolerate for a "
+                             "genuine jam, so 0.1 is a reasonable, low-risk smoother alternative to "
+                             "the shipped default if the wedge/edge chatter feels too sharp; not "
+                             "changed here as the shipped default since responsiveness vs "
+                             "smoothness is a genuine, task-dependent tradeoff (see README_insertion.md).")
+    parser.add_argument("--ft-filter-cutoff-hz", type=float,
+                        default=DEFAULT_INSERTION_PROPERTIES.ft_filter_cutoff_hz,
+                        help="Butterworth low-pass cutoff in Hz (only used when --ft-filter-type="
+                             "butterworth). Previously hardcoded/unreachable from the CLI -- now "
+                             "tunable the same way --ft-filter-alpha tunes the EMA case.")
     parser.add_argument("--noslip-iterations", type=int,
                         default=DEFAULT_INSERTION_PROPERTIES.noslip_iterations,
                         help="MuJoCo's post-pass (model.opt.noslip_iterations) for refining the "
@@ -483,6 +499,7 @@ def main():
         dynamic_filter_beta=args.dynamic_filter_beta,
         ft_filter_type=args.ft_filter_type,
         ft_filter_alpha=args.ft_filter_alpha,
+        ft_filter_cutoff_hz=args.ft_filter_cutoff_hz,
         noslip_iterations=args.noslip_iterations,
         peg_tilt_randomization_deg=args.peg_tilt_randomization_deg,
     )

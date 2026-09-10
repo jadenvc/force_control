@@ -858,6 +858,36 @@ a genuinely open table from clearly outside any margin). **Not
 implemented**: no measured benefit over the existing sustained clamp for
 this fixture's geometry.
 
+## Anisotropic stiffness: stiff down, compliant lateral (`--tool-kp-axes`)
+
+Ported `teleop_flipup.py`'s `--tool-kp-axes` (per-WORLD-axis multiplier on
+`--tool-kp`'s translational diagonal, `(1,1,1)` = original isotropic
+behavior) -- motivated the same way it was there: force-insertion-sim's own
+`dynamic_impedance` controller (`K_cart=[450,450,700,80,80,200]`) is
+anisotropic, insertion-axis (Z) stiffest, ~1.56x over X/Y. Unlike flipup's
+version, this one also scales `task_space_cartesian_kd` by the same axes
+(`InsertionEnv._recompute_cartesian_damping`), so the D/K damping ratio
+stays identical on every axis regardless of `--tool-kp-axes` -- flipup's
+own comment flags not doing this as a known gap ("every OTHER formula that
+uses tool_kp still uses the plain scalar").
+
+```bash
+--tool-kp-axes 0.5 0.5 1.5
+```
+
+At `--tool-kp 1200`, this gives 600 N/m lateral / 1800 N/m vertical. Verified
+across scripted-demo seeds 0-9: 10/10 still succeed, and peak force actually
+dropped versus the isotropic baseline (max 14.3N across the 10 seeds here,
+vs. the isotropic baseline's ~15-31N range) -- the compliant lateral axes
+reduce search-time contact chatter while the stiffer Z axis keeps insertion
+precision, rather than one scalar forcing a single tradeoff on all three.
+
+**Caveat**: these axes are WORLD-frame, matching flipup's convention -- "Z
+is the direction the peg points down" is only true while the peg is
+untilted. `--enable-rotation`/`--peg-tilt-randomization-deg` can tilt the
+peg away from world-vertical without these axes following it (there is no
+peg-body-frame variant of this flag).
+
 ## Orientation control & tilt randomization
 
 Two independent knobs, both off by default (peg always exactly

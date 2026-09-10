@@ -577,10 +577,13 @@ class InsertionEnv(FlipUpEnv):
         seed=0,
         properties=None,
         tool_kp=DEFAULT_TOOL_KP,
+        tool_kp_axes=(1.0, 1.0, 1.0),
         tool_rot_kp=DEFAULT_TOOL_ROT_KP,
         arm_damping=DEFAULT_ARM_DAMPING,
         show_viewer=False,
     ):
+        if len(tool_kp_axes) != 3 or any(float(v) <= 0.0 for v in tool_kp_axes):
+            raise ValueError("tool_kp_axes must have exactly 3 positive values")
         self.seed = int(seed)
         self._rng = np.random.default_rng(self.seed)
         self.properties = properties or DEFAULT_INSERTION_PROPERTIES
@@ -589,6 +592,23 @@ class InsertionEnv(FlipUpEnv):
         self.hole_transform = HOLE_TRANSFORM
 
         self.tool_kp = float(tool_kp)
+        # Per-WORLD-axis multiplier on tool_kp's translational diagonal --
+        # (1,1,1) is the original isotropic scalar behavior. Ported from
+        # teleop_flipup.py's --tool-kp-axes (see FLIPUP_LOW_STIFFNESS_CONTROLLER.md
+        # #4), motivated the same way there: force-insertion-sim's own
+        # dynamic_impedance K_cart=[450,450,700,80,80,200] is anisotropic,
+        # insertion-axis (Z) stiffest -- 700 vs 450 on X/Y, a ~1.56x ratio.
+        # Lets the peg feel stiff/precise straight down (the axis that
+        # matters for finding/entering the hole) while staying compliant
+        # laterally (the axes implicated in search-time contact chatter),
+        # instead of one scalar tool_kp forcing the same tradeoff on all
+        # three. The peg always points along WORLD -z at home_rotvec (see
+        # NOMINAL_HOME_ROTVEC) -- these axes are WORLD-frame, matching
+        # flipup's convention, not the (possibly tilted, if
+        # --enable-rotation/--peg-tilt-randomization-deg is in play) peg's
+        # own body frame; index 2 (Z) is "the direction the peg points down"
+        # only when the peg is untilted, same caveat flipup's version has.
+        self.tool_kp_axes = np.asarray(tool_kp_axes, dtype=np.float64)
         self.tool_rot_kp = float(tool_rot_kp)
 
         self.physics = self._build_physics(self.properties)
@@ -625,7 +645,7 @@ class InsertionEnv(FlipUpEnv):
         self.hole_bottom_site_id = self.model.site("insertion_hole/hole_bottom").id
 
         self.task_space_kp = np.diag(
-            [self.tool_kp] * 3 + [self.tool_rot_kp] * 3
+            list(self.tool_kp * self.tool_kp_axes) + [self.tool_rot_kp] * 3
         ).astype(np.float64)
         self.task_space_kd = DEFAULT_JOINT_KD * float(arm_damping)
         self._recompute_cartesian_damping()
@@ -684,10 +704,20 @@ class InsertionEnv(FlipUpEnv):
         "extend the existing task-space PD law with non-zero Cartesian
         translational damping" piece the task brief calls for; sanding/flipup
         both leave translational Cartesian damping at exactly zero (see
-        flipup_minimal/flipup/environment.py:110-119)."""
-        kp_diag = np.array(
-            [self.tool_kp] * 3 + [self.tool_rot_kp] * 3, dtype=np.float64
-        )
+        flipup_minimal/flipup/environment.py:110-119).
+
+        Unlike flipup_teleop.py's --tool-kp-axes (whose own comment flags
+        this as a known gap: "every OTHER formula that uses tool_kp still
+        uses the plain scalar -- an approximation once this is
+        anisotropic"), this scales the damping diagonal by tool_kp_axes
+        too, so a stiffer axis gets proportionally more damping rather
+        than inheriting the isotropic scalar's damping while running at a
+        different stiffness -- keeps the same D/K ratio (hence the same
+        qualitative damping character) on every axis regardless of
+        tool_kp_axes."""
+        kp_diag = np.concatenate(
+            [self.tool_kp * self.tool_kp_axes, [self.tool_rot_kp] * 3]
+        ).astype(np.float64)
         scale = float(self.properties.cartesian_damping_scale)
         self.task_space_cartesian_kd = kp_diag * _CARTESIAN_KD_RATIO * scale
 

@@ -250,6 +250,20 @@ def build_arg_parser():
                         help="Cartesian task-space stiffness (N/m) driving the arm "
                              "toward the operator's target. Deliberately much softer than "
                              "sanding's -- see insertion_teleop.py's DEFAULT_TOOL_KP comment")
+    parser.add_argument("--tool-kp-axes", type=float, nargs=3, default=(1.0, 1.0, 1.0),
+                        metavar=("X", "Y", "Z"),
+                        help="per-WORLD-axis multiplier on --tool-kp's translational "
+                             "diagonal -- (1,1,1) is the original isotropic behavior. Z is "
+                             "'the direction the peg points down' only while untilted (the "
+                             "peg's home_rotvec is WORLD -z; --enable-rotation/"
+                             "--peg-tilt-randomization-deg can tilt the peg away from that "
+                             "without these axes following it -- they stay WORLD-frame, "
+                             "matching teleop_flipup.py's --tool-kp-axes). Try e.g. 0.5 0.5 "
+                             "1.5 for stiff-down/compliant-lateral: keeps insertion-axis "
+                             "precision while softening the axes implicated in search-time "
+                             "contact chatter. Cartesian damping scales with this too (see "
+                             "InsertionEnv._recompute_cartesian_damping), so the D/K ratio "
+                             "stays the same on every axis regardless of this setting")
     parser.add_argument("--arm-damping", type=float, default=2.5,
                         help="multiplier on the default joint damping")
     parser.add_argument("--max-speed", type=float, default=0.10,
@@ -480,6 +494,8 @@ def main():
         parser.error("--control-freq must be positive")
     if args.tool_kp <= 0.0:
         parser.error("--tool-kp must be positive")
+    if len(args.tool_kp_axes) != 3 or any(v <= 0.0 for v in args.tool_kp_axes):
+        parser.error("--tool-kp-axes must have exactly 3 positive values")
     if args.collect_dataset:
         _log_session_command(args.collect_dataset, sys.argv[1:], args)
     pos_map = build_pos_map(args.axes)
@@ -507,6 +523,7 @@ def main():
         seed=args.seed,
         properties=properties,
         tool_kp=args.tool_kp,
+        tool_kp_axes=tuple(args.tool_kp_axes),
         arm_damping=args.arm_damping,
     )
 

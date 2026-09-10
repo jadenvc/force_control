@@ -211,6 +211,18 @@ and not a separate popup) stacks three things top to bottom:
   they don't apply to the current state (e.g. KEEP/DELETE before an episode
   is stopped).
 
+Also drawn on the camera view unless `--no-com-marker`: a magenta cross at
+the T's actual center of mass (offset from the bar's visual centerline
+toward the stem -- not obvious by eye), a line to the pusher, and the
+current offset distance in mm. Rotating the T needs an off-center push
+(torque = force x lever arm from the CoM); a push through the CoM only
+translates it no matter how hard. This exists because aiming, not physics,
+turned out to be the actual bottleneck for rotating the T -- offset size,
+pusher radius, T mass, and friction were all tested and barely change how
+much rotation a given off-center push produces (16-29 degrees across a
+5x range of each), but there was previously no way to see where the CoM
+even was.
+
 ## Files
 
 - `push_t_teleop.py` -- the environment (`PushTTeleop`, `PushTProperties`).

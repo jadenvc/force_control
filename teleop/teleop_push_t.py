@@ -307,6 +307,18 @@ def build_arg_parser():
                         help="hide the live force strip-chart panel; the "
                              "camera view and START/STOP/KEEP/DELETE buttons "
                              "(if a recorder is active) still show")
+    parser.add_argument("--no-com-marker", action="store_true",
+                        help="hide the T's center-of-mass marker and the "
+                             "pusher-to-CoM offset line/label on the camera "
+                             "view. On by default because rotating the T "
+                             "requires pushing off-center from its CoM (not "
+                             "its visual centerline -- the CoM is offset "
+                             "toward the stem), and that offset is otherwise "
+                             "invisible; verified that offset size, pusher "
+                             "radius, T mass, and friction all barely change "
+                             "how much rotation a given off-center push "
+                             "produces, so aiming, not physics, is usually "
+                             "the actual bottleneck for rotating the T")
     parser.add_argument("--plot-span", type=float, default=4.0,
                         help="seconds of force history shown in the live plot")
     parser.add_argument("--plot-smoothing-hz", type=float, default=8.0,
@@ -688,7 +700,7 @@ def main():
 
         camera = MovableCamera(env.physics, height=CAM_H, width=CAM_W)
         camera.set_pose((0.0, 0.0, 0.0), 0.9, 90.0, -90.0)
-        view = {"camera": camera, "cv2": cv2, "running": True}
+        view = {"camera": camera, "cv2": cv2, "running": True, "camera_matrix": camera.matrix}
 
         if not args.no_view:
             def on_mouse(event, x, y, _flags, _userdata):
@@ -726,10 +738,45 @@ def main():
         elif action == "delete" and collection["state"] == "review":
             resolve_recorded_episode(False)
 
+    def draw_com_overlay(canvas, cv2):
+        """Mark the T's actual center of mass and the current pusher-to-CoM
+        lever arm on the camera frame.
+
+        Rotating the T requires pushing off-center from its CoM (torque =
+        force x lever arm) -- verified empirically that offset size, pusher
+        radius, T mass, and friction barely change how much rotation a given
+        off-center push produces (16-29 degrees across a wide sweep of all
+        of them), so a "hard to rotate" complaint is much more likely an
+        aiming/perception problem than a physics one: there's normally no
+        way to see where the CoM actually is (it's offset from the bar's
+        visual centerline toward the stem, not obvious by eye) or how far
+        off it your pusher currently is. This makes both visible.
+        """
+        com_world = np.asarray(env.data.xipos[env.t_body_id][:2], dtype=float)
+        pusher_world = env.pusher_pos
+        com_px = view["camera_matrix"] @ np.array([com_world[0], com_world[1], 0.0, 1.0])
+        com_px = (com_px[:2] / com_px[2]).astype(int)
+        pusher_px = view["camera_matrix"] @ np.array([pusher_world[0], pusher_world[1], 0.0, 1.0])
+        pusher_px = (pusher_px[:2] / pusher_px[2]).astype(int)
+        if 0 <= com_px[0] < CAM_W and 0 <= com_px[1] < CAM_H:
+            cv2.drawMarker(canvas, tuple(com_px), (200, 0, 200),
+                           cv2.MARKER_CROSS, 14, 2, cv2.LINE_AA)
+            # Straight-line pusher-to-CoM distance, not the true lever arm
+            # relative to push direction (that also needs the instantaneous
+            # push velocity) -- still a useful proxy: near 0 means you're
+            # pushing through the CoM (translation only, no torque).
+            offset_mm = 1000.0 * float(np.linalg.norm(pusher_world - com_world))
+            cv2.line(canvas, tuple(pusher_px), tuple(com_px), (200, 0, 200), 1, cv2.LINE_AA)
+            cv2.putText(canvas, f"offset {offset_mm:.0f}mm", (com_px[0] + 8, com_px[1] - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 0, 200), 1, cv2.LINE_AA)
+
     def build_canvas():
         cv2 = view["cv2"]
         frame = view["camera"].render()
         canvas = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        canvas = np.ascontiguousarray(canvas)
+        if not args.no_com_marker:
+            draw_com_overlay(canvas, cv2)
         if show_plot:
             canvas = np.vstack(
                 [canvas, _draw_plot_panel(trace_t, trace_mag, trace_fx, trace_fy, CAM_W, PLOT_H)]

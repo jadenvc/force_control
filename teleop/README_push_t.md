@@ -55,6 +55,27 @@ layout too if `--randomize-start` was passed).
   center will translate the T further before any meaningful rotation and is
   also the more likely source of the bounce/jitter discussed above -- an
   off-center, unhurried push gets you rotation more reliably, not less.
+- **`--table-friction`/`--pusher-friction` DO affect rotation, non-
+  monotonically -- there's no separate static-vs-kinetic friction to tune
+  (MuJoCo uses one Coulomb coefficient for both stick and slip here, not a
+  higher-before-motion/lower-during-sliding pair), but the single value
+  still matters a lot at the extremes.** Holding a fixed 12mm off-center
+  push constant and only sweeping friction:
+  - `--table-friction`: 0.02 -> 7 deg, 0.1 -> 6 deg, 0.4 -> 27 deg,
+    **0.8 -> 32 deg (best)**, 1.5 -> 23 deg, 3.0 -> 22 deg. Too little
+    table grip lets the T skid away before it can rotate; too much
+    (>~1.5) starts suppressing both translation and rotation together.
+  - `--pusher-friction`: 0.1 -> 10 deg, 0.3 -> 16 deg, 0.6 -> 25 deg,
+    **0.9 -> 27 deg (near-best)**, 1.5 -> 20 deg, **3.0 -> 0 deg** -- at
+    3.0 the T barely moved AT ALL (final pose within 0.1mm of its start)
+    even though the pusher reached its full target displacement: enough
+    friction can jam the contact into sticking without transmitting
+    useful force, not just resist rotation specifically.
+  - The defaults (`--table-friction 0.4`, `--pusher-friction 0.9`) are
+    already close to the empirically best zone for rotation -- if you're
+    tempted to push `--pusher-friction` higher hoping for more "grip" and
+    therefore more rotation, don't; past ~1.0-1.2 it gets worse, and by
+    3.0 it can stop working almost entirely.
 - The T-block has real mass/inertia (`--t-mass`, plus `--t-bar-length` etc.
   for its geometry); MuJoCo derives its rotational inertia from the compiled
   box geometry and density, not a hand-tuned constant.

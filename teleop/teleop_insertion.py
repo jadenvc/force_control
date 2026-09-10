@@ -68,6 +68,7 @@ from scipy.spatial.transform import Rotation
 from insertion_teleop import (
     CONTACT_CONTROL_Z,
     DEFAULT_INSERTION_PROPERTIES,
+    DEFAULT_TOOL_ROT_KP,
     DEVICE_WORKSPACE_HALF_M,
     HOLE_TRANSFORM,
     InsertionProperties,
@@ -254,16 +255,29 @@ def build_arg_parser():
                         metavar=("X", "Y", "Z"),
                         help="per-WORLD-axis multiplier on --tool-kp's translational "
                              "diagonal -- (1,1,1) is the original isotropic behavior. Z is "
-                             "'the direction the peg points down' only while untilted (the "
-                             "peg's home_rotvec is WORLD -z; --enable-rotation/"
-                             "--peg-tilt-randomization-deg can tilt the peg away from that "
-                             "without these axes following it -- they stay WORLD-frame, "
-                             "matching teleop_flipup.py's --tool-kp-axes). Try e.g. 0.5 0.5 "
+                             "the hole's own bore axis, which is always WORLD -z -- the "
+                             "HOLE never tilts, only the peg does (--enable-rotation/"
+                             "--peg-tilt-randomization-deg), so Z stiffness stays aligned "
+                             "with 'orthogonal to the hole' regardless of any peg tilt; it "
+                             "is NOT trying to track the peg's own (possibly tilted) long "
+                             "axis, and doesn't need to for this purpose. Try e.g. 0.5 0.5 "
                              "1.5 for stiff-down/compliant-lateral: keeps insertion-axis "
                              "precision while softening the axes implicated in search-time "
                              "contact chatter. Cartesian damping scales with this too (see "
                              "InsertionEnv._recompute_cartesian_damping), so the D/K ratio "
                              "stays the same on every axis regardless of this setting")
+    parser.add_argument("--tool-rot-kp", type=float, default=DEFAULT_TOOL_ROT_KP,
+                        help="task-space rotational stiffness (N*m/rad), applied "
+                             "isotropically to all 3 rotational DOF (no --tool-rot-kp-axes "
+                             "equivalent yet -- unlike --tool-kp-axes, there's no anisotropic "
+                             "version of this). Was previously a constructor-only default "
+                             "with no CLI flag at all -- exposed here since it directly "
+                             "governs how much torque --enable-rotation's wrist commands (or "
+                             "a wedge, see --max-rot-lead-deg's history) produce for a given "
+                             "angular error. Lower it (e.g. 200) for a softer-feeling wrist; "
+                             "raise it for tighter angle tracking, but re-check "
+                             "--max-rot-lead-deg's jam-force math if you do (it scales with "
+                             "this the same way --max-lead-m scales with --tool-kp)")
     parser.add_argument("--arm-damping", type=float, default=2.5,
                         help="multiplier on the default joint damping")
     parser.add_argument("--max-speed", type=float, default=0.10,
@@ -496,6 +510,8 @@ def main():
         parser.error("--tool-kp must be positive")
     if len(args.tool_kp_axes) != 3 or any(v <= 0.0 for v in args.tool_kp_axes):
         parser.error("--tool-kp-axes must have exactly 3 positive values")
+    if args.tool_rot_kp <= 0.0:
+        parser.error("--tool-rot-kp must be positive")
     if args.collect_dataset:
         _log_session_command(args.collect_dataset, sys.argv[1:], args)
     pos_map = build_pos_map(args.axes)
@@ -524,6 +540,7 @@ def main():
         properties=properties,
         tool_kp=args.tool_kp,
         tool_kp_axes=tuple(args.tool_kp_axes),
+        tool_rot_kp=args.tool_rot_kp,
         arm_damping=args.arm_damping,
     )
 
@@ -531,8 +548,9 @@ def main():
     print(
         f"insertion ready: contact_threshold={properties.force_contact_threshold_n:.1f}N, "
         f"BREAK={properties.force_break_n:.1f}N, insert_depth_target="
-        f"{properties.insert_depth_target_m*1000:.0f}mm, tool_kp={env.tool_kp:.0f} N/m, "
-        f"force_gain={force_gain:.4f} N/N"
+        f"{properties.insert_depth_target_m*1000:.0f}mm, tool_kp={env.tool_kp:.0f} N/m "
+        f"(axes {tuple(round(float(v), 3) for v in env.tool_kp_axes)}), "
+        f"tool_rot_kp={env.tool_rot_kp:.0f} N*m/rad, force_gain={force_gain:.4f} N/N"
     )
     reach_xy = np.asarray(args.scale[:2]) * DEVICE_WORKSPACE_HALF_M[:2]
     print(

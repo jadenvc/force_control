@@ -882,11 +882,29 @@ vs. the isotropic baseline's ~15-31N range) -- the compliant lateral axes
 reduce search-time contact chatter while the stiffer Z axis keeps insertion
 precision, rather than one scalar forcing a single tradeoff on all three.
 
-**Caveat**: these axes are WORLD-frame, matching flipup's convention -- "Z
-is the direction the peg points down" is only true while the peg is
-untilted. `--enable-rotation`/`--peg-tilt-randomization-deg` can tilt the
-peg away from world-vertical without these axes following it (there is no
-peg-body-frame variant of this flag).
+**Works correctly with `--peg-tilt-randomization-deg`/`--enable-rotation`,
+verified, not just assumed**: these axes are WORLD-frame, matching
+flipup's convention, and Z tracks "orthogonal to the hole" regardless of
+peg tilt -- because the HOLE never tilts, only the peg does. Z stiffness
+staying aligned with world -z is exactly what you want for insertion-axis
+precision no matter how the peg itself is oriented; there's no need for a
+peg-body-frame variant of this flag for that purpose. Verified with
+`--tool-kp-axes 0.5 0.5 1.5 --peg-tilt-randomization-deg 5`: still succeeds,
+peak force 8.7N (dry-run, seed 0) -- no crash, no regression from adding
+tilt on top.
+
+### Rotational stiffness (`--tool-rot-kp`)
+
+Was a constructor-only default (`DEFAULT_TOOL_ROT_KP = 400.0` N*m/rad,
+`insertion_teleop.py`) with **no CLI flag at all** until now -- exposed as
+`--tool-rot-kp` since it directly governs how much torque
+`--enable-rotation`'s wrist commands (or a jam, see "Safety: rotation rate
+limit" above) produce for a given angular error. Applied isotropically to
+all 3 rotational DOF; unlike `--tool-kp-axes`, there is no anisotropic
+`--tool-rot-kp-axes` yet. Lower it (e.g. 200) for a softer-feeling wrist;
+raise it for tighter angle tracking, but re-check `--max-rot-lead-deg`'s
+jam-force math if you do -- it scales with this the same way `--max-lead-m`
+scales with `--tool-kp`.
 
 ## Orientation control & tilt randomization
 

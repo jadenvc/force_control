@@ -379,7 +379,7 @@ all left `max_force`/`max_jump` unchanged to 3+ significant figures.
 given the above - fixing the straight-edge case first is a prerequisite,
 and it isn't fixed yet.
 
-**Net result:** the inner-top-edge discontinuity is real, well
+**Net result (this pass):** the inner-top-edge discontinuity is real, well
 characterized, and demonstrably NOT fixable by any contact-parameter or
 solver-setting knob; a geometrically correct fix (box split + tangent
 fillet) exists and reduces the jump by ~10-35% depending on radius, but
@@ -390,6 +390,106 @@ was reverted rather than shipped with an unexplained regression risk; the
 next person picking this up should start from variant 3's `margin=0`
 version (reproducible via the `r`/`strip_margin` sweep described above) and
 root-cause the zero-contact seeds before merging it.
+
+### Follow-up: the zero-contact mystery, root-caused (still not shipped)
+
+A later session reconstructed variant 3's `margin=0` geometry from scratch
+(no leftover stash/code survived; the `insertion_hole.xml`/`insertion_teleop.py`
+in git were byte-identical to before the investigation, confirming the prior
+session's revert was clean) and root-caused the zero-contact seeds. **It is
+NOT the `hole_geom_ids`-omits-new-geoms reporting bug it looked like at
+first glance** (that was the first hypothesis tested and it's a real,
+separate footgun worth knowing about -- `InsertionEnv.hole_geom_ids` is a
+hardcoded list of geom *names*, `peg_contact_force()` silently reports zero
+for any contact against a geom not in that list, so adding new fixture
+geoms without updating it would silently drop their contribution to every
+force reading. But instrumenting `env.data.ncon`/`env.data.contact` directly
+(bypassing `hole_geom_ids` entirely) showed `ncon` was genuinely **0 for the
+entire episode**, not just mis-attributed -- a real physics difference, not
+a reporting one).
+
+The real cause: variant 3's "recessed inner strip" box, as specified (`u in
+[0, r]`, `w` from the wall's full bottom up to `z_top - r`), spans **the
+wall's entire ~65mm height minus a 2mm top band** -- i.e. it isn't a small
+detail confined to the corner, it *is* almost the entire inner surface of
+the wall the peg slides against throughout SEARCH/INSERT. Instrumenting
+`contact.dist` directly during a baseline run showed why this matters:
+baseline's sustained "in contact" reading throughout INSERT (`ncon=4`,
+~11N, for thousands of consecutive steps) has `dist` around **+0.002m** --
+i.e. the peg is NOT geometrically touching anything; MuJoCo's per-pair
+contact `margin` (empirically the *sum* of both geoms' margins here, peg
+0.001 + wall 0.001 = 0.002, matching the observed threshold) creates a real,
+solver-applied restoring force *before* actual penetration, as an
+intentional soft/anticipatory contact feature -- not a bug. At this
+fixture's genuinely tight 2mm radial clearance, that 2mm combined margin
+reaches essentially the entire clearance annulus, so baseline is *almost
+always* in this soft/anticipatory contact throughout descent, regardless of
+how small the landing offset is. Variant 3's strip -- covering nearly the
+whole depth -- sets its own margin to 0 for nearly the whole depth, cutting
+the reachable margin from 2mm to 1mm (just the peg's own). For any seed
+whose landing+wiggle trajectory stays farther than 1mm from every wall for
+its whole episode -- which turns out to be common, since the landing
+perturbation (3.5mm std) is small relative to the 12mm opening half-width
+and most seeds' search never drifts the peg that close to a wall -- contact
+never triggers at all: concretely, **6 of 10 seeds never come within 1mm of
+any wall for their whole episode**, so
+`ncon` truly stays 0 and the peg just glides cleanly through -- the "10/10
+success, several seeds silently zero-force" combination observed before is
+exactly what falls out of that, not a sign error or geometric gap in the
+fillet math (the fillet's tangent-point arithmetic itself was re-derived
+independently this session and checked flush/gap-free by direct
+coordinate computation).
+
+A restructured 3-piece split was tried to fix this: keep the wall's
+**original, full-depth box at its original margin (0.001) unchanged** for
+everything except a small top `r`-tall band, and confine the
+fillet treatment (a smaller recessed "corner box" + tangent capsule, both
+`margin=0`) to only that band -- so the vast majority of the tunnel's
+depth keeps baseline's exact soft-cushion behavior, and only the sharp
+90-degree corner detail itself gets replaced. This **did** fix the
+zero-contact anomaly: at `r=0.002m`, all 10/10 seeds succeed AND all 10
+show nonzero, baseline-comparable contact force (e.g. seed 0: 15.42N peak
+vs. baseline's 15.37N, seed 3: 31.16N vs. baseline's own high-offset seeds
+in the 15-42N documented range) -- no silent zero-force episodes.
+
+**However, re-measuring the actual jump this was all for (using a clean,
+controller-free kinematic reproduction -- a standalone 2-geom MuJoCo model
+[free peg capsule + one wall], directly setting `qpos` and calling
+`mj_forward` at each swept x position with no arm/controller in the loop at
+all, to isolate the pure geometric/solver discontinuity from any
+settling-transient artifact a closed-loop controller sweep introduces --
+several controller-based sweep methodologies were tried first and discarded
+for exactly this contamination) showed the restructured split does NOT
+reduce the worst-case single-step jump: baseline's sharp corner
+gives **0.35N** at its corner (`x=0.012`), but the fillet variant gives
+**1.21N** at the *seam between the new fillet capsule and corner-box
+primitives* (`x=0.014`, i.e. NOT the original corner location) -- a real,
+larger discontinuity introduced by the split itself, not a controller
+artifact (confirmed with zero controller dynamics involved). Splitting a
+single primitive into multiple primitives replaces one discontinuity
+(sharp box corner) with at least one *new* seam discontinuity (where two
+independently-computed nearest-contact primitives hand off), and there's no
+guarantee that seam is smoother than the corner it replaced -- here it
+measurably wasn't, this specific tangent placement made the worst case
+*larger*.
+
+**Net result (updated): not shipped, and not recommended without further
+work.** The zero-contact anomaly is now fully understood (not a bug, not
+shippable-with-caveats -- it was masking a genuinely different fix needed),
+and a corrected split exists that resolves it while keeping 10/10 success.
+But the core motivating goal (reduce the worst-case single-step contact
+force jump at this edge) is not actually achieved by any box-split+fillet
+variant tried across both sessions once measured without a
+settling-dynamics-blurred methodology -- the jump is relocated, not
+reduced, and by this specific tangent construction it gets worse at the new
+seam. A genuinely smoother fix would need either a single smooth primitive
+spanning the whole corner+adjacent-face region (no internal seam at all --
+not expressible with MuJoCo's box/capsule primitives for a 3D box corner
+without a custom mesh) or a principled way to blend contact response across
+the seam (e.g. matching solimp curvature at the tangent point, not just
+position) -- both larger efforts than this task's cap allows. No files
+changed; `insertion_hole.xml`/`insertion_teleop.py` remain exactly as
+before both investigation sessions.
 
 ## Running
 

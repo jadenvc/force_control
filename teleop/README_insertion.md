@@ -525,6 +525,32 @@ updating, rather than interleaving tick-by-tick -- a cosmetic gap in the
 preview, not a physics one, and it doesn't affect the real (non-dry-run)
 teleoperation path at all.
 
+## Shifting the mapped workspace down (`--z-bias`)
+
+By default, the handle's home/center position maps to `nominal_hover`
+(`CONTACT_CONTROL_Z + 0.02`, i.e. 2cm above the touch point) -- so reaching
+the surface, let alone pressing into it, already spends some of the
+handle's downward travel just closing that 2cm gap.
+
+**`--home` does NOT fix this**, even though it sounds like it should: it
+only relocates which *physical* handle position counts as "center" (and
+moves the real device there at startup); `desired = reset_target +
+pos_map @ (scale * (device_xyz - home_xyz))` adds `reset_target` back
+regardless of `--home`'s value, so whatever physical position you call
+home still maps to the same `nominal_hover` sim height.
+
+`--z-bias` is a separate, SIM-frame offset added directly to the mapped
+target's z, after `--scale`: `desired[2] += args.z_bias`. Negative shifts
+the whole mapped workspace down -- e.g. `--z-bias -0.015` moves the
+handle-at-home point to 5mm above the touch point instead of 20mm, so
+less downward travel is needed to reach the surface and more of the
+handle's range is free for pressing/inserting past first contact. Applied
+inside the main tracking loop (not to `reset_target`/`nominal_hover`
+themselves), so it takes effect from the very first tick with no
+two-phase settle-then-jump artifact. Startup prints the resulting
+effective center height (`[workspace] --z-bias ...`) so you can sanity-check
+it before touching the real device.
+
 ## Data collection & live monitoring
 
 Same on-disk dataset shape and CLI conventions as flipup/sanding, via

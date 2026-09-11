@@ -310,6 +310,19 @@ def build_arg_parser():
     parser.add_argument("--home", type=float, nargs=3, default=(0.0, 0.0, 0.0),
                         metavar=("X", "Y", "Z"),
                         help="physical handle position (device m) mapped to the hole-hover target")
+    parser.add_argument("--z-bias", type=float, default=0.0,
+                        help="SIM-frame metres added to the mapped target's z after --scale "
+                             "(not a device-space offset like --home -- --home only relocates "
+                             "which physical handle position counts as center, it does NOT "
+                             "change what sim height that center maps to, since reset_target "
+                             "is added back regardless of --home's value). Negative shifts the "
+                             "whole mapped workspace DOWN: at the handle's home position, the "
+                             "peg sits --z-bias below the nominal 2cm hover point instead of "
+                             "at it, so less downward handle travel is needed to reach/press "
+                             "into the surface, and more of the handle's downward range is "
+                             "available for pressing past first contact instead of being spent "
+                             "just closing the hover gap. Try -0.015 to start roughly at the "
+                             "touch point instead of 2cm above it")
     parser.add_argument("--axes", type=str, default=DEFAULT_AXES,
                         help="which device axis (optionally negated) drives sim x, y, z")
     parser.add_argument("--enable-rotation", action="store_true",
@@ -558,6 +571,16 @@ def main():
         f"comfortable range reaches +/-{reach_xy[0]*100:.1f}cm x, +/-{reach_xy[1]*100:.1f}cm y "
         f"around the hole center"
     )
+    if args.z_bias != 0.0:
+        # 0.02 here matches nominal_hover's hardcoded "2cm clear of first
+        # touch" below -- duplicated rather than shared since nominal_hover
+        # isn't computed until later and this print only needs the number,
+        # not the full array.
+        center_above_touch_mm = (0.02 + args.z_bias) * 1000.0
+        print(
+            f"[workspace] --z-bias {args.z_bias*1000:.1f}mm: handle-at-home now maps to "
+            f"{center_above_touch_mm:.1f}mm above the touch point (was 20.0mm at --z-bias 0)"
+        )
     ctl_dt = 1.0 / args.control_freq
     tau = args.force_tau / 1000.0
     t_eff = ctl_dt + 2.0 * tau
@@ -1064,6 +1087,7 @@ def main():
                 device_state = state
                 device_xyz = state["pos"][:3]
                 desired = reset_target + pos_map @ (scale * (device_xyz - home_xyz))
+                desired[2] += args.z_bias
                 if state["long_press_count"] > 0:
                     if collection["state"] == "recording":
                         stop_episode("operator_reset")

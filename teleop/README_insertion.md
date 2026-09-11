@@ -884,6 +884,40 @@ a genuinely open table from clearly outside any margin). **Not
 implemented**: no measured benefit over the existing sustained clamp for
 this fixture's geometry.
 
+## Lowering `--friction` for free axial sliding once inserted
+
+User question: "once the peg is in the hole, why doesn't it slide down for
+the most part instead of needing continuous pushing?" Measured, not
+guessed: the peg is position-controlled, not gravity-driven, so nothing
+makes it fall through the hole on its own regardless of friction -- but
+even a small lateral off-center (or tilt) puts the peg lightly against one
+wall, and the compiled sliding friction (`0.4` on `insertion_peg.xml`'s
+`peg_collision` class, higher than force-insertion-sim's own reference
+value of `0.3`) turns that light contact into substantial AXIAL drag
+resisting the commanded descent, not just lateral resistance.
+
+Synthetic test (peg touching one wall lightly, commanded to descend at a
+steady 0.01 m/s, `--tool-kp 1200 --tool-kp-axes 0.5 0.5 1.5`):
+
+| `--friction` (sliding term) | mean axial drag | depth reached (3s) |
+|---|---|---|
+| 0.4 (compiled default) | 4.85N | 3.3mm |
+| 0.3 | 3.17N | 4.7mm |
+| 0.2 | 1.62N | 5.8mm |
+| **0.1** | **0.47N** | **6.6mm** |
+| 0.05 | 0.15N | 6.9mm (diminishing returns past 0.1) |
+
+```bash
+--friction 0.1 0.01 0.0002
+```
+
+Verified across scripted-demo seeds 0-9 (combined with
+`--tool-kp-axes 0.5 0.5 1.5`): still 10/10 success, and peak/mean force
+dropped further on every seed (peak range 3.6-9.6N, vs. 8.5-14.3N with
+`--tool-kp-axes` alone, vs. ~15-31N at the original isotropic baseline) --
+lower friction doesn't hurt search reliability here, it just removes drag
+that was never doing useful work.
+
 ## Anisotropic stiffness: stiff down, compliant lateral (`--tool-kp-axes`)
 
 Ported `teleop_flipup.py`'s `--tool-kp-axes` (per-WORLD-axis multiplier on

@@ -244,6 +244,28 @@ def build_arg_parser():
                              "applied to the peg's nominal orientation on reset (see "
                              "InsertionEnv.reset()). 0 (default) = always exactly "
                              "straight-down, a true no-op. Independent of --enable-rotation")
+    parser.add_argument("--hole-tilt-randomization-deg", type=float,
+                        default=DEFAULT_INSERTION_PROPERTIES.hole_tilt_randomization_deg,
+                        help="max magnitude (degrees) of a random per-episode roll/pitch tilt "
+                             "applied to the SOCKET FIXTURE itself (not the peg) on reset, "
+                             "mirroring --peg-tilt-randomization-deg's pattern (independent "
+                             "uniform roll/pitch, no yaw -- see "
+                             "InsertionProperties.hole_tilt_randomization_deg's docstring for "
+                             "why 'no yaw' is true here for a DIFFERENT reason than the peg's "
+                             "case). 0 (default) = always exactly the compiled, untilted "
+                             "fixture, a true no-op. --tool-kp-axes' translational stiffness "
+                             "(and its matching Cartesian damping) is rotated into the hole's "
+                             "actual current orientation every reset, so raising this remains "
+                             "correct rather than silently stiffening/damping along a stale "
+                             "world -z -- see README_insertion.md's 'Hole-tilt randomization' "
+                             "section. LIVE TELEOP (this script) is the supported path for "
+                             "this knob; insertion_scripted_demo.py's APPROACH/CONTACT/SEARCH/"
+                             "INSERT phase logic assumes an untilted, world -z-aligned hole and "
+                             "is NOT adapted for this (mirrors --peg-tilt-randomization-deg's "
+                             "own scripted-demo caveat) -- --dry-run at nonzero values will "
+                             "typically fail cleanly (e.g. search_timeout/insert_timeout) "
+                             "rather than crash, but is not a validated demonstration of this "
+                             "feature")
     parser.add_argument("--seed", type=int, default=0)
 
     # ---- controller -----------------------------------------------------------
@@ -253,19 +275,24 @@ def build_arg_parser():
                              "sanding's -- see insertion_teleop.py's DEFAULT_TOOL_KP comment")
     parser.add_argument("--tool-kp-axes", type=float, nargs=3, default=(1.0, 1.0, 1.0),
                         metavar=("X", "Y", "Z"),
-                        help="per-WORLD-axis multiplier on --tool-kp's translational "
-                             "diagonal -- (1,1,1) is the original isotropic behavior. Z is "
-                             "the hole's own bore axis, which is always WORLD -z -- the "
-                             "HOLE never tilts, only the peg does (--enable-rotation/"
-                             "--peg-tilt-randomization-deg), so Z stiffness stays aligned "
-                             "with 'orthogonal to the hole' regardless of any peg tilt; it "
-                             "is NOT trying to track the peg's own (possibly tilted) long "
-                             "axis, and doesn't need to for this purpose. Try e.g. 0.5 0.5 "
-                             "1.5 for stiff-down/compliant-lateral: keeps insertion-axis "
+                        help="per-axis multiplier on --tool-kp's translational diagonal, "
+                             "defined in the HOLE's OWN frame -- (1,1,1) is the original "
+                             "isotropic behavior. Z is the hole's own bore axis. This "
+                             "diagonal is rotated into WORLD frame using the hole's CURRENT "
+                             "orientation (identity, i.e. world -z, unless "
+                             "--hole-tilt-randomization-deg tilted it this episode), so Z "
+                             "stiffness tracks the hole's ACTUAL bore direction, not a "
+                             "hardcoded world -z -- verified (see README_insertion.md's "
+                             "'Hole-tilt randomization' section for the validated alignment- "
+                             "angle number). It is NOT trying to track the peg's own "
+                             "(possibly tilted, --enable-rotation/--peg-tilt-randomization-deg) "
+                             "long axis, and doesn't need to for this purpose. Try e.g. 0.5 "
+                             "0.5 1.5 for stiff-down/compliant-lateral: keeps insertion-axis "
                              "precision while softening the axes implicated in search-time "
                              "contact chatter. Cartesian damping scales with this too (see "
-                             "InsertionEnv._recompute_cartesian_damping), so the D/K ratio "
-                             "stays the same on every axis regardless of this setting")
+                             "InsertionEnv._recompute_task_space_gains), so the D/K ratio "
+                             "stays the same on every axis, in the same rotated frame, "
+                             "regardless of this setting")
     parser.add_argument("--tool-rot-kp", type=float, default=DEFAULT_TOOL_ROT_KP,
                         help="task-space rotational stiffness (N*m/rad), applied "
                              "isotropically to all 3 rotational DOF (no --tool-rot-kp-axes "
@@ -565,6 +592,7 @@ def main():
         ft_filter_cutoff_hz=args.ft_filter_cutoff_hz,
         noslip_iterations=args.noslip_iterations,
         peg_tilt_randomization_deg=args.peg_tilt_randomization_deg,
+        hole_tilt_randomization_deg=args.hole_tilt_randomization_deg,
     )
     env = InsertionTeleop(
         seed=args.seed,

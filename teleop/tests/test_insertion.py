@@ -72,6 +72,10 @@ class InsertionPropertiesTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             InsertionProperties(search_wiggle_amplitude_n=-1.0)
 
+    def test_rejects_negative_hole_tilt_randomization(self) -> None:
+        with self.assertRaises(ValueError):
+            InsertionProperties(hole_tilt_randomization_deg=-1.0)
+
 
 class DynamicFilterTest(unittest.TestCase):
     def test_converges_toward_constant_input(self) -> None:
@@ -202,6 +206,171 @@ class ScriptedDemoTest(unittest.TestCase):
                 result = run_scripted_demo(env=env, seed=seed, max_steps=40000)
                 successes += int(result.success)
         self.assertGreaterEqual(successes, 4)
+
+
+class HoleTiltRandomizationTest(unittest.TestCase):
+    """hole_tilt_randomization_deg -- mirrors peg_tilt_randomization_deg's
+    own no-op/range tests, plus a check that hole_entrance's world position
+    stays fixed (the socket tilts IN PLACE, walls swing around it, see
+    InsertionEnv.hole_body_id's comment)."""
+
+    def test_zero_is_a_true_noop(self) -> None:
+        with InsertionEnv(properties=InsertionProperties(hole_tilt_randomization_deg=0.0)) as env:
+            baseline_R = env.hole_rotation_matrix.copy()
+            baseline_pos = env.hole_entrance_pos.copy()
+            for _ in range(5):
+                env.reset()
+                np.testing.assert_array_equal(env.hole_rotation_matrix, np.eye(3))
+                np.testing.assert_array_equal(env.hole_rotation_matrix, baseline_R)
+                np.testing.assert_allclose(env.hole_entrance_pos, baseline_pos, atol=0.0)
+
+    def test_nonzero_samples_within_range_and_keeps_entrance_fixed(self) -> None:
+        max_deg = 15.0
+        with InsertionEnv(
+            seed=0, properties=InsertionProperties(hole_tilt_randomization_deg=max_deg)
+        ) as env:
+            entrance0 = env.hole_entrance_pos.copy()
+            saw_nonidentity = False
+            for _ in range(10):
+                env.reset()
+                R = env.hole_rotation_matrix
+                # hole_entrance's WORLD position must stay exactly fixed
+                # regardless of tilt -- rotating the socket body about its
+                # own (0,0,0)-local-pos origin, which is where the site
+                # sits, must not move that origin.
+                np.testing.assert_allclose(env.hole_entrance_pos, entrance0, atol=1e-9)
+                # R must be a valid rotation (orthonormal, det=+1).
+                np.testing.assert_allclose(R @ R.T, np.eye(3), atol=1e-9)
+                self.assertAlmostEqual(float(np.linalg.det(R)), 1.0, places=9)
+                bore_axis = R @ np.array([0.0, 0.0, 1.0])
+                angle_from_world_z = np.degrees(
+                    np.arccos(np.clip(bore_axis[2], -1.0, 1.0))
+                )
+                # Composed roll+pitch (each up to max_deg) can tilt the bore
+                # axis by more than max_deg alone; generous bound.
+                self.assertLessEqual(angle_from_world_z, 2.0 * max_deg + 1e-6)
+                if not np.allclose(R, np.eye(3)):
+                    saw_nonidentity = True
+            self.assertTrue(saw_nonidentity, "expected at least one tilted episode across 10 resets")
+
+    def test_peg_tip_depth_uses_tilted_hole_frame_not_world_z(self) -> None:
+        """peg_tip_depth_m() must project along the hole's ACTUAL (tilted)
+        bore axis, not a hardcoded world -z. Tests the FORMULA directly
+        (writes the tool site's xpos, bypassing the arm's dynamics/
+        controller entirely) rather than trying to physically drive a
+        STRAIGHT peg down a substantially TILTED bore -- that's a separate,
+        real geometric problem (a straight peg can legitimately catch the
+        tilted rim before reaching an arbitrary interior point, exactly the
+        kind of tilt-vs-orientation mismatch --peg-tilt-randomization-deg's
+        own scripted-demo caveat already documents for the peg side), not a
+        depth-FORMULA bug -- isolating the formula from that confound is
+        the honest way to check this specific claim."""
+        with InsertionEnv(
+            seed=0, properties=InsertionProperties(hole_tilt_randomization_deg=20.0)
+        ) as env:
+            env.reset()
+            R = env.hole_rotation_matrix
+            if np.allclose(R, np.eye(3)):
+                # Extremely unlikely (continuous uniform sample landing at
+                # exactly 0,0) but keep the test deterministic if it happens.
+                self.skipTest("sampled hole tilt was exactly zero")
+            local_bore_down = np.array([0.0, 0.0, -1.0])
+            world_bore_down = R @ local_bore_down
+            depth_m = 0.012
+            tip_target = env.hole_entrance_pos + depth_m * world_bore_down
+            env.data.site(env.tool_site_id).xpos[:] = tip_target
+            measured = env.peg_tip_depth_m()
+            self.assertAlmostEqual(measured, depth_m, places=9)
+
+            # And the reverse direction (above the fixture, along the same
+            # tilted axis) must read negative, same convention as untilted.
+            above_target = env.hole_entrance_pos - depth_m * world_bore_down
+            env.data.site(env.tool_site_id).xpos[:] = above_target
+            self.assertAlmostEqual(env.peg_tip_depth_m(), -depth_m, places=9)
+
+
+class ToolKpAxesHoleFrameAlignmentTest(unittest.TestCase):
+    """The actual motivating question: does --tool-kp-axes' stiffness
+    diagonal track a tilted HOLE's real bore axis, or does it stay pinned
+    to world -z? Validates the effective world-frame stiffness matrix's
+    principal axis against the hole's current bore direction directly,
+    with a numeric angle, rather than merely asserting no crash."""
+
+    def test_principal_stiffness_axis_tracks_tilted_hole_bore_axis(self) -> None:
+        props = InsertionProperties(hole_tilt_randomization_deg=15.0)
+        with InsertionEnv(
+            seed=0, properties=props, tool_kp=1200.0, tool_kp_axes=(0.5, 0.5, 2.0)
+        ) as env:
+            env.reset()
+            R = env.hole_rotation_matrix
+            self.assertFalse(np.allclose(R, np.eye(3)), "expected a nonzero sampled hole tilt")
+
+            K = env.task_space_kp[:3, :3]
+            # K must be symmetric (a valid rotated stiffness tensor).
+            np.testing.assert_allclose(K, K.T, atol=1e-9)
+            eigvals, eigvecs = np.linalg.eigh(K)
+            principal_axis = eigvecs[:, int(np.argmax(eigvals))]
+            # tool_kp_axes' largest component (2.0, index 2 -- "Z"/bore) is
+            # unique and strictly bigger than X/Y (0.5 each), so the
+            # top eigenvalue must correspond to the (rotated) hole-frame Z
+            # axis, with no degeneracy to worry about.
+            hole_bore_axis_world = R @ np.array([0.0, 0.0, 1.0])
+            if np.dot(principal_axis, hole_bore_axis_world) < 0.0:
+                principal_axis = -principal_axis
+            cos_angle = np.clip(np.dot(principal_axis, hole_bore_axis_world), -1.0, 1.0)
+            angle_deg = float(np.degrees(np.arccos(cos_angle)))
+            # The number this whole feature is FOR: aligned with the hole's
+            # actual bore axis to numerical precision, not off by anything
+            # close to the sampled tilt magnitude (~15 degrees) the way an
+            # un-rotated world-frame diagonal would be.
+            self.assertLess(angle_deg, 1e-6)
+
+            # Sanity check the eigenvalues themselves match tool_kp*axes.
+            np.testing.assert_allclose(sorted(eigvals), sorted([600.0, 600.0, 2400.0]), atol=1e-6)
+
+    def test_zero_hole_tilt_reduces_to_original_world_frame_diagonal(self) -> None:
+        """No-op check: at hole_tilt_randomization_deg=0, the rotated-frame
+        formula must be BYTE-IDENTICAL to the original bare world-frame
+        diagonal (R is exactly np.eye(3)), not merely close."""
+        with InsertionEnv(tool_kp=1200.0, tool_kp_axes=(0.5, 0.5, 2.0)) as env:
+            np.testing.assert_array_equal(env.hole_rotation_matrix, np.eye(3))
+            expected = np.diag([600.0, 600.0, 2400.0])
+            np.testing.assert_array_equal(env.task_space_kp[:3, :3], expected)
+
+    def test_cartesian_damping_also_rotates_with_hole_frame(self) -> None:
+        props = InsertionProperties(hole_tilt_randomization_deg=15.0, cartesian_damping_scale=1.0)
+        with InsertionEnv(
+            seed=1, properties=props, tool_kp=1200.0, tool_kp_axes=(0.5, 0.5, 2.0)
+        ) as env:
+            env.reset()
+            R = env.hole_rotation_matrix
+            self.assertFalse(np.allclose(R, np.eye(3)))
+            Kd = env.task_space_cartesian_kd[:3, :3]
+            np.testing.assert_allclose(Kd, Kd.T, atol=1e-9)
+            eigvals, eigvecs = np.linalg.eigh(Kd)
+            principal_axis = eigvecs[:, int(np.argmax(eigvals))]
+            hole_bore_axis_world = R @ np.array([0.0, 0.0, 1.0])
+            if np.dot(principal_axis, hole_bore_axis_world) < 0.0:
+                principal_axis = -principal_axis
+            cos_angle = np.clip(np.dot(principal_axis, hole_bore_axis_world), -1.0, 1.0)
+            angle_deg = float(np.degrees(np.arccos(cos_angle)))
+            self.assertLess(angle_deg, 1e-6)
+
+    def test_step_task_space_still_works_with_nondiagonal_kp_kd(self) -> None:
+        """step_task_space's task_space_kp/task_space_cartesian_kd usage
+        must be a general matrix-vector product, not assuming diagonal
+        structure -- exercise it directly at a nonzero hole tilt and check
+        the sim stays finite/stable."""
+        props = InsertionProperties(hole_tilt_randomization_deg=15.0)
+        with InsertionEnv(seed=0, properties=props, tool_kp=1200.0, tool_kp_axes=(0.5, 0.5, 2.0)) as env:
+            env.reset()
+            self.assertFalse(np.allclose(env.task_space_kp[:3, :3], np.diag(np.diag(env.task_space_kp[:3, :3]))))
+            target = env.tool_pos.copy()
+            for _ in range(2000):
+                ok = env.step(target)
+                self.assertTrue(ok)
+            self.assertTrue(np.all(np.isfinite(env.data.qpos)))
+            self.assertTrue(np.all(np.isfinite(env.data.qvel)))
 
 
 class InsertionRecorderTest(unittest.TestCase):

@@ -491,6 +491,29 @@ class InsertionProperties:
     # it is), it does not add any per-step operator control by itself.
     peg_tilt_randomization_deg: float = 0.0
 
+    # Max magnitude (degrees) of a random per-episode roll+pitch tilt applied
+    # to the SOCKET FIXTURE (not the peg) on reset -- mirrors
+    # peg_tilt_randomization_deg's pattern exactly (independent uniform
+    # roll/pitch in [-DEG, DEG], 0 default is a true no-op), see
+    # InsertionEnv.reset()'s "randomize hole orientation" block.
+    #
+    # No yaw term, but NOT for the same reason peg_tilt_randomization_deg
+    # skips yaw. The peg is axisymmetric (a capsule) so peg yaw is a true
+    # geometric no-op regardless of the hole. The socket's square opening,
+    # by contrast, is only 4-fold symmetric -- a yaw of the SOCKET is NOT
+    # in general a no-op (it changes which world direction each flat wall
+    # face points). It's excluded here anyway because, after composing it
+    # with the peg's own axisymmetric tip, a yaw of the hole about its OWN
+    # (possibly already roll/pitch-tilted) bore axis still doesn't change
+    # the peg-vs-hole CONTACT geometry: the peg tip is round, so it presents
+    # the identical contact surface to the 4 walls no matter which way they
+    # are yawed about the bore axis. I.e. this is the peg's symmetry doing
+    # the work here, not the hole's -- worth stating explicitly since it is
+    # a different (and easier to get backwards) argument than peg tilt's.
+    # If a non-round peg is ever ported, this reasoning would need
+    # revisiting and a yaw term would likely need to be added.
+    hole_tilt_randomization_deg: float = 0.0
+
     # MuJoCo's dedicated post-pass for refining the friction-force split
     # across several simultaneous near-redundant contacts -- ported from
     # FLIPUP_LOW_STIFFNESS_CONTROLLER.md #6: the peg touching 2+ socket
@@ -551,6 +574,8 @@ class InsertionProperties:
             raise ValueError("peg_softness_max_solimp_width must be in (0, 1)")
         if self.peg_tilt_randomization_deg < 0.0:
             raise ValueError("peg_tilt_randomization_deg cannot be negative")
+        if self.hole_tilt_randomization_deg < 0.0:
+            raise ValueError("hole_tilt_randomization_deg cannot be negative")
 
 
 DEFAULT_INSERTION_PROPERTIES = InsertionProperties()
@@ -602,12 +627,23 @@ class InsertionEnv(FlipUpEnv):
         # matters for finding/entering the hole) while staying compliant
         # laterally (the axes implicated in search-time contact chatter),
         # instead of one scalar tool_kp forcing the same tradeoff on all
-        # three. The peg always points along WORLD -z at home_rotvec (see
-        # NOMINAL_HOME_ROTVEC) -- these axes are WORLD-frame, matching
-        # flipup's convention, not the (possibly tilted, if
-        # --enable-rotation/--peg-tilt-randomization-deg is in play) peg's
-        # own body frame; index 2 (Z) is "the direction the peg points down"
-        # only when the peg is untilted, same caveat flipup's version has.
+        # three. index 2 (Z) is meant to track "the hole's own bore
+        # direction" -- NOT the peg's own (possibly tilted, if
+        # --enable-rotation/--peg-tilt-randomization-deg is in play) body
+        # frame, same caveat flipup's version has for the peg side.
+        #
+        # UPDATE (hole_tilt_randomization_deg): this diagonal is built in
+        # the HOLE's own frame and then rotated into world frame by
+        # _recompute_task_space_gains (R @ diag(...) @ R.T, R =
+        # self.hole_rotation_matrix), NOT applied as a bare world-frame
+        # diagonal as it originally was. At hole_tilt_randomization_deg=0,
+        # R is exactly the identity matrix, so this is byte-identical to
+        # the original "these axes are WORLD-frame" behavior -- but once
+        # the hole is tilted, Z now correctly tracks the hole's ACTUAL
+        # current bore axis instead of a hardcoded world -z (which would
+        # otherwise silently mismatch the moment the hole tilts -- this
+        # was the actual motivating gap hole_tilt_randomization_deg was
+        # built to expose and fix; see README_insertion.md).
         self.tool_kp_axes = np.asarray(tool_kp_axes, dtype=np.float64)
         self.tool_rot_kp = float(tool_rot_kp)
 
@@ -643,12 +679,32 @@ class InsertionEnv(FlipUpEnv):
         )
         self.hole_entrance_site_id = self.model.site("insertion_hole/hole_entrance").id
         self.hole_bottom_site_id = self.model.site("insertion_hole/hole_bottom").id
+        # The fixed (no-joint) body whose pose is mutated per-episode by
+        # hole_tilt_randomization_deg -- see reset()'s "randomize hole
+        # orientation" block. Its own body_pos is (0,0,0) relative to its
+        # parent (the "insertion_hole/" attachment body created by
+        # FlipUpEnv._attach_model), and the hole_entrance site sits at this
+        # body's own local origin (pos="0 0 0" in insertion_hole.xml) --
+        # so rotating ONLY this body's body_quat (never body_pos) leaves
+        # hole_entrance's WORLD POSITION exactly fixed while every wall/
+        # floor geom (and hole_bottom) swings around it. Verified directly
+        # (rotate 15deg about x, call physics.forward(), compare
+        # hole_entrance site xpos before/after: bit-identical; wall geom
+        # xpos changes as expected) before building anything else on this.
+        self.hole_body_id = self.model.body("insertion_hole/socket").id
+        self._hole_body_quat0 = self.model.body_quat[self.hole_body_id].copy()
+        # Current world-frame rotation matrix of the hole's own bore-axis
+        # frame (identity at hole_tilt_randomization_deg=0, matching the
+        # original untilted behavior exactly). Recomputed in reset() any
+        # time the hole's orientation is (re)sampled; task_space_kp/
+        # task_space_cartesian_kd's translational blocks are rotated into
+        # this frame by _recompute_task_space_gains below, so
+        # --tool-kp-axes' Z axis tracks "the hole's actual bore direction",
+        # not a hardcoded world -z, once the hole is tilted.
+        self.hole_rotation_matrix = np.eye(3, dtype=np.float64)
 
-        self.task_space_kp = np.diag(
-            list(self.tool_kp * self.tool_kp_axes) + [self.tool_rot_kp] * 3
-        ).astype(np.float64)
         self.task_space_kd = DEFAULT_JOINT_KD * float(arm_damping)
-        self._recompute_cartesian_damping()
+        self._recompute_task_space_gains()
 
         self.jacobian = np.zeros((6, self.model.nv), dtype=np.float64)
         self.twist = np.zeros(6, dtype=np.float64)
@@ -697,29 +753,86 @@ class InsertionEnv(FlipUpEnv):
 
             self.viewer = viewer.launch_passive(model=self.model.ptr, data=self.data.ptr)
 
-    def _recompute_cartesian_damping(self) -> None:
-        """(Re)build task_space_cartesian_kd from _CARTESIAN_KD_RATIO applied
-        to this controller's own Kp diagonal -- see module docstring / the
-        _CARTESIAN_KD_RATIO comment for the porting rationale. This is the
-        "extend the existing task-space PD law with non-zero Cartesian
-        translational damping" piece the task brief calls for; sanding/flipup
-        both leave translational Cartesian damping at exactly zero (see
-        flipup_minimal/flipup/environment.py:110-119).
+    def _recompute_task_space_gains(self) -> None:
+        """(Re)build BOTH task_space_kp and task_space_cartesian_kd as full
+        6x6 matrices, whose TRANSLATIONAL 3x3 block is expressed in the
+        hole's CURRENT world-frame orientation (self.hole_rotation_matrix)
+        rather than a bare world-frame diagonal.
 
-        Unlike flipup_teleop.py's --tool-kp-axes (whose own comment flags
-        this as a known gap: "every OTHER formula that uses tool_kp still
-        uses the plain scalar -- an approximation once this is
-        anisotropic"), this scales the damping diagonal by tool_kp_axes
-        too, so a stiffer axis gets proportionally more damping rather
-        than inheriting the isotropic scalar's damping while running at a
-        different stiffness -- keeps the same D/K ratio (hence the same
-        qualitative damping character) on every axis regardless of
-        tool_kp_axes."""
-        kp_diag = np.concatenate(
-            [self.tool_kp * self.tool_kp_axes, [self.tool_rot_kp] * 3]
-        ).astype(np.float64)
+        Must be called any time either tool_kp/tool_kp_axes/tool_rot_kp OR
+        self.hole_rotation_matrix changes -- in particular every reset(),
+        since hole_tilt_randomization_deg resamples the hole's orientation
+        every episode, not just once at __init__.
+
+        Frame-aware --tool-kp-axes (the actual motivating question this was
+        built for -- "does --tool-kp-axes already account for a tilted
+        hole?"): NO, not before this method existed. --tool-kp-axes'
+        diagonal diag(tool_kp*tool_kp_axes) is defined in the HOLE's own
+        frame (axis 2 = "the hole's bore direction", axis 0/1 = "lateral to
+        the hole's opening"), then rotated into world frame by
+        R @ diag(...) @ R.T, where R = self.hole_rotation_matrix. At
+        hole_tilt_randomization_deg=0, R is exactly the identity matrix, so
+        this reduces to the original bare world-frame diagonal byte-for-byte
+        -- a true no-op, not an approximation of one. Once the hole is
+        tilted, R correctly re-expresses the SAME hole-frame diagonal (Z
+        stiffest, per --tool-kp-axes) rotated to point along the hole's
+        actual current bore axis instead of a hardcoded world -z. See
+        README_insertion.md's "Hole-tilt randomization" section for the
+        validated alignment-angle number proving this (the effective
+        world-frame stiffness matrix's principal axis tracks the tilted
+        hole's bore direction, not world -z).
+
+        The ROTATIONAL 3x3 block (tool_rot_kp) is left exactly as before --
+        isotropic, not rotated into the hole frame -- since wrist-orientation
+        tracking error is already expressed in world frame by
+        step_task_space's mju_quat2Vel call and there is no anisotropic
+        --tool-rot-kp-axes to rotate in the first place (see
+        README_insertion.md's "Rotational stiffness" section).
+
+        Cartesian damping (ported from force-insertion-sim, see module
+        docstring / _CARTESIAN_KD_RATIO's comment) is rotated the SAME way
+        and for the SAME reason its own existing comment already gives for
+        why it must scale with --tool-kp-axes at all: keeping the D/K
+        damping ratio identical on every axis regardless of --tool-kp-axes
+        now also means keeping it identical on every axis of the HOLE's
+        frame, not world frame, once the hole is tilted -- otherwise a
+        tilted hole would silently reintroduce exactly the "every OTHER
+        formula that uses tool_kp still uses the plain scalar" gap
+        flipup_teleop.py's own --tool-kp-axes comment flags, just moved from
+        stiffness to damping.
+
+        Unlike the old scalar-per-axis task_space_cartesian_kd (applied via
+        elementwise `*`), this is now a full 6x6 matrix applied via `@` in
+        step_task_space -- verified that step_task_space's use of both
+        task_space_kp/task_space_cartesian_kd is a fully general matrix-
+        vector product (`M @ twist`/`M @ tool_velocity`), not anywhere
+        assuming diagonal-only structure, so a genuinely non-diagonal
+        (rotated) 3x3 block works correctly with no other changes needed
+        there.
+        """
+        R = self.hole_rotation_matrix
+        trans_kp_hole = np.diag(self.tool_kp * self.tool_kp_axes)
+        trans_kp_world = R @ trans_kp_hole @ R.T
+        self.task_space_kp = np.zeros((6, 6), dtype=np.float64)
+        self.task_space_kp[:3, :3] = trans_kp_world
+        self.task_space_kp[3:, 3:] = np.eye(3, dtype=np.float64) * self.tool_rot_kp
+
         scale = float(self.properties.cartesian_damping_scale)
-        self.task_space_cartesian_kd = kp_diag * _CARTESIAN_KD_RATIO * scale
+        trans_kd_hole = np.diag(
+            self.tool_kp * self.tool_kp_axes * _CARTESIAN_KD_RATIO[:3] * scale
+        )
+        trans_kd_world = R @ trans_kd_hole @ R.T
+        rot_kd = self.tool_rot_kp * _CARTESIAN_KD_RATIO[3:] * scale
+        self.task_space_cartesian_kd = np.zeros((6, 6), dtype=np.float64)
+        self.task_space_cartesian_kd[:3, :3] = trans_kd_world
+        self.task_space_cartesian_kd[3:, 3:] = np.diag(rot_kd)
+
+    # Backward-compatible alias: earlier code/comments called this
+    # _recompute_cartesian_damping (translation-damping-only). Kept as a
+    # thin alias rather than removed in case anything outside this file
+    # still calls it by the old name.
+    def _recompute_cartesian_damping(self) -> None:
+        self._recompute_task_space_gains()
 
     # ------------------------------------------------------------- building
     @classmethod
@@ -915,8 +1028,11 @@ class InsertionEnv(FlipUpEnv):
         from force-insertion-sim per the task brief:
 
           - task_space_cartesian_kd now has non-zero TRANSLATIONAL entries
-            (see _recompute_cartesian_damping), not just rotational like
-            sanding's tool_rot_kd.
+            (see _recompute_task_space_gains), not just rotational like
+            sanding's tool_rot_kd. Both task_space_kp and
+            task_space_cartesian_kd are full 6x6 matrices whose
+            translational 3x3 block is rotated into the hole's current
+            (possibly tilted, see hole_tilt_randomization_deg) frame.
           - an optional ``feed_forward_wrench`` (raw/desired, 6,) is passed
             through this env's DynamicFilter instance every step and the
             smoothed result is added directly to task_wrench BEFORE the
@@ -957,7 +1073,7 @@ class InsertionEnv(FlipUpEnv):
         F_ff = self._dynamic_filter.step(F_df, self.timestep)
         task_wrench = (
             self.task_space_kp @ self.twist
-            - self.task_space_cartesian_kd * tool_velocity
+            - self.task_space_cartesian_kd @ tool_velocity
             + F_ff
         )
         generalized_force = self.jacobian.T @ task_wrench
@@ -1042,7 +1158,44 @@ class InsertionEnv(FlipUpEnv):
         self.data.ctrl[:] = 0.0
         self.data.time = 0.0
         self.data.qpos[self.joint_qpos_ids] = self._HOME_JOINTS
+
+        # Randomize this episode's SOCKET (hole) orientation by up to
+        # hole_tilt_randomization_deg (0 = always exactly the compiled,
+        # untilted body_quat, a true no-op). Set BEFORE physics.forward()
+        # below so the same forward() call that resolves qpos also resolves
+        # this body_quat change into hole_entrance's/the wall geoms' world
+        # poses -- see hole_body_id's comment for why rotating ONLY this
+        # body's body_quat (never its body_pos, which stays (0,0,0)) keeps
+        # hole_entrance's world position exactly fixed while the walls/floor
+        # swing around it (verified directly, not assumed -- see that
+        # comment). Same sampling scheme as peg_tilt_randomization_deg:
+        # independent roll/pitch, each uniform in [-max, max] degrees, no
+        # yaw -- see hole_tilt_randomization_deg's docstring for why the
+        # "no yaw" reasoning here is NOT simply copied from the peg's (the
+        # square opening is only 4-fold symmetric; it's the ROUND PEG's
+        # symmetry that makes a hole yaw a contact-geometry no-op here).
+        hole_max_deg = float(self.properties.hole_tilt_randomization_deg)
+        if hole_max_deg > 0.0:
+            hole_roll, hole_pitch = self._rng.uniform(-hole_max_deg, hole_max_deg, size=2)
+            hole_tilt = Rotation.from_euler("xy", (hole_roll, hole_pitch), degrees=True)
+            hole_quat_matrix = hole_tilt.as_matrix()
+            self.model.body_quat[self.hole_body_id] = _wxyz_from_matrix(hole_quat_matrix)
+        else:
+            self.model.body_quat[self.hole_body_id] = self._hole_body_quat0
+
         self.physics.forward()
+
+        # Read back the ACTUAL compiled world-frame rotation of the hole's
+        # own bore-axis frame (the hole_entrance site's xmat, which shares
+        # the socket body's frame exactly -- see insertion_hole.xml, no
+        # site-local quat given) rather than re-deriving it from hole_tilt
+        # above, so this stays correct regardless of HOLE_TRANSFORM/parent-
+        # body rotations even if those ever change.
+        self.hole_rotation_matrix = np.asarray(
+            self.data.site(self.hole_entrance_site_id).xmat, dtype=np.float64
+        ).reshape(3, 3).copy()
+        self._recompute_task_space_gains()
+
         self._broken = False
         self._break_streak = 0
         self._break_force_filtered = 0.0

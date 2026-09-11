@@ -298,6 +298,22 @@ def build_arg_parser():
                              "force approaches breaking, not a clipped/truncated version of it")
     parser.add_argument("--max-force", type=float, default=10.0,
                         help="clamp on the handle force vector magnitude (N)")
+    parser.add_argument("--pos-tau", type=float, default=8.0,
+                        help="time constant (ms) of a one-pole smoothing filter on the RAW "
+                             "DEVICE POSITION, applied BEFORE --scale, 0 = raw. Ported from "
+                             "teleop_flipup.py's --pos-tau -- was missing here entirely (this "
+                             "task had --force-tau, which only smooths the force reflected "
+                             "BACK to the device, but nothing filtered the incoming position "
+                             "signal). Matters because --scale multiplies whatever tremor/"
+                             "noise sits on the raw device position, and once the peg is "
+                             "touching all 4 socket walls at once (the normal state while "
+                             "inserting), the combined contact stiffness is high enough that "
+                             "even small residual position noise shows up as a real force "
+                             "ripple -- a real recorded episode's inside-the-hole force std "
+                             "(3.0N) was ~3x this env's own noiseless scripted-demo baseline "
+                             "(1.06N) doing the identical descent, the gap being consistent "
+                             "with unfiltered hand tremor riding straight through to the "
+                             "target. 0 disables filtering (today's unfiltered behavior)")
     parser.add_argument("--force-tau", type=float, default=2.0,
                         help="handle-force smoothing time constant (ms), 0 = raw")
     parser.add_argument("--force-rate", type=float, default=80.0,
@@ -525,6 +541,8 @@ def main():
         parser.error("--tool-kp-axes must have exactly 3 positive values")
     if args.tool_rot_kp <= 0.0:
         parser.error("--tool-rot-kp must be positive")
+    if args.pos_tau < 0.0:
+        parser.error("--pos-tau cannot be negative")
     if args.collect_dataset:
         _log_session_command(args.collect_dataset, sys.argv[1:], args)
     pos_map = build_pos_map(args.axes)
@@ -1022,6 +1040,18 @@ def main():
     home_xyz = np.array(args.home, dtype=float)
     armed_at = None if not args.dry_run else t_start
 
+    # One-pole low-pass on the raw device position, applied BEFORE --scale
+    # amplifies whatever tremor/noise it carries (see --pos-tau's help).
+    # Ported from teleop_flipup.py's identical filtered_pos/pos_alpha
+    # pattern. alpha=1.0 (args.pos_tau<=0) reduces this to filtered_pos ==
+    # raw pos, i.e. the previously-only-available unfiltered behavior.
+    # Seeded from the device's actual position on first use (below) rather
+    # than zeros, so the first filtered sample isn't a spurious jump from
+    # the origin.
+    pos_tau_s = args.pos_tau / 1000.0
+    pos_alpha = 1.0 if pos_tau_s <= 0.0 else 1.0 - np.exp(-dt / pos_tau_s)
+    filtered_device_pos = [None]
+
     if recorder is not None and args.dry_run:
         start_episode()
 
@@ -1085,7 +1115,14 @@ def main():
             else:
                 state = device.get_state()
                 device_state = state
-                device_xyz = state["pos"][:3]
+                raw_device_xyz = np.asarray(state["pos"][:3], dtype=float)
+                if filtered_device_pos[0] is None:
+                    filtered_device_pos[0] = raw_device_xyz.copy()
+                else:
+                    filtered_device_pos[0] = filtered_device_pos[0] + pos_alpha * (
+                        raw_device_xyz - filtered_device_pos[0]
+                    )
+                device_xyz = filtered_device_pos[0]
                 desired = reset_target + pos_map @ (scale * (device_xyz - home_xyz))
                 desired[2] += args.z_bias
                 if state["long_press_count"] > 0:

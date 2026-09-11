@@ -884,6 +884,69 @@ a genuinely open table from clearly outside any margin). **Not
 implemented**: no measured benefit over the existing sustained clamp for
 this fixture's geometry.
 
+## Investigation: bouncing while inserted, even with a good `--stiffness`
+
+User question, after fixing the `--stiffness` passivity-limit issue (see
+"handle stiffness ... WARNING" above): "still feels like bouncing inside
+the hole, why?"
+
+Analyzed a real recorded episode (`~/data/insertion_v5.zarr`, session 10,
+`--stiffness 2000`, no passivity warning). Findings:
+
+- `contact_count` is rock-steady at 4 (occasionally 5) the entire time the
+  peg is inside the hole -- NOT flickering/dropping to 0. This rules out
+  the classic dropout/re-impact chatter mechanism (the sanding/edge-
+  crossing kind) as the cause here; the peg is symmetrically touching all
+  4 walls at once, continuously, not losing and regaining contact.
+- `normal_force_n` nonetheless shows a real, clean, roughly periodic
+  ripple (~65Hz, ~1.3N peak-to-peak) riding on a steady mean (~4.5N) while
+  `peg_tip_depth_m` increases smoothly and steadily underneath it --
+  insertion IS progressing at a normal rate, it just has a felt ripple on
+  top.
+- **The scripted demo (zero human input, perfectly smooth commanded
+  trajectory) shows the SAME kind of ripple during its own INSERT phase**
+  (~0.2N peak-to-peak, force std 1.06N) -- so this is not purely a "human
+  hand isn't steady" artifact; there's an inherent, small ripple in this
+  multi-wall-contact configuration even with a mathematically perfect
+  input. The real episode's ripple (std 3.0N) is roughly 3x larger than
+  the scripted demo's noiseless baseline -- consistent with real device
+  input adding variance on top of that inherent baseline, not being the
+  sole cause.
+- Swept `--noslip-iterations` (0/5/15/25/40) against a synthetic
+  centered-descent reproduction: **zero effect**, confirming (again, as in
+  the inner-top-edge investigation) that this knob doesn't touch this
+  class of artifact.
+- Swept `--cartesian-damping-scale` (0.5-3.0): small, counter-intuitive
+  effect -- MORE damping slightly INCREASED the synthetic ripple (std
+  0.14 at 0.5 -> 0.36 at 2.0) in this specific centered/symmetric
+  configuration. Not a lever worth pushing on for this.
+- Swept `--tool-kp-axes`' Z multiplier (1.0/1.2/1.5/2.0, holding X/Y at
+  0.5): a real, monotonic reduction (std 0.65 at Z=1.0 -> 0.17 at Z=2.0).
+  **Worth pushing further than the previously-recommended 1.5** -- try
+  `--tool-kp-axes 0.5 0.5 2.0`.
+- Added `--pos-tau` (ported from `teleop_flipup.py`, which has had this
+  since early in the project; `teleop_insertion.py` never got it). Filters
+  the RAW DEVICE POSITION before `--scale` amplifies whatever tremor sits
+  on it -- previously only `--force-tau` existed, which smooths the force
+  reflected back TO the device, not the position signal FROM it, so real
+  hand tremor rode straight through unfiltered. **Honestly reported: a
+  synthetic white-noise-injection test (0.3mm std position noise) did NOT
+  show a clear reduction in force std across `--pos-tau` 0/4/8/16/30ms**
+  (0.85-0.93N throughout) -- so this is shipped as a real, precedented,
+  low-risk gap-closer (matches flipup's proven pattern), not as a proven
+  fix for this specific ripple. Real device tremor may have different
+  spectral characteristics than the white noise tested; worth trying
+  `--pos-tau 8` (the flipup default) live since it can't make things worse
+  and might help against real (non-white) tremor.
+
+**Bottom line**: this specific inside-the-hole ripple is smaller in
+absolute terms (a few N riding on top of a few N mean, well under
+`--max-force`) than the earlier wedging/jam-force/bouncing problems that
+were fully fixed, and appears to have an irreducible component even in the
+noiseless scripted demo. `--tool-kp-axes 0.5 0.5 2.0` is the one concretely
+validated lever to push further; `--pos-tau 8` is a reasonable try, not a
+proven fix.
+
 ## Lowering `--friction` for free axial sliding once inserted
 
 User question: "once the peg is in the hole, why doesn't it slide down for

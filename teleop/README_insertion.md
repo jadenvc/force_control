@@ -1083,6 +1083,196 @@ straight-down, byte-identical to the original behavior):
   teleop data collection, where a human operator can see and correct for
   the tilt; it isn't meant to make the scripted demo itself tilt-robust.
 
+## Hole-tilt randomization, and making `--tool-kp-axes` frame-aware
+
+User question: does `--tool-kp-axes` (see "Anisotropic stiffness" above)
+already account for a tilted *hole*, the way it was already verified to
+handle a tilted *peg*? Answer: **no** -- its translational diagonal was
+built once, in `InsertionEnv.__init__`, as a bare WORLD-frame
+`np.diag(tool_kp * tool_kp_axes)`, which only tracks "the hole's bore
+direction" because the hole itself had never had an orientation knob at
+all; every world -z in this codebase up to this point was silently doing
+double duty as both "world down" and "the hole's bore axis" only because
+those two directions had always been identical.
+
+### `--hole-tilt-randomization-deg`
+
+New `InsertionProperties` field, added by mirroring
+`peg_tilt_randomization_deg`'s pattern exactly: on each `reset()`, samples
+an independent roll and pitch (each uniform in `[-DEG, DEG]`) and applies
+it to the SOCKET FIXTURE instead of the peg. `0` (default) is a true no-op,
+verified the same way `peg_tilt_randomization_deg=0` is (bit-identical
+`hole_rotation_matrix == np.eye(3)` and `task_space_kp`/
+`task_space_cartesian_kd` byte-identical to the pre-existing hardcoded
+diagonal, across repeated resets).
+
+**No yaw term -- but NOT for the same reason the peg's tilt skips yaw.**
+The peg's own docstring reasoning ("axisymmetric capsule, yaw is a true
+geometric no-op") does **not** transfer to the hole: the socket's square
+opening is only 4-fold symmetric, so a yaw of the *socket* by an arbitrary
+angle is not, in general, a no-op -- it changes which world direction each
+flat wall face points. Yaw is excluded anyway, but the actual reason is
+the **peg's** symmetry, not the hole's: the peg tip is round, so it
+presents an identical contact surface to the 4 walls no matter how they
+are yawed about the hole's own (possibly already tilted) bore axis, so a
+hole-yaw term would add a real sampling/composition step for zero effect
+on peg-vs-hole contact geometry. This is worth stating explicitly because
+it is a different argument than the peg's, easy to get backwards, and
+would need revisiting if a non-round peg is ever ported.
+
+### Implementation: rotating a fixed (no-joint) MJCF body at runtime
+
+The socket is compiled as a body with no joint (`insertion_hole.xml`'s
+`<body name="socket" pos="0 0 0">`, attached into the world at a fixed
+`HOLE_TRANSFORM` by `FlipUpEnv._attach_model`) -- its pose is defined
+directly by `model.body_pos`/`model.body_quat`, both ordinary *mutable*
+MuJoCo model arrays (not something baked into the compiled geometry), and
+`mj_forward`/`mj_step` recompute every child's world pose (`xpos`/`xmat`,
+including all 4 wall geoms, the floor, and the `hole_entrance`/
+`hole_bottom` sites) from them on every call, exactly like any other body.
+This was verified directly before building anything else on top of it (not
+assumed): rotate `model.body_quat[hole_body_id]` by 15 degrees about x,
+call `physics.forward()`, and confirm `hole_entrance`'s site `xpos`/`xmat`
+and a wall geom's `xpos` update as expected.
+
+**Convention chosen: the socket tilts in place around the entrance point.**
+`insertion_hole.xml`'s `hole_entrance` site sits at `pos="0 0 0"` *within*
+the socket body, i.e. exactly at that body's own local origin -- and the
+socket body's own `body_pos` (its offset from its PARENT, the fixed
+attachment body) is also `(0, 0, 0)`. Rotating `body_quat` alone (never
+touching `body_pos`) therefore leaves the socket body's origin -- and so
+`hole_entrance`'s WORLD position -- exactly fixed, while every wall/floor
+geom (and `hole_bottom`, offset along the now-tilted local z) swings around
+it. Measured (rotate 15 degrees about x, `physics.forward()`):
+`hole_entrance_pos` bit-identical before/after; the +x wall geom's `xpos`
+moves as expected. This was the natural, and only sensible, choice here --
+"the entrance point stays put, the fixture tilts around it" matches how a
+real fixture bolted down at one reference point but manufactured/installed
+slightly out of true would behave, and keeps `InsertionEnv`'s existing
+`hole_entrance_pos` bookkeeping trivially correct (unchanged) rather than
+needing to track a moving reference point.
+
+`InsertionEnv.hole_rotation_matrix` (a new attribute, recomputed every
+`reset()` right after the tilt is sampled and `physics.forward()` is
+called) holds the hole's current world-frame orientation, read back
+directly from `hole_entrance`'s own live `xmat` -- not re-derived from the
+sampled roll/pitch -- so it stays correct regardless of any future changes
+to `HOLE_TRANSFORM` or intermediate parent-body rotations.
+
+**`peg_tip_depth_m()` needed NO code change.** Re-reading it against this
+feature (it was assumed going in that it would need one, since success/
+depth detection silently misbehaving at nonzero hole tilt was called out
+as a real risk): it already projects `tip_world - entrance_world` into
+`hole_entrance`'s own live `xmat` frame (`entrance_mat.T @ ...`), not a
+hardcoded world -z -- so it was *already* generically correct for a tilted
+hole, it simply had never been exercised with one before. Verified
+directly (not just by inspection): with the tool site's `xpos` placed by
+hand exactly `12mm` along a 20-degree-tilted hole's own bore axis from
+`hole_entrance`, `peg_tip_depth_m()` returns `0.012000000000000012` (i.e.
+correct to floating-point precision), and the reverse direction (above the
+tilted entrance, same axis) returns `-0.012` -- see
+`tests/test_insertion.py`'s `test_peg_tip_depth_uses_tilted_hole_frame_not_world_z`.
+
+### The actual fix: `--tool-kp-axes`/damping rotated into the hole's live frame
+
+`InsertionEnv._recompute_task_space_gains` (replacing the old
+`_recompute_cartesian_damping`, kept as a thin backward-compatible alias)
+now builds BOTH `task_space_kp` and `task_space_cartesian_kd` as full 6x6
+matrices whose translational 3x3 block is
+
+```
+R @ diag(tool_kp * tool_kp_axes) @ R.T          # stiffness
+R @ diag(tool_kp * tool_kp_axes * kd_ratio * scale) @ R.T   # damping
+```
+
+with `R = InsertionEnv.hole_rotation_matrix` -- i.e. `--tool-kp-axes`'
+diagonal is now defined in the HOLE's own frame (axis 2 = "the hole's bore
+direction") and rotated into world frame using the hole's CURRENT
+orientation, rather than being a bare world-frame diagonal that silently
+assumed the hole's bore direction was always world -z. At
+`hole_tilt_randomization_deg=0`, `R` is exactly `np.eye(3)`, so this is
+byte-identical to the pre-existing behavior (verified:
+`test_zero_hole_tilt_reduces_to_original_world_frame_diagonal`) -- a true
+no-op, matching every other knob in this file's convention. Cartesian
+damping is rotated for the exact reason its own pre-existing comment
+already gave for scaling with `--tool-kp-axes` at all: keeping the D/K
+ratio identical on every axis, now in the hole's actual current frame, not
+just a fixed world one.
+
+This required changing `step_task_space`'s Cartesian-damping term from an
+elementwise product (`self.task_space_cartesian_kd * tool_velocity`,
+correct only for a diagonal-as-vector representation) to a matrix product
+(`self.task_space_cartesian_kd @ tool_velocity`) -- `task_space_kp` was
+already applied via `@` and needed no change. Checked directly (not
+assumed): `step_task_space`'s use of both matrices is a fully general
+matrix-vector product nowhere else in the control law that assumes
+diagonal-only structure, so a genuinely non-diagonal (rotated) 3x3 block
+works correctly with this one change.
+
+**Validated, not just claimed**: at a synthetic 15-degree hole tilt
+(`--tool-kp 1200 --tool-kp-axes 0.5 0.5 2.0`), the effective world-frame
+translational stiffness matrix's principal eigenvector (the axis
+corresponding to `tool_kp_axes`' largest component, Z=2.0, unique and
+non-degenerate against X/Y=0.5) is compared directly against the hole's
+actual current bore axis (`R @ [0, 0, 1]`):
+
+| quantity | value |
+|---|---|
+| sampled hole tilt (this seed) | ~15 degrees (independent roll+pitch, each in [-15, 15]) |
+| angle: principal stiffness axis vs. hole's ACTUAL bore axis | **0.0 degrees** (dot product exactly `1.0` in float64) |
+| angle: principal stiffness axis vs. WORLD -z (what the old, unrotated code effectively assumed) | **19.9 degrees** |
+| stiffness eigenvalues | 600, 600, 2400 N/m (= `tool_kp * tool_kp_axes`, exactly) |
+| same check, Cartesian damping's principal axis vs. hole's bore axis | **0.0 degrees** |
+
+I.e. before this fix, at a 15-degree hole tilt, `--tool-kp-axes 0.5 0.5
+2.0`'s "stiff along Z" axis would have been pointing ~20 degrees away from
+the hole's actual insertion direction (silently -- no error, no warning,
+just physically wrong); after this fix it tracks the hole's real bore
+direction to numerical precision, confirming the frame-aware formula (not
+just its zero-tilt no-op case) is doing what it's supposed to. See
+`tests/test_insertion.py`'s `ToolKpAxesHoleFrameAlignmentTest` for the
+exact reproducible check (this table's numbers come from that test).
+
+### What's supported: live teleop; scripted demo is NOT
+
+**`teleop_insertion.py` (live teleop) is the supported, validated path**
+for `--hole-tilt-randomization-deg` -- confirmed with the user's validated
+data-collection command (`--tool-kp 1200 --tool-kp-axes 1 1 2 ...`, see
+"Data collection & live monitoring" above) plus
+`--hole-tilt-randomization-deg 10/20/30/45` via `--dry-run`: no crash, no
+corrupted state, clean exit (code 0, no traceback) at every value tried.
+
+**`insertion_scripted_demo.py`'s phase state machine is explicitly NOT
+adapted for a tilted hole**, and this is scoped out deliberately rather
+than fixed, mirroring exactly how `--peg-tilt-randomization-deg`'s own
+section above already scopes out the scripted demo for a tilted peg (same
+underlying reason: `CONTACT_CONTROL_Z`, the APPROACH/CONTACT hover/descent
+targets, and the SEARCH spiral all assume the hole's bore axis is world
+-z, i.e. that `entrance[2]` alone determines "how far down to go"). Tried
+directly via `--dry-run` (which reuses `run_scripted_demo` verbatim) at
+10/20/30/45 degrees: it does NOT crash at any of these (clean exit, no
+traceback), and interestingly some seeds/tilts still nominally "succeed"
+(a straight-down min-jerk descent can still land inside a moderately
+tilted opening by luck) while others correctly report a clean failure
+(`insert_timeout` at 30 degrees, seed 30) -- i.e. it degrades gracefully
+exactly as required, without ever being a validated demonstration of
+tilt-robustness. Given the task's scope (live teleop correctness was the
+priority), no attempt was made to adapt the scripted demo's trajectory
+generation to an arbitrary bore axis; a real fix would need APPROACH's
+hover/descent points and SEARCH's spiral plane both re-expressed in the
+hole's local frame (`hole_rotation_matrix`) instead of world xy/z, which is
+a larger, separate effort.
+
+### Note on `--pos-tau`
+
+Unrelated to this feature specifically, but touched code nearby: as
+already documented above ("Investigation: bouncing while inserted"),
+`--pos-tau 8` was tried by the user in an earlier session and reportedly
+felt WORSE, not better. Nothing in this pass changes that finding or
+re-tests it -- it's not re-litigated here, just noted since anyone tuning
+`--tool-kp-axes`/`--hole-tilt-randomization-deg` together for a live
+session may also be looking at `--pos-tau` on the same command line.
+
 ## Files
 
 - `insertion_teleop.py` -- the environment (`InsertionEnv`,

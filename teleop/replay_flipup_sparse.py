@@ -154,6 +154,19 @@ def replay_episode(source_episode, dst_recorder: PyriteEpisodeRecorder, *, datas
 
     with FlipUpTeleop(**env_kwargs) as env:
         env.configure_episode(env_kwargs["physical_properties"], book_color, start_position)
+        # configure_episode()'s internal settle loop only runs for a fixed
+        # settle_s (2.5s default) -- live, the operator idles holding at
+        # tool_home for however long it takes to press S, often much
+        # longer, so the arm keeps converging past that fixed window.
+        # Without this, replay's "sample zero" state inherits the FULL
+        # un-settled residual (measured: an 8.98mm offset, exactly equal to
+        # the episode's own recorded settle_error_m) instead of the
+        # closer-to-converged state the live recording actually started
+        # from. Holding here for several more seconds (the spring-damper
+        # controller converges monotonically) closes that gap; --verify
+        # confirms how close.
+        for _ in range(int(round(5.0 * control_freq_hz))):
+            env.step(start_position, n_substeps=1, target_rotvec=None)
 
         dst_recorder.start_episode(metadata=metadata)
         step = 0

@@ -154,14 +154,86 @@ replays the recorded command stream tick-by-tick, and calls the FULL
 `PyriteEpisodeRecorder.record_sample()` at every tick since there's no
 real-time deadline offline. `--verify` compares the replayed achieved
 trajectory against the source's own live-recorded one as a determinism
-check -- measured **0.000mm** max deviation on a `--dry-run` round trip.
+check.
+
+### Exactly how the replay reconstruction works
+
+For each source episode:
+
+1. **Env reconstruction.** `build_env_kwargs()` pulls two things out of the
+   episode's `metadata_json`:
+   - `command_line`: every CLI flag `teleop_flipup.py` was run with, via an
+     explicit whitelist (`ENV_KWARGS_FROM_COMMAND_LINE`/`RENAMED_ENV_KWARGS`
+     in the script) of the ones that affect controller/contact PHYSICS
+     (`tool_kp`, `bookend_solref`, `tool_cartesian_kd`, `noslip_iterations`,
+     ...). Flags that only change haptic feel or device-axis mapping
+     (`--stiffness`, `--damping`, `--scale`, `--axes`, ...) are deliberately
+     excluded -- replay drives the env directly from the recorded target
+     stream, never through the haptic/device layer, so they're inert here.
+   - `episode_attempt`: the *exact accepted* `physical_properties` (the
+     live-randomized book mass/size/friction for that specific episode) and
+     `start_sample.position_world_m` (the exact accepted start pose). No
+     RNG/resampling is re-run -- the already-resolved values are used
+     directly, which is strictly more faithful than trying to reproduce the
+     live run's resample sequence.
+2. **`env.configure_episode(properties, book_color, start_position)`** --
+   deterministic given the same compiled model, so this reproduces the
+   live run's book/pose setup exactly.
+3. **Extra settle hold** (see the bug below) -- `env.step(start_position, ...)`
+   held for 5 more seconds before replay "starts," to match how long the
+   live operator idled at that pose before pressing S.
+4. **Tick-by-tick replay.** For each recorded sparse sample, the number of
+   physics ticks to step is computed from `robot_time_stamps_0` deltas (not
+   `control_batch_size`, which only reflects catch-up batching, not a
+   `--dataset-hz` decimation gap) -- `round((ts[i] - ts[i-1]) * control_freq_hz / 1000)`.
+   Each tick calls `env.step()` with that sample's recorded
+   `ts_pose_command_0`/`target_rotvec`, then the FULL recorder's
+   `record_sample()`.
+5. **`--verify`** compares the replayed `ts_pose_fb_0` (achieved pose) at
+   every source sample index against the source's own recorded one, reporting
+   the max deviation.
+
+### A real bug this caught: initial-state mismatch, not nondeterminism
+
+First pass (no extra settle hold, step 3 above absent) measured **5-9mm**
+max deviation on real live-teleop episodes -- concerning, since a `--dry-run`
+round trip on the same code got **0.000mm** exactly. Traced by comparing
+deviation at tick 0 (before any command is replayed) against the episode's
+own recorded `settle_error_m`: they matched to 5 decimal places (8.978mm
+both). Root cause: `configure_episode()`'s internal settle loop only runs a
+fixed `settle_s` (2.5s default); *live*, the operator idles holding at the
+start pose for however long it takes to press S -- often much longer than
+2.5s, so the arm keeps converging in that time via the same monotonically-
+converging spring-damper dynamics. Confirmed by measuring deviation over the
+first 3000 replayed ticks with NO extra hold: it fell monotonically from
+8.98mm to 0.06mm purely from the recorded trajectory's own motion, proving
+the per-tick physics was already exact -- only the *starting point* was
+wrong. The `--dry-run` case never showed this because a scripted dry run has
+no idle-and-wait period at all.
+
+Fixed by holding at `start_position` for 5 extra seconds (step 3 above)
+before beginning replay. Re-measured on 16 real live-teleop episodes:
+**0.03-0.4mm** max deviation on 15 of them, one outlier at 2.06mm (a longer
+live idle hold than 5s covers) -- down from 5-9mm on all of them.
+
+This mattered for more than precision bookkeeping: comparing reconstructed
+sparse-mode force statistics against live full-mode recordings (both from
+real teleoperated episodes, same session) showed sparse-mode contact forces
+running noticeably lower (in-contact mean 9.4N vs 20.1N, max 41N vs 72N) --
+consistent with full mode's catch-up batches producing small impulsive
+force spikes that sparse mode, with zero catch-up saturation, doesn't
+produce. The pre-fix 5-9mm reconstruction error would have been large enough
+to cast doubt on that comparison; post-fix, it isn't.
 
 Known limitation, stated in the script's docstring: the env-reconstruction
 whitelist is a hand-maintained list of CLI flags, not `teleop_flipup.py`'s
 own `env_kwargs`-building code (embedded in a large stateful `main()`, not
 factored out for reuse) -- a new physics/controller-relevant flag added to
 `teleop_flipup.py` in the future must also be added to the whitelist, or
-replay will silently fall back to that flag's default.
+replay will silently fall back to that flag's default. The 5-second extra
+settle hold is also a fixed constant, not derived from the actual live idle
+duration (which isn't recorded) -- it covers most cases but not an
+unusually long idle wait.
 
 Example commands:
 

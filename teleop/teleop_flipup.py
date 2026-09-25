@@ -1190,6 +1190,23 @@ def main(env_class=None):
                         help="record contact force and handle motion, then report their "
                              "dominant oscillation frequencies at exit. Tells a haptic "
                              "limit cycle apart from sim-side contact chatter")
+    parser.add_argument(
+        "--latency-diagnostics",
+        action="store_true",
+        help=(
+            "print a periodic breakdown of where each control-loop iteration's "
+            "wall time goes (device read, sim step, recorder, view/readout, "
+            "sleep), plus how many ticks the wall clock is behind (catch-up "
+            "debt) -- diagnoses WHY the loop is lagging, not just that it is. "
+            "The underlying diag_* fields are always written to --collect-dataset "
+            "regardless of this flag, so a dataset already has this breakdown "
+            "even if you forgot to pass it live; this only controls the printout"
+        ),
+    )
+    parser.add_argument(
+        "--latency-log-interval", type=float, default=2.0,
+        help="seconds between --latency-diagnostics printouts",
+    )
     parser.add_argument("--dry-run", action="store_true",
                         help="skip the device and drive the scripted flip arc instead")
     parser.add_argument("--dry-speed", type=float,
@@ -3254,6 +3271,71 @@ def main(env_class=None):
     plot_every = max(1, int(round(args.control_freq * args.plot_span / W)))
     next_plot_step = [plot_every]
 
+    # ---- per-iteration latency diagnostics ---------------------------------
+    # Wall-clock breakdown of one outer control-loop pass, so a lagging loop
+    # can be diagnosed (device read? physics? recorder? rendering/readout?
+    # the sleep at the bottom overshooting?) instead of just observed via
+    # deadline_lateness_ms/control_batch_size, which say THAT a batch caught
+    # up several ticks but not WHERE the time went. perf_counter() calls are
+    # ~50-100 ns, so these are left unconditional (not gated behind
+    # --latency-diagnostics) -- only the console printout is opt-in; the
+    # values themselves always reach the recorded dataset (see
+    # PyriteEpisodeRecorder.record_sample's diag_* kwargs) so a run collected
+    # without the flag can still be analyzed for this after the fact.
+    #
+    # Two fields ("view" and "sleep") measure a section that runs AFTER this
+    # iteration's samples are already recorded, so they carry a deliberate
+    # ONE-ITERATION lag: the value written into a sample is the previous
+    # iteration's view/sleep time, not this one's. diag["record_ms"] carries
+    # a one-SUBSTEP lag for the same self-referential reason (the recorder
+    # call's own duration can't be known before it returns). Every other
+    # field is same-iteration/same-substep, no lag.
+    diag = {
+        "prev_iter_start": None,
+        "prev_iter_ms": 0.0,
+        "command_ms": 0.0,
+        "catchup_debt_ticks": 0.0,
+        "prev_view_ms": 0.0,
+        "prev_sleep_ms": 0.0,
+        "step_ms": 0.0,
+        "last_record_ms": 0.0,
+    }
+
+    def _diag_track(stats, key, value):
+        entry = stats.setdefault(key, {"n": 0, "sum": 0.0, "max": 0.0})
+        entry["n"] += 1
+        entry["sum"] += value
+        entry["max"] = max(entry["max"], value)
+
+    diag_stats = {}
+    diag_batches_saturated = [0]
+    diag_batches_total = [0]
+    last_diag_print = [time.time()]
+
+    def maybe_print_latency_diagnostics():
+        if not args.latency_diagnostics:
+            return
+        now = time.time()
+        elapsed = now - last_diag_print[0]
+        if elapsed < args.latency_log_interval or not diag_stats:
+            return
+        parts = []
+        for key in ("prev_iter_ms", "command_ms", "sim_batch_ms", "prev_view_ms", "prev_sleep_ms"):
+            entry = diag_stats.get(key)
+            if entry is None or entry["n"] == 0:
+                continue
+            parts.append(f"{key}={entry['sum']/entry['n']:5.2f}/{entry['max']:6.2f}ms avg/max")
+        sat = diag_batches_saturated[0]
+        total = max(1, diag_batches_total[0])
+        print(
+            "\n[latency] " + "  ".join(parts)
+            + f"  catchup-saturated {sat}/{total} iters ({100.0*sat/total:.0f}%)"
+        )
+        diag_stats.clear()
+        diag_batches_saturated[0] = 0
+        diag_batches_total[0] = 0
+        last_diag_print[0] = now
+
     try:
         while True:
             if recorder is not None and collection["state"] == "review":
@@ -3277,6 +3359,15 @@ def main(env_class=None):
                     print("\n[dataset] choose KEEP or DELETE before quitting")
                 time.sleep(0.01)
                 continue
+
+            # ---- latency diagnostics: start of one control-loop iteration --
+            _diag_iter_t0 = time.perf_counter()
+            diag["prev_iter_ms"] = (
+                0.0 if diag["prev_iter_start"] is None
+                else (_diag_iter_t0 - diag["prev_iter_start"]) * 1000.0
+            )
+            diag["prev_iter_start"] = _diag_iter_t0
+            _diag_cmd_t0 = _diag_iter_t0
 
             if device is not None:
                 state = device.get_state()
@@ -3343,13 +3434,25 @@ def main(env_class=None):
             # flung into the book faster than the contact can settle.
             target = slew_position_target(target, commanded)
             target_rv = slew_rotation_target(target_rv, commanded_rv)
+            diag["command_ms"] = (time.perf_counter() - _diag_cmd_t0) * 1000.0
 
             # Advance the sim to match WALL time, not one step per iteration:
             # time.sleep overshoots and a stall costs several periods, so
             # single-stepping runs the sim slow, which time-warps recorded demos
             # and scales their contact forces with it.
             due = int((time.time() - t_start) * args.control_freq) + 1
+            # How many ticks wall-clock time says we owe, BEFORE clamping to
+            # MAX_CATCHUP -- if this repeatedly exceeds MAX_CATCHUP, the loop
+            # is structurally behind (each pass pays down at most MAX_CATCHUP
+            # ticks of debt while more keeps accruing), not just occasionally
+            # jittery. See maybe_print_latency_diagnostics's "catchup-saturated"
+            # line, which counts how often that happens.
+            diag["catchup_debt_ticks"] = float(due - step)
             n_steps = min(max(1, due - step), MAX_CATCHUP)
+            diag_batches_total[0] += 1
+            if due - step > MAX_CATCHUP:
+                diag_batches_saturated[0] += 1
+            _diag_batch_t0 = time.perf_counter()
             auto_finish_ready = False
             for substep_index in range(n_steps):
                 # A renderer/recorder stall may require several simulation ticks
@@ -3364,7 +3467,9 @@ def main(env_class=None):
                     target_rv = slew_rotation_target(target_rv, commanded_rv)
                 if cube_lift:
                     env.set_gripper_command(gripper_command)
+                _diag_step_t0 = time.perf_counter()
                 env.step(target, n_substeps=substeps, target_rotvec=target_rv)
+                diag["step_ms"] = (time.perf_counter() - _diag_step_t0) * 1000.0
                 step += 1
                 contact = env.contact_force()
                 sensor_force = (
@@ -3459,6 +3564,7 @@ def main(env_class=None):
                                 float(shot["sim_time_s"])
                                 - float(collection["started_sim_time_s"]),
                             )
+                        _diag_record_t0 = time.perf_counter()
                         sample_recorded = recorder.record_sample(
                             env,
                             timestamp_ms=sample_index * 1000.0 / args.dataset_hz,
@@ -3480,7 +3586,20 @@ def main(env_class=None):
                                 )
                                 * 1000.0,
                             ),
+                            diag_prev_iter_ms=diag["prev_iter_ms"],
+                            diag_command_ms=diag["command_ms"],
+                            diag_step_ms=diag["step_ms"],
+                            diag_catchup_debt_ticks=diag["catchup_debt_ticks"],
+                            diag_prev_view_ms=diag["prev_view_ms"],
+                            diag_prev_sleep_ms=diag["prev_sleep_ms"],
+                            # One-substep lag: this call's own duration can't
+                            # be known before it returns, so it reports the
+                            # PREVIOUS record_sample call's wall time.
+                            diag_record_ms=diag["last_record_ms"],
                         )
+                        diag["last_record_ms"] = (
+                            time.perf_counter() - _diag_record_t0
+                        ) * 1000.0
                         if has_new_frame:
                             last_dataset_frame_id[0] = frame_id
                         if sample_recorded and args.auto_finish and env.success():
@@ -3510,6 +3629,11 @@ def main(env_class=None):
                             trace_xyz[axis].append(float(sent[0][axis]))
                             trace_xyz_raw[axis].append(float(raw_dev[axis]))
 
+            _diag_sim_batch_ms = (time.perf_counter() - _diag_batch_t0) * 1000.0
+            _diag_track(diag_stats, "prev_iter_ms", diag["prev_iter_ms"])
+            _diag_track(diag_stats, "command_ms", diag["command_ms"])
+            _diag_track(diag_stats, "sim_batch_ms", _diag_sim_batch_ms)
+
             if auto_finish_ready:
                 stop_recorded_episode("auto_success")
                 if args.dry_run:
@@ -3523,6 +3647,7 @@ def main(env_class=None):
                 continue
 
             # ---- view ----------------------------------------------------
+            _diag_view_t0 = time.perf_counter()
             key = pop_viewer_key()
             if key != 255:
                 if key in (ord("q"), 27):
@@ -3599,9 +3724,16 @@ def main(env_class=None):
                     resolve_recorded_episode(keep=True, reset=False)
                 break
 
+            diag["prev_view_ms"] = (time.perf_counter() - _diag_view_t0) * 1000.0
+            _diag_track(diag_stats, "prev_view_ms", diag["prev_view_ms"])
+
+            _diag_sleep_t0 = time.perf_counter()
             ahead = (step / args.control_freq) - (time.time() - t_start)
             if ahead > 0.0005:
                 time.sleep(ahead - 0.0003)
+            diag["prev_sleep_ms"] = (time.perf_counter() - _diag_sleep_t0) * 1000.0
+            _diag_track(diag_stats, "prev_sleep_ms", diag["prev_sleep_ms"])
+            maybe_print_latency_diagnostics()
     except KeyboardInterrupt:
         pass
     finally:

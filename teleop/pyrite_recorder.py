@@ -338,8 +338,35 @@ class PyriteEpisodeRecorder:
         control_batch_size: int = 1,
         control_batch_index: int = 0,
         deadline_lateness_ms: float = 0.0,
+        diag_prev_iter_ms: float = 0.0,
+        diag_command_ms: float = 0.0,
+        diag_step_ms: float = 0.0,
+        diag_record_ms: float = 0.0,
+        diag_catchup_debt_ticks: float = 0.0,
+        diag_prev_view_ms: float = 0.0,
+        diag_prev_sleep_ms: float = 0.0,
     ) -> bool:
-        """Capture one control sample and, when new, one asynchronous RGB frame."""
+        """Capture one control sample and, when new, one asynchronous RGB frame.
+
+        The ``diag_*`` fields are a wall-clock breakdown of the control loop
+        iteration that produced this sample, for diagnosing WHY teleop is
+        lagging rather than just noticing that it is (deadline_lateness_ms/
+        control_batch_size say a batch fell behind, not where the time went).
+        All default to 0.0 -- callers that don't pass --latency-diagnostics
+        still populate them (see teleop_flipup.py's diag dict; they're cheap
+        enough to always measure), so a plain --collect-dataset run still
+        carries this breakdown even if the live printout wasn't requested.
+
+        diag_prev_iter_ms / diag_prev_view_ms / diag_prev_sleep_ms describe
+        the PREVIOUS control-loop iteration (its total wall time, and its
+        post-physics view/readout and end-of-loop sleep durations,
+        respectively) -- they run after this iteration's samples are already
+        recorded, so reporting them one iteration late is unavoidable.
+        diag_record_ms is one SUBSTEP late for the same self-referential
+        reason (this call's own duration isn't known until it returns).
+        diag_command_ms, diag_step_ms and diag_catchup_debt_ticks are same-
+        iteration/same-substep, no lag.
+        """
         if not self._started:
             self.start_episode()
 
@@ -400,6 +427,13 @@ class PyriteEpisodeRecorder:
         self._append("control_batch_size", int(control_batch_size))
         self._append("control_batch_index", int(control_batch_index))
         self._append("deadline_lateness_ms", float(deadline_lateness_ms))
+        self._append("diag_prev_iter_ms", float(diag_prev_iter_ms))
+        self._append("diag_command_ms", float(diag_command_ms))
+        self._append("diag_step_ms", float(diag_step_ms))
+        self._append("diag_record_ms", float(diag_record_ms))
+        self._append("diag_catchup_debt_ticks", float(diag_catchup_debt_ticks))
+        self._append("diag_prev_view_ms", float(diag_prev_view_ms))
+        self._append("diag_prev_sleep_ms", float(diag_prev_sleep_ms))
         self._append("ts_pose_fb_0", feedback_pose)
         self._append("ts_pose_command_0", command_pose)
         # Keep the operator's requested pose above, and separately store the

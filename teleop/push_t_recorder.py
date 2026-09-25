@@ -16,9 +16,16 @@ model if the env was built with ``force_sensor_cutoff_hz`` set -- see
 PushTTeleop.sensor_force_xy); ``wrench_ground_truth_0`` is always the raw
 solver contact force, same split as flip-up's recorder.
 
+``t_disturbance_wrench_0`` is ground truth for the optional unforced random
+push/spin applied directly to the T (see PushTTeleop.t_disturbance_wrench,
+--t-disturbance-force/-torque) -- all zero unless that feature is enabled,
+and not something an operator/policy could have anticipated from the
+observation stream, only useful for offline analysis of what actually moved
+the T versus what the pusher did.
+
     data/episode_N/{ts_pose_command_0, ts_pose_controller_0, ts_pose_fb_0,
                     pusher_vel_0, t_pose_0, t_twist_0, wrench_0,
-                    wrench_ground_truth_0, ...}
+                    wrench_ground_truth_0, t_disturbance_wrench_0, ...}
     meta/episode_robot0_len
 """
 
@@ -165,6 +172,11 @@ class PushTEpisodeRecorder:
         # why the raw signal is discretely noisy even with a smooth target.
         self._samples.append("wrench_0", env.sensor_force_xy())
         self._samples.append("wrench_ground_truth_0", env.pusher_contact_force_xy())
+        # Ground truth only -- an operator/policy can't see this coming (it's
+        # an unforced random process, not a scripted path), but recording it
+        # lets offline analysis separate "the T moved on its own" from "the
+        # push did that". All zero unless --t-disturbance-force/-torque set.
+        self._samples.append("t_disturbance_wrench_0", env.t_disturbance_wrench)
         self._samples.append("contact_count", int(env.data.ncon))
         self._samples.append("sim_time_s", float(env.data.time))
         self._samples.append("success", int(env.success()))

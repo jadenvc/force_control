@@ -197,6 +197,38 @@ def build_arg_parser():
                              "pusher's contact flip-flopping between nearby "
                              "friction solutions tick to tick. 0 disables it "
                              "(the previous, unset default)")
+    parser.add_argument("--t-disturbance-force", type=float, default=0.0,
+                        help="stationary-std magnitude (N) of an unforced, "
+                             "unpredictable push applied directly to the "
+                             "T-block -- an Ornstein-Uhlenbeck (smoothly "
+                             "wandering, not white-noise-buzzy) random force, "
+                             "independent of anything the pusher does. 0 "
+                             "(default) disables it entirely -- the task is "
+                             "bit-identical to before unless you set this. "
+                             "Try 0.3-0.5 for a noticeable but not "
+                             "overwhelming drift to react to; the T's mass "
+                             "is 0.2 kg by default, so 0.5N is already "
+                             "~2.5 m/s^2 of disturbance acceleration")
+    parser.add_argument("--t-disturbance-torque", type=float, default=0.0,
+                        help="same Ornstein-Uhlenbeck process as "
+                             "--t-disturbance-force, but a spin (N*m) "
+                             "instead of a push. 0 disables it. Try 0.01-0.02")
+    parser.add_argument("--t-disturbance-tau", type=float, default=0.8,
+                        help="correlation time (s) of the disturbance's "
+                             "random walk. Higher = slower, smoother "
+                             "drifting (easier to anticipate a moment "
+                             "ahead, harder to ignore); lower = faster, "
+                             "jitterier (easier to average out, harder to "
+                             "predict at all). Only matters if "
+                             "--t-disturbance-force/-torque is nonzero")
+    parser.add_argument("--t-disturbance-seed", type=int, default=None,
+                        help="seed for the disturbance's random stream, "
+                             "independent of --seed (which only controls "
+                             "start-pose randomization). Default derives "
+                             "one from --seed; set explicitly to get the "
+                             "same disturbance path across runs while still "
+                             "varying --seed's start-pose sampling, or vice "
+                             "versa")
     parser.add_argument("--workspace-half", type=float, default=DEFAULT_WORKSPACE_HALF_M,
                         help="half-extent (m) of the square workspace the "
                              "pusher target is clamped to. --scale's default "
@@ -512,6 +544,10 @@ def main():
         force_sensor_cutoff_hz=args.force_sensor_cutoff,
         pusher_joint_damping=args.pusher_joint_damping,
         noslip_iterations=args.noslip_iterations,
+        t_disturbance_force_n=args.t_disturbance_force,
+        t_disturbance_torque_n_m=args.t_disturbance_torque,
+        t_disturbance_tau_s=args.t_disturbance_tau,
+        t_disturbance_seed=args.t_disturbance_seed,
         workspace_half_m=args.workspace_half,
         success_threshold=args.success_threshold,
     )
@@ -598,6 +634,9 @@ def main():
             "force_sensor_cutoff_hz": env.force_sensor_cutoff_hz,
             "pusher_joint_damping": env.pusher_joint_damping,
             "noslip_iterations": env.noslip_iterations,
+            "t_disturbance_force_n": env.t_disturbance_force_n,
+            "t_disturbance_torque_n_m": env.t_disturbance_torque_n_m,
+            "t_disturbance_tau_s": env.t_disturbance_tau_s,
             "workspace_half_m": env.workspace_half_m,
             "success_threshold": env.success_threshold,
             "axes": args.axes,

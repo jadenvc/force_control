@@ -144,6 +144,10 @@ class PushTTeleop:
         force_sensor_cutoff_hz=0.0,
         pusher_joint_damping=1.0,
         noslip_iterations=2,
+        t_disturbance_force_n=0.0,
+        t_disturbance_torque_n_m=0.0,
+        t_disturbance_tau_s=1.0,
+        t_disturbance_seed=None,
     ):
         del settle_s
         self.seed = int(seed)
@@ -172,6 +176,25 @@ class PushTTeleop:
         if int(noslip_iterations) < 0:
             raise ValueError("noslip_iterations cannot be negative")
         self.noslip_iterations = int(noslip_iterations)
+        if float(t_disturbance_force_n) < 0.0:
+            raise ValueError("t_disturbance_force_n cannot be negative")
+        if float(t_disturbance_torque_n_m) < 0.0:
+            raise ValueError("t_disturbance_torque_n_m cannot be negative")
+        if float(t_disturbance_tau_s) <= 0.0:
+            raise ValueError("t_disturbance_tau_s must be positive")
+        self.t_disturbance_force_n = float(t_disturbance_force_n)
+        self.t_disturbance_torque_n_m = float(t_disturbance_torque_n_m)
+        self.t_disturbance_tau_s = float(t_disturbance_tau_s)
+        # Separate stream from self._rng (start-pose sampling) so changing
+        # one doesn't perturb the other's draw sequence; offset from the
+        # main seed so seed=N doesn't silently reuse seed=N's disturbance
+        # stream for some other purpose that happens to seed with N too.
+        disturbance_seed = (
+            self.seed + 100_003 if t_disturbance_seed is None else int(t_disturbance_seed)
+        )
+        self._disturbance_rng = np.random.default_rng(disturbance_seed)
+        self._disturbance_force = np.zeros(2, dtype=float)
+        self._disturbance_torque = 0.0
         self.workspace_half_m = float(workspace_half_m)
         if self.workspace_half_m <= 0.0:
             raise ValueError("workspace_half_m must be positive")
@@ -199,6 +222,20 @@ class PushTTeleop:
             self._sensor_alpha = 1.0 - np.exp(-dt / tau)
         self._sensor_stage1 = np.zeros(2, dtype=float)
         self._sensor_stage2 = np.zeros(2, dtype=float)
+
+        # Exact discrete-time Ornstein-Uhlenbeck coefficients (stable for any
+        # dt/tau ratio, unlike an Euler update): decay shrinks the current
+        # disturbance each tick, noise_scale injects fresh randomness sized
+        # so the process's STATIONARY std matches the requested magnitude
+        # (t_disturbance_force_n/torque_n_m), not the per-tick noise itself.
+        # A high tau gives a slow, smoothly-wandering push (genuinely hard to
+        # predict a step ahead but not violent); a low tau gives fast,
+        # buzzy jitter -- same "path" either way, just a different bandwidth.
+        dt = float(self.model.opt.timestep)
+        self._disturbance_decay = float(np.exp(-dt / self.t_disturbance_tau_s))
+        noise_factor = float(np.sqrt(1.0 - self._disturbance_decay ** 2))
+        self._disturbance_force_noise_scale = self.t_disturbance_force_n * noise_factor
+        self._disturbance_torque_noise_scale = self.t_disturbance_torque_n_m * noise_factor
 
         self.t_free_joint_ids = np.array(
             [
@@ -657,6 +694,65 @@ class PushTTeleop:
         self._sensor_stage1 += self._sensor_alpha * (raw - self._sensor_stage1)
         self._sensor_stage2 += self._sensor_alpha * (self._sensor_stage1 - self._sensor_stage2)
 
+    @property
+    def t_disturbance_wrench(self):
+        """Current (Fx, Fy, Mz) disturbance applied to the T, ground truth.
+
+        Not something a live operator can see coming -- it's an unforced
+        stochastic process, not a scripted path -- but recorded so an
+        offline learner/analysis can tell "the T moved on its own" from
+        "the operator's push did that".
+        """
+        return np.array(
+            [self._disturbance_force[0], self._disturbance_force[1], self._disturbance_torque]
+        )
+
+    def _advance_disturbance(self):
+        """One exact-discrete-time OU step, applied to the T's own DOFs.
+
+        A no-op (returns the zero vector, same as if disabled) whenever both
+        magnitudes are 0 -- the default -- so this task is unchanged unless
+        --t-disturbance-force/--t-disturbance-torque are explicitly set.
+
+        A sustained wandering force with no operator contact can walk the T
+        off the table surface entirely -- once it's off, table friction
+        (which is what the disturbance is fighting against) goes to exactly
+        zero, so the remaining unopposed disturbance force is genuinely
+        unbounded (measured: a T pushed with the pusher held away from it
+        reached ~100m from origin in 6 simulated seconds under a modest 1.5N
+        disturbance). This isn't a real task failure mode to design around --
+        it's what happens if nobody is playing -- but it needs a floor so an
+        idle/disconnected episode can't blow up the sim. A soft spring+damper
+        activates only once the T strays beyond 1.15x the pusher's own
+        workspace, pulling it back without adding any drag or resistance
+        inside the actual play area.
+        """
+        if self.t_disturbance_force_n <= 0.0 and self.t_disturbance_torque_n_m <= 0.0:
+            return
+        self._disturbance_force = (
+            self._disturbance_decay * self._disturbance_force
+            + self._disturbance_force_noise_scale * self._disturbance_rng.standard_normal(2)
+        )
+        self._disturbance_torque = (
+            self._disturbance_decay * self._disturbance_torque
+            + self._disturbance_torque_noise_scale * self._disturbance_rng.standard_normal()
+        )
+        force_xy = self._disturbance_force.copy()
+        boundary = 1.15 * self.workspace_half_m
+        pos_xy = np.asarray(self.data.qpos[self.t_free_joint_ids[:2]], dtype=float)
+        excess = pos_xy - np.clip(pos_xy, -boundary, boundary)
+        if np.any(excess != 0.0):
+            vel_xy = np.asarray(self.data.qvel[self.t_dof_ids[:2]], dtype=float)
+            leash_kp = 300.0
+            leash_kd = 2.0 * np.sqrt(leash_kp * self.properties.t_mass_kg)
+            beyond = excess != 0.0
+            force_xy = np.where(
+                beyond, force_xy - leash_kp * excess - leash_kd * vel_xy, force_xy
+            )
+        self.data.qfrc_applied[self.t_dof_ids[0]] = force_xy[0]
+        self.data.qfrc_applied[self.t_dof_ids[1]] = force_xy[1]
+        self.data.qfrc_applied[self.t_dof_ids[2]] = self._disturbance_torque
+
     # ------------------------------------------------------------ control
     def limited_target(self, target_xy):
         target = np.asarray(target_xy, dtype=float)
@@ -671,6 +767,7 @@ class PushTTeleop:
                 self._drive_target - self.pusher_pos
             ) - self.pusher_kd * self.pusher_vel
             self.data.qfrc_applied[self.pusher_dof_ids] = force_xy
+            self._advance_disturbance()
             mujoco.mj_step(self.model.ptr, self.data.ptr)
             self._refresh_force_sensor()
         return self
@@ -692,6 +789,11 @@ class PushTTeleop:
         self._drive_target = self._requested_target.copy()
         self._sensor_stage1[:] = 0.0
         self._sensor_stage2[:] = 0.0
+        # Zero the OU process's state, not its RNG stream -- each episode
+        # starts from "no disturbance yet" but keeps drawing new values, so
+        # repeated resets don't replay the identical disturbance path.
+        self._disturbance_force[:] = 0.0
+        self._disturbance_torque = 0.0
         return self
 
     def _configure_pusher_contact(self):

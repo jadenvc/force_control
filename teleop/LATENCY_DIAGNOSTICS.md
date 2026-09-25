@@ -79,11 +79,20 @@ several episodes.
 
 ## Implementation notes
 
-- `teleop_flipup.py`: a `diag` dict tracks the lagged/same-tick values
+- `teleop_flipup.py`: a `latency` dict tracks the lagged/same-tick values
   described above across loop iterations (same style as the existing
-  `force_monitor`/`collection` state dicts in this file); `diag_stats` +
-  `_diag_track()` accumulate count/sum/max between printouts, cleared each
-  time `maybe_print_latency_diagnostics()` fires.
+  `force_monitor`/`collection` state dicts in this file; named `latency`,
+  not `diag`, to avoid colliding with the pre-existing `--diagnose` feature's
+  own `diag` dict -- an unrelated force/handle oscillation-correlation tool
+  declared later in the same function). `diag_stats` + `_diag_track()`
+  accumulate count/sum/max between printouts, cleared each time
+  `maybe_print_latency_diagnostics()` fires. `latency`, `diag_stats`, and
+  `MAX_CATCHUP` are declared early in `main()` (before `render_thread`/
+  `viewer_thread` start), not next to the control loop that updates them --
+  the always-on-screen HUD line below reads them from the viewer thread,
+  which can start running before execution reaches a later declaration
+  point, and closures resolve free variables at call time, not definition
+  time, so an out-of-order declaration would race.
 - `pyrite_recorder.py`: `record_sample()` gained seven new optional kwargs,
   all defaulting to `0.0`, unconditionally appended via the existing generic
   `_NumericSampleBuffer` (no schema-version bump needed -- new columns are
@@ -92,3 +101,82 @@ several episodes.
 - Verified: full-arm test suite unaffected (34/34 relevant tests pass, same
   before and after), and a `--collect-dataset` smoke test confirms all 7
   `diag_*` fields land correctly per-sample in the resulting zarr.
+
+## Always-on-screen HUD line
+
+`draw_state()` now draws a latency line at the bottom-left of the live
+viewer, every frame, regardless of `--latency-diagnostics`:
+
+```
+loop 17.7ms  debt  +29 ticks  catchup-saturated 100%  LAGGING
+```
+
+Green when healthy, red with a `LAGGING` suffix when `catchup_debt_ticks`
+exceeds `MAX_CATCHUP` (16) or the recent catchup-saturated fraction exceeds
+10% -- meant to be watched continuously during a live run, not just
+inspected after the fact.
+
+## Sparse recording + offline replay
+
+The diagnostics above traced the lag to a specific cause: `diag_record_ms`
+(the full recorder's per-tick cost -- `mj_getState`'s full-state copy, plus
+contact/wrist/sensor wrench extraction, more costly with the 3-5
+simultaneous contacts a real flip produces) exceeded `diag_step_ms` (pure
+physics) in testing. Two ways to remove the recorder from the real-time
+budget were considered (see the design discussion in this repo's history):
+async/background recording was rejected -- the per-tick cost is CPU-bound,
+not I/O-bound, so a Python thread still contends for the GIL, and anything
+truly deferred would need a synchronous copy of live-mutating MuJoCo state
+first anyway. Recording a cheap stream live and reconstructing the
+expensive one offline (no real-time deadline there) was adopted instead --
+the same pattern already validated in this repo's `gen_sanding_clean.py`.
+
+**`--dataset-mode {full,sparse}`** (default `full`, unchanged behavior).
+`sparse` swaps in `sparse_flipup_recorder.SparseFlipUpRecorder`: cheap
+fields only (target/achieved pose, device telemetry, the `diag_*` timing
+fields, no RGB) -- see that module's docstring for the exact field list and
+why each heavy call is skipped.
+
+Measured (`--dry-run --collect-dataset`, otherwise identical settings):
+
+| | `full` | `sparse` |
+|---|---|---|
+| catchup-saturated | 100% | **0%** |
+| `prev_iter_ms` avg | ~17.7ms | **~1.0ms** |
+| real-time factor | 0.88x | **0.99x** |
+
+**`replay_flipup_sparse.py --src <sparse.zarr> --dst <dense.zarr> [--dataset-hz N] [--verify]`**
+reconstructs the full dense state/wrench stream offline: rebuilds the exact
+`FlipUpTeleop` env from each episode's recorded metadata (an explicit
+CLI-flag whitelist for controller/contact-physics args, plus the exact
+accepted book/start-pose from `episode_attempt` -- no RNG/resampling needed),
+replays the recorded command stream tick-by-tick, and calls the FULL
+`PyriteEpisodeRecorder.record_sample()` at every tick since there's no
+real-time deadline offline. `--verify` compares the replayed achieved
+trajectory against the source's own live-recorded one as a determinism
+check -- measured **0.000mm** max deviation on a `--dry-run` round trip.
+
+Known limitation, stated in the script's docstring: the env-reconstruction
+whitelist is a hand-maintained list of CLI flags, not `teleop_flipup.py`'s
+own `env_kwargs`-building code (embedded in a large stateful `main()`, not
+factored out for reuse) -- a new physics/controller-relevant flag added to
+`teleop_flipup.py` in the future must also be added to the whitelist, or
+replay will silently fall back to that flag's default.
+
+Example commands:
+
+```
+# current full-rate interface (unchanged) -- watch the on-screen "loop"/
+# "debt" HUD line, or add --latency-diagnostics for a periodic console
+# breakdown, to see whether/how badly this is lagging on your machine:
+python teleop_flipup.py --collect-dataset ~/data/run.zarr --latency-diagnostics
+
+# new low-latency interface -- cheap fields only, live; reconstruct the
+# dense stream afterward with replay_flipup_sparse.py:
+python teleop_flipup.py --collect-dataset ~/data/run_sparse.zarr \
+    --dataset-mode sparse --latency-diagnostics
+
+# offline: rebuild the full dense state/wrench stream at up to 1kHz
+python replay_flipup_sparse.py --src ~/data/run_sparse.zarr \
+    --dst ~/data/run_dense.zarr --verify
+```

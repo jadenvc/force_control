@@ -1154,6 +1154,22 @@ def main(env_class=None):
                              "placeholder RGB frames for low-dimensional experiments")
     parser.add_argument("--dataset-min-samples", type=int, default=20,
                         help="discard episodes shorter than this many control samples")
+    parser.add_argument(
+        "--dataset-mode", type=str, default="full", choices=["full", "sparse"],
+        help=(
+            "'full' (default): every sample does mj_getState + contact/wrist/"
+            "sensor wrench extraction -- everything PyriteEpisodeRecorder "
+            "supports, at the cost of --latency-diagnostics showing "
+            "diag_record_ms competing with, sometimes exceeding, the physics "
+            "step's own cost. 'sparse': SparseFlipUpRecorder records only "
+            "the cheap command/device-telemetry stream (no mj_getState, no "
+            "wrench extraction, no RGB) -- meant to run with ~zero recorder-"
+            "induced latency even at 1kHz. Reconstruct the full dense "
+            "state/wrench stream afterward with replay_flipup_sparse.py, "
+            "which has no real-time deadline so the heavy calls' cost "
+            "doesn't matter there."
+        ),
+    )
     parser.add_argument("--collection-home-tolerance", type=float, default=0.005,
                         help="maximum handle distance from fixed --home before S can "
                              "start a dataset episode, in m (default 0.005)")
@@ -1577,20 +1593,29 @@ def main(env_class=None):
                 "for exact-rate collection"
             )
         dataset_stride = int(round(ratio))
-        from pyrite_recorder import PyriteEpisodeRecorder
+        if args.dataset_mode == "sparse":
+            from sparse_flipup_recorder import SparseFlipUpRecorder
 
-        recorder = PyriteEpisodeRecorder(
-            args.collect_dataset,
-            sample_hz=args.dataset_hz,
-            image_size=tuple(args.dataset_image_size),
-            include_rgb=not args.dataset_no_rgb,
-            min_samples=args.dataset_min_samples,
-            wrench_filter_seconds=args.dataset_wrench_filter,
-            ac_k_max=args.ac_k_max,
-            ac_k_min=args.ac_k_min,
-            ac_f_low=args.ac_f_low,
-            ac_f_high=args.ac_f_high,
-        )
+            recorder = SparseFlipUpRecorder(
+                args.collect_dataset,
+                sample_hz=args.dataset_hz,
+                min_samples=args.dataset_min_samples,
+            )
+        else:
+            from pyrite_recorder import PyriteEpisodeRecorder
+
+            recorder = PyriteEpisodeRecorder(
+                args.collect_dataset,
+                sample_hz=args.dataset_hz,
+                image_size=tuple(args.dataset_image_size),
+                include_rgb=not args.dataset_no_rgb,
+                min_samples=args.dataset_min_samples,
+                wrench_filter_seconds=args.dataset_wrench_filter,
+                ac_k_max=args.ac_k_max,
+                ac_k_min=args.ac_k_min,
+                ac_f_low=args.ac_f_low,
+                ac_f_high=args.ac_f_high,
+            )
         # Continue the deterministic start/property sequence when appending to
         # an existing dataset instead of repeating attempt zero every launch.
         episode_attempt[0] = len(recorder.episode_names)
@@ -1646,6 +1671,87 @@ def main(env_class=None):
     def reset_force_monitor():
         for key in force_monitor:
             force_monitor[key] = {} if key == "contact_breakdown_at_peak" else 0.0
+
+    # How many ticks of wall-clock catch-up one outer loop pass will pay off
+    # at most. Declared here (not down by the control loop, where it used to
+    # live) for the same reason as the latency block below: draw_state/show()
+    # read it every HUD frame from the viewer thread, which can start before
+    # execution reaches a later declaration point.
+    MAX_CATCHUP = 16
+
+    # ---- per-iteration latency diagnostics ---------------------------------
+    # Wall-clock breakdown of one outer control-loop pass, so a lagging loop
+    # can be diagnosed (device read? physics? recorder? rendering/readout?
+    # the sleep at the bottom overshooting?) instead of just observed via
+    # deadline_lateness_ms/control_batch_size, which say THAT a batch caught
+    # up several ticks but not WHERE the time went. perf_counter() calls are
+    # ~50-100 ns, so these are left unconditional (not gated behind
+    # --latency-diagnostics) -- only the console printout and HUD line are
+    # opt-in/always-on-screen respectively; the values themselves always
+    # reach the recorded dataset (see PyriteEpisodeRecorder.record_sample's
+    # diag_* kwargs) so a run collected without the flag can still be
+    # analyzed for this after the fact. Named "latency", not "diag", to
+    # avoid colliding with the PRE-EXISTING --diagnose feature's own `diag`
+    # dict (force/handle oscillation correlation) declared further down.
+    #
+    # Declared here (well before render_thread/viewer_thread start) rather
+    # than right before the control loop below: draw_state/show() run in the
+    # viewer thread and read this dict every HUD frame (see the "loop"/
+    # "debt" line added there), and that thread can start before the main
+    # loop reaches any later declaration point, which would otherwise race.
+    #
+    # Two fields ("view" and "sleep") measure a section that runs AFTER this
+    # iteration's samples are already recorded, so they carry a deliberate
+    # ONE-ITERATION lag: the value written into a sample is the previous
+    # iteration's view/sleep time, not this one's. latency["last_record_ms"]
+    # carries a one-SUBSTEP lag for the same self-referential reason (the
+    # recorder call's own duration can't be known before it returns). Every
+    # other field is same-iteration/same-substep, no lag.
+    latency = {
+        "prev_iter_start": None,
+        "prev_iter_ms": 0.0,
+        "command_ms": 0.0,
+        "catchup_debt_ticks": 0.0,
+        "prev_view_ms": 0.0,
+        "prev_sleep_ms": 0.0,
+        "step_ms": 0.0,
+        "last_record_ms": 0.0,
+    }
+
+    def _diag_track(stats, key, value):
+        entry = stats.setdefault(key, {"n": 0, "sum": 0.0, "max": 0.0})
+        entry["n"] += 1
+        entry["sum"] += value
+        entry["max"] = max(entry["max"], value)
+
+    diag_stats = {}
+    diag_batches_saturated = [0]
+    diag_batches_total = [0]
+    last_diag_print = [time.time()]
+
+    def maybe_print_latency_diagnostics():
+        if not args.latency_diagnostics:
+            return
+        now = time.time()
+        elapsed = now - last_diag_print[0]
+        if elapsed < args.latency_log_interval or not diag_stats:
+            return
+        parts = []
+        for key in ("prev_iter_ms", "command_ms", "sim_batch_ms", "prev_view_ms", "prev_sleep_ms"):
+            entry = diag_stats.get(key)
+            if entry is None or entry["n"] == 0:
+                continue
+            parts.append(f"{key}={entry['sum']/entry['n']:5.2f}/{entry['max']:6.2f}ms avg/max")
+        sat = diag_batches_saturated[0]
+        total = max(1, diag_batches_total[0])
+        print(
+            "\n[latency] " + "  ".join(parts)
+            + f"  catchup-saturated {sat}/{total} iters ({100.0*sat/total:.0f}%)"
+        )
+        diag_stats.clear()
+        diag_batches_saturated[0] = 0
+        diag_batches_total[0] = 0
+        last_diag_print[0] = now
 
     review_action = [None]
     last_dataset_frame_id = [-1]
@@ -1894,11 +2000,20 @@ def main(env_class=None):
               f"{'UP' if not args.axes.split(',')[2].startswith('-') else 'DOWN'} to lever "
               f"the book over")
     if recorder is not None:
+        dataset_kind = (
+            f"sparse (--dataset-mode sparse: command/device telemetry only, "
+            f"no mj_getState/wrench/RGB -- replay_flipup_sparse.py "
+            f"reconstructs the dense stream offline)"
+            if args.dataset_mode == "sparse"
+            else (
+                f"state/wrench + asynchronous RGB ({args.dataset_image_size[0]}x"
+                f"{args.dataset_image_size[1]} RGB"
+                f"{' placeholders' if args.dataset_no_rgb else ''})"
+            )
+        )
         print(
-            f"[dataset] {args.dataset_hz:g} Hz state/wrench + asynchronous RGB Pyrite Zarr -> "
-            f"{recorder.dataset_path} ({args.dataset_image_size[0]}x"
-            f"{args.dataset_image_size[1]} RGB"
-            f"{' placeholders' if args.dataset_no_rgb else ''}); "
+            f"[dataset] {args.dataset_hz:g} Hz {dataset_kind} Pyrite Zarr -> "
+            f"{recorder.dataset_path}; "
             f"{'centering pull guides' if args.collection_recenter_stiffness > 0.0 else 'return'} "
             f"handle within {args.collection_home_tolerance * 1000.0:.0f} mm "
             f"of --home and hold still for {args.collection_home_dwell_ms:.0f} ms, "
@@ -2415,6 +2530,35 @@ def main(env_class=None):
                 1,
                 cv2.LINE_AA,
             )
+
+        # Always-on-screen latency readout (not gated behind
+        # --latency-diagnostics, which only controls the console printout --
+        # this is meant to be watched continuously during a live run without
+        # needing a flag). diag_stats' avg/max reset every
+        # --latency-log-interval (default 2s) when that flag IS set;
+        # otherwise diag_stats stays empty and this falls back to the
+        # single latest sample, still updated every HUD frame regardless.
+        # Read-only access to variables written by the main control-loop
+        # thread -- individual dict entries, no lock, same "a torn read is
+        # harmless" tolerance already used for the RGB frame in this file.
+        iter_entry = diag_stats.get("prev_iter_ms")
+        iter_avg = iter_entry["sum"] / iter_entry["n"] if iter_entry and iter_entry["n"] else latency["prev_iter_ms"]
+        debt = latency["catchup_debt_ticks"]
+        sat_total = max(1, diag_batches_total[0])
+        sat_pct = 100.0 * diag_batches_saturated[0] / sat_total
+        lagging = debt > MAX_CATCHUP or sat_pct > 10.0
+        cv2.putText(
+            frame,
+            f"loop {iter_avg:5.1f}ms  debt {debt:+5.0f} ticks  "
+            f"catchup-saturated {sat_pct:4.0f}%"
+            + ("  LAGGING" if lagging else ""),
+            (8, H - 10),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (70, 70, 245) if lagging else (140, 220, 140),
+            1,
+            cv2.LINE_AA,
+        )
         return frame
 
     def show():
@@ -2848,18 +2992,19 @@ def main(env_class=None):
         )
         episode[1] = step
         last_dataset_frame_id[0] = int(shot["n"])
-        recorder.record_sample(
-            env,
+        _sample_zero_kwargs = dict(
             timestamp_ms=0.0,
             target_pos=target,
             target_rotvec=target_rv,
             device_state=(device.get_state() if device is not None else state),
             sent_force=np.zeros(3),
-            image_rgb=None,
-            image_capture_time_s=None,
-            image_id=None,
             wall_time_ns=time.perf_counter_ns(),
         )
+        if args.dataset_mode != "sparse":
+            _sample_zero_kwargs.update(
+                image_rgb=None, image_capture_time_s=None, image_id=None,
+            )
+        recorder.record_sample(env, **_sample_zero_kwargs)
         # Sample-zero allocation is deliberately outside live scheduling.
         collection["started_monotonic"] = time.monotonic()
         t_start = time.time() - step / args.control_freq
@@ -2949,13 +3094,21 @@ def main(env_class=None):
             return False
         count = recorder.sample_count
         if save:
-            name = recorder.commit(
-                success=bool(collection["success"]),
-                termination_reason=str(collection["reason"]),
-                final_book_angle_deg=float(collection["final_book_angle_deg"]),
-                final_task_metric_name=task_metric_name,
-                final_task_metric_value=float(collection["final_task_metric"]),
-            )
+            if args.dataset_mode == "sparse":
+                name = recorder.commit(
+                    success=bool(collection["success"]),
+                    termination_reason=str(collection["reason"]),
+                    final_task_metric_name=task_metric_name,
+                    final_task_metric_value=float(collection["final_task_metric"]),
+                )
+            else:
+                name = recorder.commit(
+                    success=bool(collection["success"]),
+                    termination_reason=str(collection["reason"]),
+                    final_book_angle_deg=float(collection["final_book_angle_deg"]),
+                    final_task_metric_name=task_metric_name,
+                    final_task_metric_value=float(collection["final_task_metric"]),
+                )
             if name is None:
                 print(
                     f"\n[dataset] discarded {count} samples; minimum is "
@@ -3063,7 +3216,6 @@ def main(env_class=None):
     step = 0
     t_start = time.time()
     period = 1.0 / args.control_freq
-    MAX_CATCHUP = 16
     state = {"pos": home.copy(), "gripper": args.device_grip_open}
     # One-pole low-pass on the raw device position, applied BEFORE --scale
     # amplifies whatever tremor/noise it carries (see --pos-tau's help).
@@ -3271,71 +3423,6 @@ def main(env_class=None):
     plot_every = max(1, int(round(args.control_freq * args.plot_span / W)))
     next_plot_step = [plot_every]
 
-    # ---- per-iteration latency diagnostics ---------------------------------
-    # Wall-clock breakdown of one outer control-loop pass, so a lagging loop
-    # can be diagnosed (device read? physics? recorder? rendering/readout?
-    # the sleep at the bottom overshooting?) instead of just observed via
-    # deadline_lateness_ms/control_batch_size, which say THAT a batch caught
-    # up several ticks but not WHERE the time went. perf_counter() calls are
-    # ~50-100 ns, so these are left unconditional (not gated behind
-    # --latency-diagnostics) -- only the console printout is opt-in; the
-    # values themselves always reach the recorded dataset (see
-    # PyriteEpisodeRecorder.record_sample's diag_* kwargs) so a run collected
-    # without the flag can still be analyzed for this after the fact.
-    #
-    # Two fields ("view" and "sleep") measure a section that runs AFTER this
-    # iteration's samples are already recorded, so they carry a deliberate
-    # ONE-ITERATION lag: the value written into a sample is the previous
-    # iteration's view/sleep time, not this one's. diag["record_ms"] carries
-    # a one-SUBSTEP lag for the same self-referential reason (the recorder
-    # call's own duration can't be known before it returns). Every other
-    # field is same-iteration/same-substep, no lag.
-    diag = {
-        "prev_iter_start": None,
-        "prev_iter_ms": 0.0,
-        "command_ms": 0.0,
-        "catchup_debt_ticks": 0.0,
-        "prev_view_ms": 0.0,
-        "prev_sleep_ms": 0.0,
-        "step_ms": 0.0,
-        "last_record_ms": 0.0,
-    }
-
-    def _diag_track(stats, key, value):
-        entry = stats.setdefault(key, {"n": 0, "sum": 0.0, "max": 0.0})
-        entry["n"] += 1
-        entry["sum"] += value
-        entry["max"] = max(entry["max"], value)
-
-    diag_stats = {}
-    diag_batches_saturated = [0]
-    diag_batches_total = [0]
-    last_diag_print = [time.time()]
-
-    def maybe_print_latency_diagnostics():
-        if not args.latency_diagnostics:
-            return
-        now = time.time()
-        elapsed = now - last_diag_print[0]
-        if elapsed < args.latency_log_interval or not diag_stats:
-            return
-        parts = []
-        for key in ("prev_iter_ms", "command_ms", "sim_batch_ms", "prev_view_ms", "prev_sleep_ms"):
-            entry = diag_stats.get(key)
-            if entry is None or entry["n"] == 0:
-                continue
-            parts.append(f"{key}={entry['sum']/entry['n']:5.2f}/{entry['max']:6.2f}ms avg/max")
-        sat = diag_batches_saturated[0]
-        total = max(1, diag_batches_total[0])
-        print(
-            "\n[latency] " + "  ".join(parts)
-            + f"  catchup-saturated {sat}/{total} iters ({100.0*sat/total:.0f}%)"
-        )
-        diag_stats.clear()
-        diag_batches_saturated[0] = 0
-        diag_batches_total[0] = 0
-        last_diag_print[0] = now
-
     try:
         while True:
             if recorder is not None and collection["state"] == "review":
@@ -3362,11 +3449,11 @@ def main(env_class=None):
 
             # ---- latency diagnostics: start of one control-loop iteration --
             _diag_iter_t0 = time.perf_counter()
-            diag["prev_iter_ms"] = (
-                0.0 if diag["prev_iter_start"] is None
-                else (_diag_iter_t0 - diag["prev_iter_start"]) * 1000.0
+            latency["prev_iter_ms"] = (
+                0.0 if latency["prev_iter_start"] is None
+                else (_diag_iter_t0 - latency["prev_iter_start"]) * 1000.0
             )
-            diag["prev_iter_start"] = _diag_iter_t0
+            latency["prev_iter_start"] = _diag_iter_t0
             _diag_cmd_t0 = _diag_iter_t0
 
             if device is not None:
@@ -3434,7 +3521,7 @@ def main(env_class=None):
             # flung into the book faster than the contact can settle.
             target = slew_position_target(target, commanded)
             target_rv = slew_rotation_target(target_rv, commanded_rv)
-            diag["command_ms"] = (time.perf_counter() - _diag_cmd_t0) * 1000.0
+            latency["command_ms"] = (time.perf_counter() - _diag_cmd_t0) * 1000.0
 
             # Advance the sim to match WALL time, not one step per iteration:
             # time.sleep overshoots and a stall costs several periods, so
@@ -3447,7 +3534,7 @@ def main(env_class=None):
             # ticks of debt while more keeps accruing), not just occasionally
             # jittery. See maybe_print_latency_diagnostics's "catchup-saturated"
             # line, which counts how often that happens.
-            diag["catchup_debt_ticks"] = float(due - step)
+            latency["catchup_debt_ticks"] = float(due - step)
             n_steps = min(max(1, due - step), MAX_CATCHUP)
             diag_batches_total[0] += 1
             if due - step > MAX_CATCHUP:
@@ -3469,7 +3556,7 @@ def main(env_class=None):
                     env.set_gripper_command(gripper_command)
                 _diag_step_t0 = time.perf_counter()
                 env.step(target, n_substeps=substeps, target_rotvec=target_rv)
-                diag["step_ms"] = (time.perf_counter() - _diag_step_t0) * 1000.0
+                latency["step_ms"] = (time.perf_counter() - _diag_step_t0) * 1000.0
                 step += 1
                 contact = env.contact_force()
                 sensor_force = (
@@ -3539,42 +3626,12 @@ def main(env_class=None):
                     episode_step = step - episode[1]
                     if episode_step > 0 and episode_step % dataset_stride == 0:
                         sample_index = episode_step // dataset_stride
-                        frame_id = int(shot["n"])
-                        has_new_frame = (
-                            shot["frame"] is not None
-                            and frame_id != last_dataset_frame_id[0]
-                        )
-                        dataset_frame = (
-                            np.array(shot["frame"], copy=True)
-                            if has_new_frame
-                            else None
-                        )
-                        image_capture_time_s = None
-                        if (
-                            has_new_frame
-                            and shot["sim_time_s"] is not None
-                            and collection["started_sim_time_s"] is not None
-                        ):
-                            # Pyrite timestamps for every modality share the
-                            # episode-relative origin. MuJoCo data.time is not
-                            # reset between attempts, so storing it directly
-                            # would shift RGB by all prior reset/episode time.
-                            image_capture_time_s = max(
-                                0.0,
-                                float(shot["sim_time_s"])
-                                - float(collection["started_sim_time_s"]),
-                            )
-                        _diag_record_t0 = time.perf_counter()
-                        sample_recorded = recorder.record_sample(
-                            env,
+                        common_kwargs = dict(
                             timestamp_ms=sample_index * 1000.0 / args.dataset_hz,
                             target_pos=target,
                             target_rotvec=target_rv,
                             device_state=sample_device_state,
                             sent_force=sent[0],
-                            image_rgb=dataset_frame,
-                            image_capture_time_s=image_capture_time_s,
-                            image_id=(frame_id if has_new_frame else None),
                             wall_time_ns=time.perf_counter_ns(),
                             control_batch_size=n_steps,
                             control_batch_index=substep_index,
@@ -3586,22 +3643,66 @@ def main(env_class=None):
                                 )
                                 * 1000.0,
                             ),
-                            diag_prev_iter_ms=diag["prev_iter_ms"],
-                            diag_command_ms=diag["command_ms"],
-                            diag_step_ms=diag["step_ms"],
-                            diag_catchup_debt_ticks=diag["catchup_debt_ticks"],
-                            diag_prev_view_ms=diag["prev_view_ms"],
-                            diag_prev_sleep_ms=diag["prev_sleep_ms"],
+                            diag_prev_iter_ms=latency["prev_iter_ms"],
+                            diag_command_ms=latency["command_ms"],
+                            diag_step_ms=latency["step_ms"],
+                            diag_catchup_debt_ticks=latency["catchup_debt_ticks"],
+                            diag_prev_view_ms=latency["prev_view_ms"],
+                            diag_prev_sleep_ms=latency["prev_sleep_ms"],
                             # One-substep lag: this call's own duration can't
                             # be known before it returns, so it reports the
                             # PREVIOUS record_sample call's wall time.
-                            diag_record_ms=diag["last_record_ms"],
+                            diag_record_ms=latency["last_record_ms"],
                         )
-                        diag["last_record_ms"] = (
-                            time.perf_counter() - _diag_record_t0
-                        ) * 1000.0
-                        if has_new_frame:
-                            last_dataset_frame_id[0] = frame_id
+                        if args.dataset_mode == "sparse":
+                            # No mj_getState/wrench extraction/RGB at all --
+                            # see sparse_flipup_recorder.py's module docstring.
+                            # Skip even reading shot["frame"]/shot["n"] below;
+                            # this recorder has nowhere to put them.
+                            _diag_record_t0 = time.perf_counter()
+                            sample_recorded = recorder.record_sample(env, **common_kwargs)
+                            latency["last_record_ms"] = (
+                                time.perf_counter() - _diag_record_t0
+                            ) * 1000.0
+                        else:
+                            frame_id = int(shot["n"])
+                            has_new_frame = (
+                                shot["frame"] is not None
+                                and frame_id != last_dataset_frame_id[0]
+                            )
+                            dataset_frame = (
+                                np.array(shot["frame"], copy=True)
+                                if has_new_frame
+                                else None
+                            )
+                            image_capture_time_s = None
+                            if (
+                                has_new_frame
+                                and shot["sim_time_s"] is not None
+                                and collection["started_sim_time_s"] is not None
+                            ):
+                                # Pyrite timestamps for every modality share the
+                                # episode-relative origin. MuJoCo data.time is not
+                                # reset between attempts, so storing it directly
+                                # would shift RGB by all prior reset/episode time.
+                                image_capture_time_s = max(
+                                    0.0,
+                                    float(shot["sim_time_s"])
+                                    - float(collection["started_sim_time_s"]),
+                                )
+                            _diag_record_t0 = time.perf_counter()
+                            sample_recorded = recorder.record_sample(
+                                env,
+                                **common_kwargs,
+                                image_rgb=dataset_frame,
+                                image_capture_time_s=image_capture_time_s,
+                                image_id=(frame_id if has_new_frame else None),
+                            )
+                            latency["last_record_ms"] = (
+                                time.perf_counter() - _diag_record_t0
+                            ) * 1000.0
+                            if has_new_frame:
+                                last_dataset_frame_id[0] = frame_id
                         if sample_recorded and args.auto_finish and env.success():
                             auto_finish_ready = True
                             break
@@ -3630,8 +3731,8 @@ def main(env_class=None):
                             trace_xyz_raw[axis].append(float(raw_dev[axis]))
 
             _diag_sim_batch_ms = (time.perf_counter() - _diag_batch_t0) * 1000.0
-            _diag_track(diag_stats, "prev_iter_ms", diag["prev_iter_ms"])
-            _diag_track(diag_stats, "command_ms", diag["command_ms"])
+            _diag_track(diag_stats, "prev_iter_ms", latency["prev_iter_ms"])
+            _diag_track(diag_stats, "command_ms", latency["command_ms"])
             _diag_track(diag_stats, "sim_batch_ms", _diag_sim_batch_ms)
 
             if auto_finish_ready:
@@ -3724,15 +3825,15 @@ def main(env_class=None):
                     resolve_recorded_episode(keep=True, reset=False)
                 break
 
-            diag["prev_view_ms"] = (time.perf_counter() - _diag_view_t0) * 1000.0
-            _diag_track(diag_stats, "prev_view_ms", diag["prev_view_ms"])
+            latency["prev_view_ms"] = (time.perf_counter() - _diag_view_t0) * 1000.0
+            _diag_track(diag_stats, "prev_view_ms", latency["prev_view_ms"])
 
             _diag_sleep_t0 = time.perf_counter()
             ahead = (step / args.control_freq) - (time.time() - t_start)
             if ahead > 0.0005:
                 time.sleep(ahead - 0.0003)
-            diag["prev_sleep_ms"] = (time.perf_counter() - _diag_sleep_t0) * 1000.0
-            _diag_track(diag_stats, "prev_sleep_ms", diag["prev_sleep_ms"])
+            latency["prev_sleep_ms"] = (time.perf_counter() - _diag_sleep_t0) * 1000.0
+            _diag_track(diag_stats, "prev_sleep_ms", latency["prev_sleep_ms"])
             maybe_print_latency_diagnostics()
     except KeyboardInterrupt:
         pass

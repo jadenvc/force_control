@@ -229,6 +229,37 @@ def build_arg_parser():
                              "same disturbance path across runs while still "
                              "varying --seed's start-pose sampling, or vice "
                              "versa")
+    parser.add_argument("--goal-move-min-interval", type=float, default=0.0,
+                        help="minimum seconds between goal relocations. The "
+                             "actual interval is redrawn uniformly from "
+                             "[this, --goal-move-max-interval] every time -- "
+                             "not a fixed period -- so there's no reliable "
+                             "countdown to time against. 0 with "
+                             "--goal-move-max-interval also 0 (the default) "
+                             "disables goal-moving entirely: the goal is "
+                             "fixed, same as before this feature existed")
+    parser.add_argument("--goal-move-max-interval", type=float, default=0.0,
+                        help="maximum seconds between goal relocations; see "
+                             "--goal-move-min-interval. Setting only this "
+                             "(leaving min at 0) makes relocations anywhere "
+                             "from immediate to this many seconds apart. "
+                             "Try 2-6 for 'every few seconds, unpredictably'")
+    parser.add_argument("--goal-move-xy-half", type=float, default=0.15,
+                        help="half-extent (m) of the square region a new "
+                             "goal position is drawn from, centered on the "
+                             "origin (independent of --workspace-half)")
+    parser.add_argument("--goal-move-skip-prob", type=float, default=0.0,
+                        help="probability [0,1) that a scheduled relocation "
+                             "check does NOT move the goal after all, on top "
+                             "of the interval itself already being "
+                             "unpredictable -- makes it uncertain not just "
+                             "WHEN the next check happens but IF it will "
+                             "actually do anything. 0 (default): every "
+                             "scheduled check relocates the goal")
+    parser.add_argument("--goal-move-seed", type=int, default=None,
+                        help="seed for the goal-relocation random stream, "
+                             "independent of --seed and --t-disturbance-seed. "
+                             "Default derives one from --seed")
     parser.add_argument("--workspace-half", type=float, default=DEFAULT_WORKSPACE_HALF_M,
                         help="half-extent (m) of the square workspace the "
                              "pusher target is clamped to. --scale's default "
@@ -548,6 +579,11 @@ def main():
         t_disturbance_torque_n_m=args.t_disturbance_torque,
         t_disturbance_tau_s=args.t_disturbance_tau,
         t_disturbance_seed=args.t_disturbance_seed,
+        goal_move_min_interval_s=args.goal_move_min_interval,
+        goal_move_max_interval_s=args.goal_move_max_interval,
+        goal_move_xy_half_m=args.goal_move_xy_half,
+        goal_move_skip_prob=args.goal_move_skip_prob,
+        goal_move_seed=args.goal_move_seed,
         workspace_half_m=args.workspace_half,
         success_threshold=args.success_threshold,
     )
@@ -637,6 +673,10 @@ def main():
             "t_disturbance_force_n": env.t_disturbance_force_n,
             "t_disturbance_torque_n_m": env.t_disturbance_torque_n_m,
             "t_disturbance_tau_s": env.t_disturbance_tau_s,
+            "goal_move_min_interval_s": env.goal_move_min_interval_s,
+            "goal_move_max_interval_s": env.goal_move_max_interval_s,
+            "goal_move_xy_half_m": env.goal_move_xy_half_m,
+            "goal_move_skip_prob": env.goal_move_skip_prob,
             "workspace_half_m": env.workspace_half_m,
             "success_threshold": env.success_threshold,
             "axes": args.axes,

@@ -23,8 +23,14 @@ and not something an operator/policy could have anticipated from the
 observation stream, only useful for offline analysis of what actually moved
 the T versus what the pusher did.
 
+``goal_pose_0`` is recorded every sample, not just once in episode metadata,
+because --goal-move-* can relocate it mid-episode -- unlike the disturbance
+wrench, this IS something a policy/analysis needs at every tick, since
+coverage_fraction/success are computed against whatever the goal currently
+is, and that can change during the episode.
+
     data/episode_N/{ts_pose_command_0, ts_pose_controller_0, ts_pose_fb_0,
-                    pusher_vel_0, t_pose_0, t_twist_0, wrench_0,
+                    pusher_vel_0, t_pose_0, t_twist_0, goal_pose_0, wrench_0,
                     wrench_ground_truth_0, t_disturbance_wrench_0, ...}
     meta/episode_robot0_len
 """
@@ -165,6 +171,12 @@ class PushTEpisodeRecorder:
         self._samples.append("pusher_vel_0", env.pusher_vel)
         self._samples.append("t_pose_0", env.t_pose)
         self._samples.append("t_twist_0", env.t_twist)
+        # Was safe to leave out of every prior sample and put only in
+        # episode metadata, back when the goal never moved mid-episode --
+        # --goal-move-* breaks that assumption, so a policy/analysis now
+        # needs the goal recorded at every tick to know what coverage_fraction
+        # /success are even being computed against at that moment.
+        self._samples.append("goal_pose_0", env.goal_pose)
         # wrench_0 is the BC-facing signal: the causal finite-bandwidth
         # sensor model if --force-sensor-cutoff is set (env.sensor_force_xy()
         # equals the raw value when it isn't), matching flip-up's wrench_0 /

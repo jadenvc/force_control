@@ -148,6 +148,11 @@ class PushTTeleop:
         t_disturbance_torque_n_m=0.0,
         t_disturbance_tau_s=1.0,
         t_disturbance_seed=None,
+        goal_move_min_interval_s=0.0,
+        goal_move_max_interval_s=0.0,
+        goal_move_xy_half_m=0.15,
+        goal_move_skip_prob=0.0,
+        goal_move_seed=None,
     ):
         del settle_s
         self.seed = int(seed)
@@ -195,6 +200,25 @@ class PushTTeleop:
         self._disturbance_rng = np.random.default_rng(disturbance_seed)
         self._disturbance_force = np.zeros(2, dtype=float)
         self._disturbance_torque = 0.0
+        if float(goal_move_min_interval_s) < 0.0 or float(goal_move_max_interval_s) < 0.0:
+            raise ValueError("goal_move_min/max_interval_s cannot be negative")
+        if goal_move_max_interval_s > 0.0 and goal_move_min_interval_s > goal_move_max_interval_s:
+            raise ValueError("goal_move_min_interval_s must be <= goal_move_max_interval_s")
+        if float(goal_move_xy_half_m) <= 0.0:
+            raise ValueError("goal_move_xy_half_m must be positive")
+        if not 0.0 <= float(goal_move_skip_prob) < 1.0:
+            raise ValueError("goal_move_skip_prob must be in [0, 1)")
+        self.goal_move_min_interval_s = float(goal_move_min_interval_s)
+        self.goal_move_max_interval_s = float(goal_move_max_interval_s)
+        self.goal_move_xy_half_m = float(goal_move_xy_half_m)
+        self.goal_move_skip_prob = float(goal_move_skip_prob)
+        # 0 (the default) disables goal-moving entirely -- next_goal_move_s
+        # of +inf means "never fires" without needing an enabled/disabled
+        # branch sprinkled through step().
+        goal_seed = self.seed + 200_003 if goal_move_seed is None else int(goal_move_seed)
+        self._goal_move_rng = np.random.default_rng(goal_seed)
+        self._goal_move_enabled = self.goal_move_max_interval_s > 0.0
+        self._next_goal_move_s = float("inf")
         self.workspace_half_m = float(workspace_half_m)
         if self.workspace_half_m <= 0.0:
             raise ValueError("workspace_half_m must be positive")
@@ -270,6 +294,9 @@ class PushTTeleop:
         )
         self.t_body_id = self.model.body("t_block").id
         self.pusher_body_id = self.model.body("pusher").id
+        self._goal_mocap_id = int(
+            self.model.body_mocapid[self.model.body("goal_marker").id]
+        )
         self.t_geom_ids = np.array(
             [self.model.geom(name).id for name in ("t_bar", "t_stem")],
             dtype=np.int32,
@@ -304,9 +331,9 @@ class PushTTeleop:
         mujoco.mj_forward(self.model.ptr, self.data.ptr)
         self._initial_qpos = self.data.qpos.copy()
 
-        self._goal_grid_xy = None
-        self._goal_mask = None
-        self._goal_mask_count = None
+        # The goal pose passed in at construction -- reset() puts the goal
+        # back here, distinct from wherever --goal-move-* last relocated it.
+        self._initial_goal_pose = self.goal_pose.copy()
         self._build_goal_grid(float(coverage_grid_resolution_m))
 
         self._requested_target = np.zeros(2, dtype=float)
@@ -450,10 +477,15 @@ class PushTTeleop:
             solimp=(0.9, 0.95, 0.001, 0.5, 2.0),
         )
 
-        # --- goal marker: identical T footprint, fixed, non-colliding -----
+        # --- goal marker: identical T footprint, non-colliding, kinematic --
+        # A mocap body (no joint, no inertia -- purely kinematic), not a
+        # static geom baked in at this pos/euler: --goal-move-* repositions
+        # it live via data.mocap_pos/mocap_quat, which a compiled-in static
+        # body could not do without recompiling the whole model.
         goal_body = world.worldbody.add(
             "body",
             name="goal_marker",
+            mocap=True,
             pos=(goal_pose[0], goal_pose[1], TABLE_TOP_Z + 0.0005),
             euler=(0, 0, goal_pose[2]),
         )
@@ -537,6 +569,10 @@ class PushTTeleop:
 
     # --------------------------------------------------------------- goal
     def _build_goal_grid(self, resolution_m):
+        """Cache the goal footprint's LOCAL-frame grid/mask once -- these
+        depend only on the T's fixed geometry, never on where the goal
+        currently is, so a goal move (``_set_goal_pose``) only needs a cheap
+        rotate+translate of this cached grid, not a full rebuild."""
         if resolution_m <= 0.0:
             raise ValueError("coverage_grid_resolution_m must be positive")
         margin = 0.01
@@ -550,16 +586,31 @@ class PushTTeleop:
         xs = np.arange(-half_x, half_x, resolution_m)
         ys = np.arange(-bottom_y, top_y, resolution_m)
         grid_x, grid_y = np.meshgrid(xs, ys)
-        local_points = np.stack([grid_x.ravel(), grid_y.ravel()], axis=-1)
-        mask_local = self._t_footprint_mask(local_points)
-        cos_g, sin_g = np.cos(self.goal_pose[2]), np.sin(self.goal_pose[2])
-        rotation = np.array([[cos_g, -sin_g], [sin_g, cos_g]])
-        world_points = local_points @ rotation.T + self.goal_pose[:2]
-        self._goal_grid_xy = world_points
-        self._goal_mask = mask_local
-        self._goal_mask_count = int(mask_local.sum())
+        self._goal_local_points = np.stack([grid_x.ravel(), grid_y.ravel()], axis=-1)
+        self._goal_mask = self._t_footprint_mask(self._goal_local_points)
+        self._goal_mask_count = int(self._goal_mask.sum())
         if self._goal_mask_count == 0:
             raise RuntimeError("goal T footprint grid is empty; lower resolution")
+        self._set_goal_pose(self.goal_pose)
+
+    def _set_goal_pose(self, goal_pose):
+        """Move the goal (coverage target AND the visual marker) to
+        ``goal_pose``, without touching the T-block, the pusher, or
+        anything else -- used both for the initial placement and by
+        --goal-move-* to relocate it mid-episode."""
+        goal_pose = np.asarray(goal_pose, dtype=float)
+        self.goal_pose = goal_pose.copy()
+        cos_g, sin_g = np.cos(goal_pose[2]), np.sin(goal_pose[2])
+        rotation = np.array([[cos_g, -sin_g], [sin_g, cos_g]])
+        self._goal_grid_xy = self._goal_local_points @ rotation.T + goal_pose[:2]
+        if self._goal_mocap_id is not None:
+            self.data.mocap_pos[self._goal_mocap_id] = (
+                goal_pose[0], goal_pose[1], TABLE_TOP_Z + 0.0005
+            )
+            half_theta = 0.5 * goal_pose[2]
+            self.data.mocap_quat[self._goal_mocap_id] = (
+                np.cos(half_theta), 0.0, 0.0, np.sin(half_theta)
+            )
 
     def _t_footprint_mask(self, points_local):
         """Boolean mask of ``points_local`` (N, 2) inside the T's own footprint."""
@@ -753,6 +804,47 @@ class PushTTeleop:
         self.data.qfrc_applied[self.t_dof_ids[1]] = force_xy[1]
         self.data.qfrc_applied[self.t_dof_ids[2]] = self._disturbance_torque
 
+    @property
+    def goal_move_active(self):
+        return self._goal_move_enabled
+
+    def _sample_goal_pose(self):
+        xy = self._goal_move_rng.uniform(
+            -self.goal_move_xy_half_m, self.goal_move_xy_half_m, size=2
+        )
+        theta = self._goal_move_rng.uniform(-np.pi, np.pi)
+        return np.array([xy[0], xy[1], theta])
+
+    def _schedule_next_goal_move(self):
+        """+inf when disabled -- lets _maybe_move_goal skip a branch, since
+        ``sim_time < inf`` is always true and it'll just never fire."""
+        if not self._goal_move_enabled:
+            self._next_goal_move_s = float("inf")
+            return
+        interval = self._goal_move_rng.uniform(
+            self.goal_move_min_interval_s, self.goal_move_max_interval_s
+        )
+        self._next_goal_move_s = float(self.data.time) + interval
+
+    def _maybe_move_goal(self):
+        """Relocate the goal (and hence what ``success``/``coverage_fraction``
+        require) at an interval drawn fresh each time from
+        [goal_move_min_interval_s, goal_move_max_interval_s] -- not a fixed
+        period, so there's no reliable countdown for an operator to time
+        against. ``goal_move_skip_prob`` additionally makes it uncertain
+        whether a given wakeup actually relocates the goal at all, on top of
+        never knowing exactly when the next wakeup is. The only strategy
+        that's robust to both is to stop optimizing for the current goal
+        pose specifically and just close the gap as fast as possible,
+        continuously, since "finish carefully but slowly" can be invalidated
+        by a relocation at any moment.
+        """
+        if not self._goal_move_enabled or self.data.time < self._next_goal_move_s:
+            return
+        if self._goal_move_rng.random() >= self.goal_move_skip_prob:
+            self._set_goal_pose(self._sample_goal_pose())
+        self._schedule_next_goal_move()
+
     # ------------------------------------------------------------ control
     def limited_target(self, target_xy):
         target = np.asarray(target_xy, dtype=float)
@@ -770,6 +862,7 @@ class PushTTeleop:
             self._advance_disturbance()
             mujoco.mj_step(self.model.ptr, self.data.ptr)
             self._refresh_force_sensor()
+            self._maybe_move_goal()
         return self
 
     def reset(self, *, t_pose=None, pusher_pos=None):
@@ -794,6 +887,13 @@ class PushTTeleop:
         # repeated resets don't replay the identical disturbance path.
         self._disturbance_force[:] = 0.0
         self._disturbance_torque = 0.0
+        # Put the goal back where it started (not wherever --goal-move-*
+        # last relocated it to) and draw a fresh first relocation interval,
+        # continuing the RNG stream rather than reseeding it -- same
+        # "reset the state, not the randomness" convention as the
+        # disturbance process above.
+        self._set_goal_pose(self._initial_goal_pose)
+        self._schedule_next_goal_move()
         return self
 
     def _configure_pusher_contact(self):

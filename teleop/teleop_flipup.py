@@ -1424,16 +1424,6 @@ def main(env_class=None):
         "offscreen": (max(W, 640), max(H, 480)),
         "collision_envelope_dimensions": collision_envelope_dimensions,
         "tip_softness": args.tip_softness,
-        "tip_softness_max_solref": args.tip_softness_max_solref,
-        "tip_softness_max_width": args.tip_softness_max_width,
-        "table_friction": args.table_friction,
-        "bookend_solref": args.bookend_solref,
-        "bookend_solimp": args.bookend_solimp,
-        "bookend_friction": args.bookend_friction,
-        "book_fixture_solref": args.book_fixture_solref,
-        "book_fixture_solimp": args.book_fixture_solimp,
-        "book_fixture_friction": args.book_fixture_friction,
-        "tip_friction": args.tip_friction,
         "approach_compliance_distance_m": args.approach_compliance_distance,
         "approach_compliance_min_kp_ratio": args.approach_compliance_min_kp_ratio,
         "approach_max_speed_mps": args.approach_compliance_max_speed,
@@ -1443,7 +1433,25 @@ def main(env_class=None):
         env_kwargs["force_sensor_cutoff_hz"] = args.force_sensor_cutoff
         env_kwargs["table_solref"] = args.table_solref
         env_kwargs["table_solimp"] = args.table_solimp
+        # FloatingFlipUpTeleop.__init__ doesn't accept these yet (confirmed
+        # via inspect.signature -- its table/approach-compliance tuning
+        # commit never grew the bookend/book-fixture/tip-softness-range/
+        # tip-friction params the full-arm FlipUpTeleop has). Passing them
+        # unconditionally to every env_class used to raise
+        # "unexpected keyword argument 'tip_softness_max_solref'" the
+        # instant anyone ran a floating-gripper task (cube-lift included) --
+        # this was a real, pre-existing regression, not new behavior.
     else:
+        env_kwargs["tip_softness_max_solref"] = args.tip_softness_max_solref
+        env_kwargs["tip_softness_max_width"] = args.tip_softness_max_width
+        env_kwargs["table_friction"] = args.table_friction
+        env_kwargs["bookend_solref"] = args.bookend_solref
+        env_kwargs["bookend_solimp"] = args.bookend_solimp
+        env_kwargs["bookend_friction"] = args.bookend_friction
+        env_kwargs["book_fixture_solref"] = args.book_fixture_solref
+        env_kwargs["book_fixture_solimp"] = args.book_fixture_solimp
+        env_kwargs["book_fixture_friction"] = args.book_fixture_friction
+        env_kwargs["tip_friction"] = args.tip_friction
         env_kwargs["tool_kp_axes"] = tuple(args.tool_kp_axes)
         env_kwargs["tool_cartesian_kd"] = tuple(args.tool_cartesian_kd)
         env_kwargs["noslip_iterations"] = args.noslip_iterations
